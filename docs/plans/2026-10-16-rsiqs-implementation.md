@@ -16,7 +16,9 @@
 
 **修订（2026-10-19，Part 1 第二至四轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断，封板只看一字形态：最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，409 个测试全部通过（Part 1 共 135 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**修订（2026-10-19，Part 2 审查修复）：** 评估器在回放留出期之前记录试验，训练、验证段报错也计入 n_trials，留出期任何异常只记为未通过、不外传文本；回测净值前置期初资金点，面板截断到本段末尾；晋升先对齐净值再算收益，按收益日计数，降级要求 t <= -1.5；`DataView.codes()` 不列出尚未上市的股票；`record_nav` 拒绝非有限值；清单损坏视为校验不通过。后续 Part 的改动：(a) Task 3.5 基线只取需要的 60 行；(b) Task 3.6 源码检查禁止任何含 `__` 的名字、属性和标识符式字符串，以及动态取属性、`print`、`exit`、`SystemExit`，`run_eval` 对 `SystemExit` 也回传错误 JSON；(c) Task 5.1 `evaluate_strategy` 以数据库里本次的试验记录决定是否进入影子盘，`EVAL_TIMEOUT` 改为 1800 秒；(d) Task 5.2 编码约定同步；(e) Task 6.2 已有清单时不重写，只校验并告警；(f) Task 6.3 先存账户再记净值，收盘价缺失时沿用上一个有效值，策略只拿到截至前一交易日的面板。
+
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，463 个测试全部通过（Part 1 共 135 个、Part 2 共 90 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -5045,7 +5047,7 @@ class BaselineMomo:
             name = view.name(code)
             if is_st(name):
                 continue
-            h = view.history(code)
+            h = view.history(code, self.min_rows)  # 只取需要的行：回测每天对约 800 只股票调用
             if len(h) < self.min_rows or h.index[-1].date() != view.asof:
                 continue
             if h["amount"].iloc[-20:].mean() < self.min_amount:
@@ -5159,8 +5161,23 @@ def test_open_and_builtins_rejected():
 
 
 def test_dunder_access_rejected():
-    for code in ["x = ().__class__.__bases__", "y = __builtins__", "z = (1).__dict__"]:
+    for code in ["x = ().__class__.__bases__", "y = __builtins__", "z = (1).__dict__",
+                 "p = view._DataView__panel", "view._DataView__ts = 0", "a__b = 1\nc = a__b",
+                 "k = '_DataView' + '__panel'", "k = '_DataView__panel'"]:
         assert any("__" in m for m in bad(code)), code
+
+
+def test_dunder_in_docstring_and_method_name_allowed():
+    src = OK.replace('    def select(self, view):', '    def select(self, view):\n        """不调用 __init__ 以外的特殊方法。"""')
+    assert check_source(src) == []
+
+
+def test_dynamic_access_and_process_control_rejected():
+    for code in ["import typing\nf = typing.operator.attrgetter('x')", "import dataclasses\nm = dataclasses.sys",
+                 "import pandas as pd\npd.eval('1 + 1')", "df = None\ndf.query('a > 1')",
+                 "import dataclasses\ni = dataclasses.inspect", "print('x')", "raise SystemExit(0)",
+                 "exit(0)", "quit()"]:
+        assert bad(code), code
 
 
 def test_file_io_attributes_rejected():
@@ -5260,6 +5277,17 @@ def test_main_reports_error_as_json(captured, monkeypatch):
     assert json.loads(out.getvalue()) == {"error": "RuntimeError: 坏了"}
 
 
+def test_main_reports_system_exit_as_json(captured, monkeypatch):
+    def leave(*a, **k):
+        print('{"gate_pass": true, "holdout_pass": true}')  # 伪造的报告行
+        raise SystemExit(0)
+
+    monkeypatch.setattr(run_eval, "evaluate", leave)
+    out = io.StringIO()
+    assert run_eval.main(["baseline_momo"], out=out) == 1
+    assert json.loads(out.getvalue()) == {"error": "SystemExit: 0"}
+
+
 def test_main_usage_error():
     out = io.StringIO()
     assert run_eval.main([], out=out) == 2
@@ -5284,17 +5312,24 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 
 **Step 3: 最小实现**
 
-沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。
+沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。含 `__` 的名字、属性和标识符式字符串一律拒绝：`DataView` 的私有面板改编后叫 `_DataView__panel`，只拦以 `__` 开头的写法挡不住它。`print`、`exit`、`SystemExit` 也拒绝：评估子进程靠 stdout 最后一行回传报告，策略不能往里写，也不能提前结束进程。
 
 ```python
 # strategies/sandbox.py
-"""策略源码静态检查：限制导入、危险内建、双下划线访问和文件读写。"""
+"""策略源码静态检查：限制导入、危险内建、双下划线访问、动态取属性和文件读写。"""
 import ast
+import re
 
 ALLOWED_IMPORTS = {"math", "statistics", "numpy", "pandas", "dataclasses", "typing",
                    "engine.types", "engine.dataview", "engine.rules", "strategies.base"}
 BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
-                "getattr", "setattr", "delattr", "breakpoint", "input"}
+                "getattr", "setattr", "delattr", "breakpoint", "input",
+                # 评估子进程只认 stdout 最后一行和数据库里的试验记录：策略不能打印，也不能提前结束进程
+                "print", "exit", "quit", "SystemExit", "attrgetter", "methodcaller"}
+# 按字符串求值或取属性，或经白名单模块拿到解释器内部模块（例如 dataclasses.sys、typing.operator）
+DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins", "importlib",
+                 "subprocess", "attrgetter", "methodcaller"}
+DUNDER_IDENT = re.compile(r"\w*__\w*")  # 形如 _DataView__panel、__panel 的标识符字符串
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
             "to_feather", "to_html", "to_clipboard", "load", "loadtxt", "save", "savez",
             "savetxt", "fromfile", "tofile", "genfromtxt", "memmap"}
@@ -5332,13 +5367,18 @@ def check_source(src: str) -> list[str]:
         elif isinstance(node, ast.Name):
             if node.id in BANNED_NAMES:
                 out.append(f"第 {line} 行: 禁止使用 {node.id}")
-            elif node.id.startswith("__"):
-                out.append(f"第 {line} 行: 禁止使用双下划线名字 {node.id}")
+            elif "__" in node.id:  # 含改编后的私有名字，例如 _DataView__panel
+                out.append(f"第 {line} 行: 禁止使用含双下划线的名字 {node.id}")
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__"):
-                out.append(f"第 {line} 行: 禁止访问双下划线属性 {node.attr}")
+            if "__" in node.attr:
+                out.append(f"第 {line} 行: 禁止访问含双下划线的属性 {node.attr}")
             elif node.attr.startswith("read_") or node.attr in IO_ATTRS:
                 out.append(f"第 {line} 行: 禁止文件读写 {node.attr}")
+            elif node.attr in DYNAMIC_ATTRS:
+                out.append(f"第 {line} 行: 禁止动态求值或访问解释器内部模块 {node.attr}")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if DUNDER_IDENT.fullmatch(node.value):
+                out.append(f"第 {line} 行: 禁止含双下划线的标识符字符串 {node.value!r}")
     if not _has_strategy(tree):
         out.append("缺少模块级 STRATEGY 赋值")
     return out
@@ -5392,7 +5432,9 @@ def main(argv: list[str] | None = None, out=None) -> int:
         return 2
     try:
         result = run(argv[0])
-    except Exception as e:  # noqa: BLE001 - 任何失败都要以 JSON 回传给 agent
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:  # noqa: BLE001 - 含策略抛出的 SystemExit：任何失败都要以 JSON 回传给 agent
         logging.exception("评估 %s 失败", argv[0])
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), file=out)
         return 1
@@ -5411,7 +5453,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：12 passed（sandbox 8 + run_eval 4）。
+预期：15 passed（sandbox 10 + run_eval 5）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -5419,7 +5461,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：51 passed。
+预期：54 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -8015,7 +8057,7 @@ git commit -m "feat: add post-close LLM review that evolves candidate playbook a
 - **Python 执行全部动作，并逐步把关：**
   1. 命名规则：`NAME_RE` 全匹配、不是保留名、不是现任，而且必须是新名字。
   2. 代码规范：`compile()` 通过，且 `strategies.sandbox.check_source()` 无违规（import 白名单、禁用的内建与反射写法、双下划线、pandas/numpy 读写函数）。违规原因原样反馈给下一轮。
-  3. 隔离评估：独立子进程 `python -m engine.run_eval <name>`（`cwd=root`，`EVAL_TIMEOUT=900` 秒），只解析最后一行 JSON（`EvalReport.to_agent_dict()`），留出集只有 `holdout_pass` 布尔值。超时、非零退出、输出异常一律按失败处理并反馈。
+  3. 隔离评估：独立子进程 `python -m engine.run_eval <name>`（`cwd=root`，`EVAL_TIMEOUT=1800` 秒；基线策略在约 800 只股票、2,600 个交易日上实测约 7 分钟，留出余量给更复杂的策略），只解析最后一行 JSON（`EvalReport.to_agent_dict()`），留出集只有 `holdout_pass` 布尔值。超时、非零退出、输出异常一律按失败处理并反馈。
   4. 次数上限：每会话最多 `MAX_ROUNDS=3` 轮，每轮最多 `MAX_DRAFTS_PER_ROUND=3` 个草稿，整个会话最多 `MAX_EVALS_PER_SESSION=5` 次评估（超时也算）。DSR 按全部历史试验折减，多试只会更难过门槛。
   5. 完整性：会话前 `integrity.verify(root)` 必须为 `[]`，否则告警且不调用 LLM；会话后再校验一次，有变化就告警、不提交 git，文件留在工作区供人工排查。
   6. 预算：开始前 `check_budget(False)`；每轮 `max_budget_usd=min(3.0, 本月剩余预算折合美元)`；`BudgetExceeded` 立即停止。
@@ -8177,10 +8219,14 @@ def report(gate=True, holdout=True):
             "dsr": 0.95, "gate_pass": gate, "holdout_pass": holdout, "n_trials": 3}
 
 
-def fake_runner(stdout, returncode=0, stderr="", calls=None):
+def fake_runner(stdout, returncode=0, stderr="", calls=None, trial=None):
+    """trial=(store, gate, holdout)：像真实子进程里的 evaluate 一样先写一条试验记录。"""
     def run(cmd, **kw):
         if calls is not None:
             calls.append((cmd, kw))
+        if trial is not None:
+            store, gate, holdout = trial
+            store.add_trial(cmd[-1], {}, 1.0, 1.2, gate, holdout)
         return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
     return run
 
@@ -8196,20 +8242,37 @@ def test_evaluate_pass_parses_last_json_line_and_sets_shadow(written):
     settings, store = written
     calls = []
     stdout = "策略日志一行\n" + json.dumps(report()) + "\n\n"
-    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(stdout, calls=calls))
+    out = evaluate_strategy(settings, store, "probe_one",
+                            runner=fake_runner(stdout, calls=calls, trial=(store, True, True)))
     assert out == {"ok": True, "report": report(), "error": ""}
     assert store.get_status("probe_one") == "shadow"
     cmd, kw = calls[0]
     assert cmd == [sys.executable, "-m", "engine.run_eval", "probe_one"]
-    assert kw["cwd"] == str(settings.root) and kw["timeout"] == research.EVAL_TIMEOUT == 900
+    assert kw["cwd"] == str(settings.root) and kw["timeout"] == research.EVAL_TIMEOUT == 1800
     assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
 
 
 @pytest.mark.parametrize("gate,holdout", [(True, False), (False, None)])
 def test_evaluate_without_full_pass_keeps_candidate(written, gate, holdout):
     settings, store = written
-    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(json.dumps(report(gate, holdout))))
+    out = evaluate_strategy(settings, store, "probe_one",
+                            runner=fake_runner(json.dumps(report(gate, holdout)), trial=(store, gate, holdout)))
     assert out["ok"] is True and out["report"]["gate_pass"] is gate and out["error"] == ""
+    assert store.get_status("probe_one") == "candidate"
+
+
+def test_evaluate_forged_report_without_trial_rejected(written):
+    settings, store = written  # 策略打印伪造的报告后提前结束进程：数据库里没有本次的试验记录
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(json.dumps(report())))
+    assert out["ok"] is False and out["report"] is None and "试验记录" in out["error"]
+    assert store.get_status("probe_one") == "candidate"
+
+
+def test_evaluate_status_follows_trial_record_not_stdout(written):
+    settings, store = written
+    out = evaluate_strategy(settings, store, "probe_one",
+                            runner=fake_runner(json.dumps(report()), trial=(store, False, None)))
+    assert out["ok"] is True and out["report"]["gate_pass"] is False and out["report"]["holdout_pass"] is None
     assert store.get_status("probe_one") == "candidate"
 
 
@@ -8336,7 +8399,7 @@ from strategies.sandbox import ALLOWED_IMPORTS, check_source
 MAX_ROUNDS = 3
 MAX_DRAFTS_PER_ROUND = 3
 MAX_EVALS_PER_SESSION = 5
-EVAL_TIMEOUT = 900
+EVAL_TIMEOUT = 1800  # 基线策略全量评估实测约 7 分钟
 CONTEXT_MAX_CHARS = 60_000       # build_context 总长度上限（字符）
 FILE_MAX_CHARS = 15_000          # 背景里单个源码文件的上限
 TRIALS_IN_CONTEXT = 20
@@ -8499,11 +8562,13 @@ def _last_json_line(stdout: str) -> dict | None:
 
 
 def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) -> dict:
-    """在子进程中运行 engine.run_eval；gate_pass 且 holdout_pass 时设为 shadow。
+    """在子进程中运行 engine.run_eval；本次写入数据库的试验记录 gate_pass 且 holdout_pass 时设为 shadow。
 
-    返回 {"ok": bool, "report": dict | None, "error": str}；任何失败都不抛异常。"""
+    策略代码和评估器在同一个子进程里，stdout 可能被伪造，所以报告只用于展示，是否通过以子进程写入的
+    试验记录为准。返回 {"ok": bool, "report": dict | None, "error": str}；任何失败都不抛异常。"""
     run = runner or subprocess.run
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}  # Windows 管道默认是 ANSI 代码页
+    before = store.trial_count(name)
     try:
         proc = run([sys.executable, "-m", "engine.run_eval", name], cwd=str(settings.root),
                    capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -8519,7 +8584,11 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
         else:
             detail = (proc.stderr or proc.stdout or "无输出").strip()[-1500:]
         return {"ok": False, "report": None, "error": f"评估失败（退出码 {proc.returncode}）：{detail}"}
-    if report.get("gate_pass") and report.get("holdout_pass"):
+    trial = store.last_trial(name) if store.trial_count(name) > before else None
+    if trial is None:
+        return {"ok": False, "report": None, "error": "评估没有写入试验记录，报告不予采信"}
+    report = {**report, "gate_pass": trial["gate_pass"], "holdout_pass": trial["holdout_pass"]}
+    if trial["gate_pass"] and trial["holdout_pass"]:
         store.set_status(name, "shadow", date.today())
     return {"ok": True, "report": report, "error": ""}
 ```
@@ -8528,7 +8597,7 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
 - `strategies.base.NAME_RE` 没有锚点，必须用 `fullmatch`。
 - `compile(..., dont_inherit=True)` 不继承本模块的 `from __future__ import annotations`，与策略文件被 import 时的编译方式一致；它还能抓到 `ast.parse` 放过的错误（例如模块顶层的 `return`）。
 - 子进程不加 `-I`（`-I` 会让 `-m engine.run_eval` 找不到项目包）。策略里的 `print` 只会出现在报告行之前，所以取最后一个非空行。
-- `evaluate_strategy` 只依据 `run_eval` 的输出把状态设为 `shadow`；试验记录由子进程里的 `engine.evaluator.evaluate` 写入同一个数据库。
+- `evaluate_strategy` 依据子进程里 `engine.evaluator.evaluate` 写入同一个数据库的试验记录把状态设为 `shadow`，并用它覆盖报告里的 `gate_pass` / `holdout_pass`；本次没有新增试验记录（例如策略打印伪造的报告后提前结束进程）时，报告不予采信。stdout 只用于展示训练、验证指标。
 
 **Step 4: 运行测试，确认通过**
 
@@ -8536,7 +8605,7 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
 uv run pytest tests/test_research_tools.py -v
 ```
 
-预期：32 passed。
+预期：34 passed。
 
 **Step 5: 提交**
 
@@ -8646,9 +8715,10 @@ class FakeLLM:
 
 
 class FakeEval:
-    """替代 subprocess.run 的评估 runner：按策略名返回预设报告，可在评估时执行副作用。"""
+    """替代 subprocess.run 的评估 runner：按策略名返回预设报告，并像真实子进程一样写入试验记录。"""
 
-    def __init__(self):
+    def __init__(self, store):
+        self.store = store
         self.outcomes: dict[str, dict] = {}
         self.side_effect = None
         self.names: list[str] = []
@@ -8659,6 +8729,9 @@ class FakeEval:
         if self.side_effect:
             self.side_effect(name)
         rep = self.outcomes.get(name, report(name))
+        if "gate_pass" in rep:
+            self.store.add_trial(name, {}, rep["train"]["sharpe"], rep["val"]["sharpe"],
+                                 rep["gate_pass"], rep["holdout_pass"])
         return subprocess.CompletedProcess(cmd, 0, stdout="评估日志\n" + json.dumps(rep) + "\n", stderr="")
 
 
@@ -8675,7 +8748,7 @@ def env(tmp_path, monkeypatch):
     commits = []
     monkeypatch.setattr(research, "git_commit",
                         lambda paths, message: commits.append((paths, message)) or True)
-    fake_eval = FakeEval()
+    fake_eval = FakeEval(store)
     real_evaluate = research.evaluate_strategy
     monkeypatch.setattr(research, "evaluate_strategy",
                         lambda s, st, name, runner=None: real_evaluate(s, st, name, runner=fake_eval))
@@ -8966,8 +9039,8 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 4. 只 import 下列模块（及其子模块）：<<ALLOWED_IMPORTS>>。不要写 from __future__ import annotations。
 5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停：计算涨跌停价时把 view.asof 作为 d 传入，例如 limit_prices(code, name, prev_close, view.asof)，因为涨跌幅按当天的规则生效；判断是否涨停或跌停用 at_limit_up / at_limit_down，它们容忍一分钱的复权舍入误差。
 6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
-7. 写法保持直接：不用 getattr、setattr、vars、globals 这类反射写法，不用 eval、exec、open；不引用以双下划线开头的名字或属性（例如 super().__init__()、__name__；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
-8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
+7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
+8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
 9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
 10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。
 
@@ -9185,7 +9258,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
 uv run pytest tests/test_research_tools.py tests/test_research_loop.py -v
 ```
 
-预期：49 passed（tools 32 + loop 17）。
+预期：51 passed（tools 34 + loop 17）。
 
 **Step 5: 提交**
 
@@ -9839,6 +9912,17 @@ def test_bootstrap_rerun_does_not_overwrite(tmp_path, monkeypatch):
     assert len(pb.load("candidate")["rules"]) == 1
 
 
+def test_bootstrap_rerun_keeps_existing_manifest_and_warns(tmp_path, monkeypatch):
+    dates, settings, _, _, notifier, manifests = setup(tmp_path, monkeypatch)
+    now = datetime.combine(dates[100], time(20, 0))
+    bootstrap.main(now=now)
+    (settings.root / integrity.MANIFEST_PATH).write_text("{}", encoding="utf-8")  # 清单已经存在
+    monkeypatch.setattr(integrity, "verify", lambda r: ["engine/broker.py"])
+    bootstrap.main(now=now)
+    assert manifests == [settings.root]  # 没有重写
+    assert "engine/broker.py" in notifier.sent[-1]
+
+
 def test_bootstrap_on_weekend_starts_from_last_trading_day(tmp_path, monkeypatch):
     dates, _, store, _, _, _ = setup(tmp_path, monkeypatch)
     sat = next_saturday(dates[99])
@@ -9913,9 +9997,16 @@ def main(now: datetime | None = None) -> dict:
         if not (playbook.PLAYBOOK_DIR / f"{kind}.json").exists():
             playbook.save(kind, {"version": 1, "created": now.date().isoformat(), "rules": []})
 
-    integrity.write_manifest(root)
+    if (root / integrity.MANIFEST_PATH).exists():
+        changed = integrity.verify(root)  # 已有清单不重写：重写等于认可 engine/ 的任何改动
+    else:
+        integrity.write_manifest(root)
+        changed = []
     msg = (f"RSIQS 初始化完成：股票池 {len(codes)} 只，起始日 {anchor.isoformat()}，"
            f"新建账户 {', '.join(created) or '无'}")
+    if changed:
+        msg += (f"\n警告：engine/ 与哈希清单不符：{', '.join(changed)}。"
+                "确认改动无误后按 Task 2.8 的命令人工重写清单并提交。")
     notifier.send_text(msg)
     print(msg)
     return {"universe": len(codes), "anchor": anchor.isoformat(), "created": created}
@@ -9932,7 +10023,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_bootstrap.py -v
 ```
-预期：4 passed。
+预期：5 passed。
 
 **Step 5: 提交**
 
@@ -9957,6 +10048,7 @@ git commit -m "feat: jobs.bootstrap initializes accounts, playbooks, cache, mani
 ```python
 from datetime import datetime, time
 
+import pandas as pd
 import pytest
 
 import engine.integrity as integrity
@@ -10074,6 +10166,46 @@ def test_shadow_account_created_and_broken_strategy_skipped(env, monkeypatch):
     assert any("broken_one" in str(m) for m in env["notifier"].sent)
 
 
+def test_crash_between_account_and_nav_loses_no_trades(env, monkeypatch):
+    dates, store = env["dates"], env["store"]
+    real = store.save_account
+
+    def killed_once(acc):
+        if acc.name == "h:active" and acc.last_trade_day == dates[101]:
+            monkeypatch.setattr(store, "save_account", real)
+            raise RuntimeError("进程被杀")
+        return real(acc)
+
+    monkeypatch.setattr(store, "save_account", killed_once)
+    assert settle.main(now=at(dates[101], 16)) == []
+    assert settle.main(now=at(dates[101], 17)) == [dates[101]]
+    buys = [f for f in store.load_account("h:active").trades if f.side == "BUY" and f.date == dates[101]]
+    assert len(buys) == 1 and store.last_nav_date("h:active") == dates[101]
+
+
+def test_nan_close_uses_last_valid_close(env):
+    dates, store = env["dates"], env["store"]
+    env["cache"].panel["600001"].loc[pd.Timestamp(dates[101]), "close"] = float("nan")
+    assert settle.main(now=at(dates[101], 16)) == [dates[101]]
+    assert store.nav_series("h:active").notna().all()
+
+
+def test_strategy_view_stops_at_previous_day(env, monkeypatch):
+    dates, store = env["dates"], env["store"]
+    seen = []
+
+    class Probe:
+        name = "probe"
+
+        def select(self, view):  # 测试专用：直接读私有面板，确认 d 日的行情不在里面
+            seen.append(max(df.index.max() for df in view._DataView__panel.values()))
+            return []
+
+    monkeypatch.setattr(settle, "load_strategy", lambda name: Probe())
+    settle.main(now=at(dates[101], 16))
+    assert seen == [pd.Timestamp(dates[100])]
+
+
 def test_promotion_events_are_notified(env, monkeypatch):
     dates = env["dates"]
     monkeypatch.setattr(promotion, "decide",
@@ -10165,8 +10297,14 @@ def settle_day(d: date, settings, store, cache, calendar) -> list[str]:
     index = cache.load_index(common.INDEX_SYMBOL)
     bench_equity = settings.capital * _index_close(index, d) / _index_close(index, bench_start)
 
-    closes = {c: float(df["close"].iloc[-1]) for c, df in panel.items() if len(df)}
-    view = DataView(panel, names, asof=calendar.prev_day(d))
+    closes = {}
+    for c, df in panel.items():
+        valid = df["close"].dropna()  # 收盘价缺失时沿用上一个有效收盘价，净值不会变成 NaN
+        if len(valid):
+            closes[c] = float(valid.iloc[-1])
+    asof = calendar.prev_day(d)
+    # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合
+    view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items()}, names, asof=asof)
     broker, per_pick, warnings = SimBroker(), settings.capital / settings.max_picks, []
 
     def run(name: str, picks) -> None:
@@ -10175,8 +10313,9 @@ def settle_day(d: date, settings, store, cache, calendar) -> list[str]:
             acc = Account(name=name, cash=settings.capital)
             store.record_nav(name, calendar.prev_day(d), settings.capital)
         broker.execute_day(acc, d, bars, picks, calendar, per_pick)
-        store.record_nav(name, d, acc.equity(closes))
+        # 先存账户再记净值：中途中断时，重跑看到 last_trade_day == d，execute_day 不会重复成交，只补记净值
         store.save_account(acc)
+        store.record_nav(name, d, acc.equity(closes))
 
     for status in ("incumbent", "shadow"):
         for strat in store.strategies_with_status(status):
@@ -10241,7 +10380,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：7 passed。
+预期：10 passed。
 
 **Step 5: 提交**
 
@@ -11211,7 +11350,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 48 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 4、`test_jobs_settle.py` 7、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 5、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 52 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 10、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 5、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
