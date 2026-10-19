@@ -169,3 +169,29 @@ def test_missing_benchmark(tmp_path, monkeypatch):
     out = io.StringIO()
     assert run_eval.main(["baseline_momo"], out=out) == 1
     assert "sh000300" in json.loads(out.getvalue())["error"]
+
+
+def test_real_evaluation_is_not_voided(tmp_path, monkeypatch):
+    """不替换 evaluate：真实回测、pandas 运算、惰性导入都不应让规则快照误报。"""
+    import engine.evaluator as ev
+    days = pd.bdate_range("2026-01-05", periods=90)
+
+    class Client:
+        def daily_bars(self, code, start, end):
+            close = [10.0 * (1.002 + 0.001 * int(code[-1])) ** i for i in range(len(days))]
+            return pd.DataFrame({"date": days, "open": close, "high": [c * 1.01 for c in close],
+                                 "low": [c * 0.99 for c in close], "close": close,
+                                 "volume": [1e5] * len(days), "amount": [2e8] * len(days)})
+
+    db = tmp_path / "data" / "t.sqlite"
+    cache = BarCache(db, Client())
+    cache.update(["600001", "600002", "600003"], days[-1].date())
+    cache.save_index("sh000300", pd.Series(range(4000, 4000 + len(days)), index=days, dtype=float))
+    monkeypatch.setattr(run_eval, "get_settings", lambda: SimpleNamespace(db_path="data/t.sqlite", root=tmp_path))
+    monkeypatch.setattr(ev, "SPLITS", {"train": (days[62].date(), days[74].date()),
+                                       "val": (days[75].date(), days[84].date()),
+                                       "holdout": (days[85].date(), None)})
+    out = io.StringIO()
+    assert run_eval.main(["baseline_momo"], out=out) == 0, out.getvalue()
+    rep = json.loads(out.getvalue())
+    assert "gate_pass" in rep and Store(db).trial_count() == 1

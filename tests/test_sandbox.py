@@ -124,6 +124,11 @@ def test_every_file_attribute_rejected(attr):
     assert bad(f"p = None\np.{attr}()"), attr
 
 
+def test_open_price_attribute_allowed_but_open_call_rejected():
+    assert bad("b = None\nx = b.open\nfor r in []:\n    y = r.open > r.close") == []
+    assert any("open" in m for m in bad("p = None\nf = p.open('x')"))
+
+
 def test_file_access_through_pathlike_and_pandas_rejected():
     for code in ["import pandas as pd\npd.DataFrame().to_string('leak.txt')", "import numpy as np\nnp.fromregex('a', 'b', [])",
                  "p = None\np.write_text('x')", "p = None\np.open()", "p = None\np.read_text()"]:

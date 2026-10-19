@@ -1,5 +1,7 @@
 # strategies/baseline_momo.py
 """基线：中期动量 + 短期反转。分数 = rank(20日涨幅) - rank(5日涨幅)。"""
+import math
+
 import pandas as pd
 
 from engine.dataview import DataView
@@ -9,7 +11,7 @@ from engine.types import Pick
 
 class BaselineMomo:
     name = "baseline_momo"
-    top_n = 5
+    top_n = 15  # 盘前流程最多取前 15 个复核；回测和结算只取前 5 个
     min_rows = 60
     min_amount = 1e8
 
@@ -22,16 +24,20 @@ class BaselineMomo:
             h = view.history(code, self.min_rows)  # 只取需要的行：回测每天对约 800 只股票调用
             if len(h) < self.min_rows or h.index[-1].date() != view.asof:
                 continue
-            if h["amount"].iloc[-20:].mean() < self.min_amount:
+            if not h["amount"].iloc[-20:].mean() >= self.min_amount:  # NaN 也排除
                 continue
             last = h.iloc[-1]
-            up, _ = limit_prices(code, name, float(last["prev_close"]), view.asof)
-            if at_limit_up(float(last["close"]), up):
+            close, prev = float(last["close"]), float(last["prev_close"])
+            if not (math.isfinite(close) and math.isfinite(prev) and close > 0 and prev > 0):
+                continue  # 数据缺失
+            up, _ = limit_prices(code, name, prev, view.asof)
+            if at_limit_up(close, up):
                 continue  # asof 收于涨停（按当天的规则，容忍一分钱的复权舍入）
             c = h["close"]
-            rows.append({"code": code, "name": name, "close": float(c.iloc[-1]),
-                         "r20": float(c.iloc[-1] / c.iloc[-21] - 1),
-                         "r5": float(c.iloc[-1] / c.iloc[-6] - 1)})
+            r20, r5 = float(c.iloc[-1] / c.iloc[-21] - 1), float(c.iloc[-1] / c.iloc[-6] - 1)
+            if not (math.isfinite(r20) and math.isfinite(r5)):
+                continue
+            rows.append({"code": code, "name": name, "close": close, "r20": r20, "r5": r5})
         if not rows:
             return []
         df = pd.DataFrame(rows)

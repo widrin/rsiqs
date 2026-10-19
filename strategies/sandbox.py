@@ -23,7 +23,7 @@ DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins"
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
             "to_feather", "to_html", "to_clipboard", "to_string", "to_latex", "to_xml", "to_stata",
             "to_markdown", "load", "loadtxt", "save", "savez", "savetxt", "fromfile", "tofile",
-            "genfromtxt", "fromregex", "memmap", "DataSource", "open", "write_text", "write_bytes",
+            "genfromtxt", "fromregex", "memmap", "DataSource", "write_text", "write_bytes",
             "read_text", "read_bytes", "unlink", "mkdir", "touch", "rmdir", "iterdir", "glob", "rglob"}
 
 
@@ -134,6 +134,9 @@ def check_source(src: str) -> list[str]:
                 out.append(f"第 {line} 行: 禁止访问含双下划线的属性 {node.attr}")
             elif node.attr.startswith("read_") or node.attr in IO_ATTRS:
                 out.append(f"第 {line} 行: 禁止文件读写 {node.attr}")
+            elif node.attr == "open" and isinstance(parent.get(node), ast.Call) and parent[node].func is node:
+                # 只拦调用（path.open(...)）；r.open、bar.open 是开盘价
+                out.append(f"第 {line} 行: 禁止文件读写 open()（读开盘价用 h[\"open\"] 或 bar.open 不受影响）")
             elif node.attr in DYNAMIC_ATTRS:
                 hint = {"format": "，拼字符串用 f-string", "format_map": "，拼字符串用 f-string",
                         "api": "，判断类型用 isinstance", "seterr": "，忽略数值警告用 np.errstate",

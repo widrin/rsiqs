@@ -79,12 +79,13 @@ def test_pick_price_fields(view):
     assert "20日涨幅20.0%" in p.reason and "5日涨幅-2.0%" in p.reason
 
 
-def test_top5_cap():
-    panel = {f"60010{i}": series(path(0.01 * (i + 1), 0.0)) for i in range(8)}
+def test_returns_up_to_15_ordered_candidates():
+    # 盘前流程最多取前 15 个复核，回测和结算只取前 5 个：策略返回完整的前 15 名
+    panel = {f"6001{i:02d}": series(path(0.01 * (i + 1), 0.0)) for i in range(20)}
     v = DataView(panel, {c: "甲" for c in panel}, asof=ASOF)
     picks = BaselineMomo().select(v)
-    assert len(picks) == 5
-    assert picks[0].code == "600107"
+    assert len(picks) == 15
+    assert picks[0].code == "600119" and [p.score for p in picks] == sorted((p.score for p in picks), reverse=True)
 
 
 def test_empty_view():
@@ -112,3 +113,15 @@ def test_load_and_list_strategies():
     for bad in ["../evil", "Base", "ab", "base", "sandbox", "x" * 50]:
         with pytest.raises(ValueError):
             load_strategy(bad)
+
+
+def test_non_finite_values_are_skipped():
+    good = series(path(0.20, -0.02))
+    nan_close = good.copy()
+    nan_close.iloc[-1, nan_close.columns.get_loc("close")] = float("nan")  # asof 当天收盘价缺失
+    nan_amount = series(path(0.15, 0.0), amount=float("nan"))           # 成交额缺失：不能当作足够
+    nan_hist = series(path(0.10, 0.10))
+    nan_hist.iloc[-21, nan_hist.columns.get_loc("close")] = float("nan")  # 20 日前收盘价缺失
+    panel = {"600001": good, "600002": nan_close, "600003": nan_amount, "600004": nan_hist}
+    picks = STRATEGY.select(DataView(panel, {c: "股" for c in panel}, asof=ASOF))
+    assert [p.code for p in picks] == ["600001"]
