@@ -24,7 +24,7 @@
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，592 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，597 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -4018,7 +4018,7 @@ uv run pytest tests/test_store.py tests/test_metrics.py tests/test_dataview.py t
 
 > 合同歧义处理（本节统一采用以下最简一致选择）：
 > - `BarCache.update` 从已存的最后 `OVERLAP_ROWS`（5）行开始请求到 `end`，重叠部分价格差超过 `ADJ_TOL`（0.011 元）就判定前复权基准变了，先取到完整数据再删旧数据、全量重拉（记在 `last_rebased`）；单只股票失败不影响其他股票，返回失败代码列表。`update(..., full=True)` 删除后全量重拉。
-> - 前复权日线只给策略算因子。`BarCache.update_raw` / `raw_bars` / `last_raw_close` 另存不复权日线（`bar_raw` 表），只供模拟盘结算撮合与估值：不复权价格不会因为之后的除权而变，多日补跑时也是当天的真实价格；`prev_close` 由涨跌幅反推，是交易所当天的参考昨收（除权日即除权参考价）。分红送转存 `dividends` 表（`save_dividends` / `dividends`）。
+> - 前复权日线只给策略算因子。`BarCache.update_raw` / `raw_bars` / `last_raw_close` 另存不复权日线（`bar_raw` 表），只供模拟盘结算撮合与估值：不复权价格不会因为之后的除权而变，多日补跑时也是当天的真实价格；`prev_close` = 收盘 - 涨跌额，是交易所当天的参考昨收（除权日即除权参考价）。分红送转存 `dividends` 表（`save_dividends` / `dividends`）。
 > - `load_panel` 先在全部历史上算 `prev_close = close.shift(1)`，再按 `[start, end]` 截取；每只股票第一根 K 线缺失的 `prev_close` 用当日 `open` 填充。
 > - `BarCache` 额外提供 `codes()`（缓存中全部代码）和 `last_date(code)`。表名加前缀（`bar_daily`/`bar_names`/`index_daily`），和 `Store` 共用同一个 sqlite 文件时不会冲突。约定 bootstrap 用 `save_index("sh000300", ...)` 保存基准。
 > - `index_daily` / `load_index` 返回的 Series 使用归一化 `DatetimeIndex`（和 panel 一致），`name` 为指数代码。`daily_bars` 的 `date` 列是归一化的 `datetime64`。
@@ -5744,6 +5744,13 @@ def test_self_cannot_be_rebound_or_faked(code):
     assert bad(code), code
 
 
+def test_messages_suggest_alternatives():
+    assert any("f-string" in m for m in bad("s = '{:.1%}'.format(0.1)"))
+    assert any("嵌套函数" in m for m in check_source(OK.replace(
+        "    def select(self, view):\n        return []",
+        "    def select(self, view):\n        def helper():\n            self.last = 1\n        return []")))
+
+
 def test_format_and_pandas_extensions_rejected():
     for code in ["v = None\ns = ('{0._DataView' + '_' + '_panel}').format(v)", "s = '{x}'.format_map({})",
                  "import pandas as pd\n@pd.api.extensions.register_series_accessor('astype')\nclass A: pass",
@@ -5931,6 +5938,15 @@ def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
     assert t["gate_pass"] is False and t["holdout_pass"] is False
 
 
+def test_lazy_submodule_import_is_not_a_change():
+    import importlib
+    import sys
+    before = run_eval._rules_state()
+    sys.modules.pop("numpy.polynomial", None)
+    importlib.import_module("numpy.polynomial")  # numpy 子模块惰性导入后会写进 vars(np)
+    assert run_eval._rules_state() == before
+
+
 def test_rules_mutated_while_loading_strategy_void_the_trial(captured, monkeypatch):
     import engine.evaluator as ev
 
@@ -6087,7 +6103,8 @@ def check_source(src: str) -> list[str]:
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"
                     and id(_enclosing_function(node, parent)) in selves):
-                out.append(f"第 {line} 行: 只能给 self 的属性赋值，禁止 {_dotted(node) or node.attr}")
+                out.append(f"第 {line} 行: 只能在类的方法体内直接给 self 的属性赋值（不能在嵌套函数、lambda 或"
+                           f"方法以外），禁止 {_dotted(node) or node.attr}")
         if isinstance(node, ast.Import):
             out += [f"第 {line} 行: 禁止导入 {a.name}" for a in node.names if not _allowed(a.name)]
         elif isinstance(node, ast.ImportFrom):
@@ -6112,7 +6129,10 @@ def check_source(src: str) -> list[str]:
             elif node.attr.startswith("read_") or node.attr in IO_ATTRS:
                 out.append(f"第 {line} 行: 禁止文件读写 {node.attr}")
             elif node.attr in DYNAMIC_ATTRS:
-                out.append(f"第 {line} 行: 禁止动态求值或访问解释器内部模块 {node.attr}")
+                hint = {"format": "，拼字符串用 f-string", "format_map": "，拼字符串用 f-string",
+                        "api": "，判断类型用 isinstance", "seterr": "，忽略数值警告用 np.errstate",
+                        "set_option": "，不要修改全局选项"}.get(node.attr, "")
+                out.append(f"第 {line} 行: 禁止动态求值、修改全局状态或访问解释器内部模块 {node.attr}{hint}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             if "__" in node.value and id(node) not in docs:  # 字符串注解等可以被 typing 求值
                 out.append(f"第 {line} 行: 禁止含双下划线的字符串 {node.value[:40]!r}")
@@ -6134,6 +6154,7 @@ import logging
 import math
 import statistics
 import sys
+import types
 from datetime import date
 from pathlib import Path
 
@@ -6153,12 +6174,13 @@ HISTORY_START = date(2015, 6, 1)
 
 
 def _namespace(obj) -> tuple:
-    """模块或类（含基类）命名空间里全部条目的身份快照：替换、新增、删除任何属性都会改变它。"""
+    """模块或类（含基类）命名空间里全部条目的身份快照：替换、新增、删除任何属性都会改变它。值为模块的条目
+    不计入：numpy、pandas 的子模块（numpy.polynomial 等）在第一次访问时才导入并写进命名空间，这不是改动。"""
     if isinstance(obj, type):
         items = [(f"{k.__qualname__}.{n}", v) for k in obj.__mro__ for n, v in vars(k).items()]
     else:
         items = list(vars(obj).items())
-    return tuple(sorted((n, id(v)) for n, v in items))
+    return tuple(sorted((n, id(v)) for n, v in items if not isinstance(v, types.ModuleType)))
 
 
 def _rules_state() -> tuple:
@@ -6224,7 +6246,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：80 passed（sandbox 61 + run_eval 19；读写文件属性逐项的参数化测试含 37 个用例，self 绑定的参数化测试含 9 个用例）。
+预期：82 passed（sandbox 62 + run_eval 20；读写文件属性逐项的参数化测试含 37 个用例，self 绑定的参数化测试含 9 个用例）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -6232,7 +6254,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：130 passed。
+预期：132 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -9876,7 +9898,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 4. 只 import 下列模块（及其子模块）：<<ALLOWED_IMPORTS>>。不要写 from __future__ import annotations。
 5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停：计算涨跌停价时把 view.asof 作为 d 传入，例如 limit_prices(code, name, prev_close, view.asof)，因为涨跌幅按当天的规则生效；判断是否涨停或跌停用 at_limit_up / at_limit_down，它们容忍一分钱的复权舍入误差。
 6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
-7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；只给 self 的属性赋值，不给模块、类或其他对象的属性赋值；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
+7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；self 只作为类中方法的第一个参数，只在方法体内直接给 self 的属性赋值（不在嵌套函数或 lambda 里），不给模块、类或其他对象的属性赋值；拼字符串用 f-string，不用 str.format；不访问 pd.api、pd.set_option、np.seterr（需要时用 np.errstate）；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
 8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
 9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
 10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。
@@ -10919,7 +10941,7 @@ git commit -m "feat: jobs.bootstrap initializes accounts, playbooks, cache, mani
 - Create: `jobs/settle.py`
 - Test: `tests/test_jobs_settle.py`
 
-规则回顾（撮合与估值用不复权日线，前复权只给策略算因子，见 Part 3 契约说明）：待结算区间 = `calendar.next_day(min(核心账户 last_nav_date))` 到"已收盘的最近交易日"（今天是交易日且 `now >= 15:10` 才包含今天）。每天用 `run_job("settle", d)` 包裹；某天失败即停止后续补跑（后一天依赖前一天持仓）。每个账户若 `last_nav_date >= d` 则跳过，保证重复执行不会重复成交。除权除息：每个待结算日之前先刷新所有持仓股票和当日盘前推荐股票的分红记录（新浪，单只失败不阻塞，汇总告警，下次结算重试），结算完再刷新一次，供次日盘中监控使用；撮合前对上次结算之后到 d 日（含）除权的持仓调用 `apply_dividend`（只在 d 日尚未撮合时调整，重跑不重复）；盘前推荐是按除权前的收盘价写的：盘前定稿有竞价快照时已经按快照昨收换算（推荐的 meta 记 `ex_adjusted`），否则 d 日是除权日时由结算按分红记录把 entry_max、止损、目标价换算到除权后。量化策略按前复权价格写价位，结算用 d 日前复权与不复权两根 K 线的仿射关系（`_to_raw`）换算后再撮合。持仓估值用 d 日（含）之前最近的不复权收盘价，中间有除权时按除权参考价换算（除权日缺 K 线也不会虚增净值）。不复权日线的参考昨收与上一收盘价不一致、却没有分红记录时：分红接口当天失败就暂停结算（下次重试），否则告警（多半是配股）。
+规则回顾（撮合与估值用不复权日线，前复权只给策略算因子，见 Part 3 契约说明）：待结算区间 = `calendar.next_day(min(核心账户 last_nav_date))` 到"已收盘的最近交易日"（今天是交易日且 `now >= 15:10` 才包含今天）。每天用 `run_job("settle", d)` 包裹；某天失败即停止后续补跑（后一天依赖前一天持仓）。每个账户若 `last_nav_date >= d` 则跳过，保证重复执行不会重复成交。除权除息：每个待结算日之前先刷新所有持仓股票和当日盘前推荐股票的分红记录（新浪，单只失败不阻塞，汇总告警，下次结算重试），结算完再刷新一次，供次日盘中监控使用；撮合前对上次结算之后到 d 日（含）除权的持仓调用 `apply_dividend`（只在 d 日尚未撮合时调整，重跑不重复）；盘前推荐的 meta 记每只股票写价位时依据的昨收 `ref_close`（有竞价快照时是快照昨收，价位已按它换算；否则是扫描时的昨收）；结算与 d 日交易所参考昨收比较，不一致（除权除息）才按比例换算，没有 `ref_close` 的旧推荐按分红记录换算。量化策略按前复权价格写价位，结算按 d 日前复权与不复权收盘价之比（`_to_raw`）换算后再撮合。前复权有 d 日 K 线、不复权却没有（取数失败或空表）时暂停结算、下次重试；当天推荐的代码即使不在 kv 股票池里也会检查。持仓估值用 d 日（含）之前最近的不复权收盘价，中间有除权时按除权参考价换算（除权日缺 K 线也不会虚增净值）。不复权日线的参考昨收与上一收盘价不一致、却没有分红记录时：分红接口当天失败就暂停结算（下次重试），否则告警（多半是配股）。
 
 **Step 1: 写失败测试**
 
@@ -11185,6 +11207,29 @@ def test_raw_bar_failure_pauses_and_retries(env):
     assert any(f.code == "600001" for f in store.load_account("h:active").trades)
 
 
+def test_raw_empty_while_adjusted_has_bar_pauses(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    cache.raw["600001"] = cache.raw["600001"].drop(pd.Timestamp(dates[101]))  # 接口返回空表：update_raw 不报失败
+    assert settle.main(now=at(dates[101], 16)) == []
+    assert store.last_nav_date("h:active") == dates[100]
+
+
+def test_raw_update_failure_alone_pauses(env, monkeypatch):
+    dates, cache = env["dates"], env["cache"]
+    monkeypatch.setattr(cache, "update_raw", lambda codes, end, start: ["600001"])  # 旧数据还在，但这次更新失败
+    assert settle.main(now=at(dates[101], 16)) == []
+
+
+def test_recommendation_outside_universe_is_checked(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    df = cache.panel["600001"].copy()
+    cache.panel["600099"], cache.raw["600099"], cache.names["600099"] = df.copy(), df.copy(), "新成分"
+    cache.raw["600099"] = cache.raw["600099"].drop(pd.Timestamp(dates[101]))
+    pick = Pick(code="600099", name="新成分", score=1.0, entry_max=999.0, stop=0.01, target=999.0, hold_days=5)
+    store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True})
+    assert settle.main(now=at(dates[101], 16)) == []  # 不在 kv universe 里，同样暂停而不是按停牌跳过
+
+
 def test_unexplained_ex_with_old_dividend_records_still_pauses(env):
     dates, store = env["dates"], env["store"]
     settle.main(now=at(dates[101], 16))
@@ -11427,8 +11472,9 @@ def _scale(pick, k: float):
 
 def _to_raw(pick, q, r):
     """量化策略按前复权价格写价位，结算按不复权日线撮合。按 d 日两根 K 线的收盘价之比换算（前复权扣减了 d 日之后
-    的分红送转；没有除权时两者相同，价位不变）。不用高低价算斜率：振幅只有几分钱时，舍入到分的误差太大；
-    派息时比例换算与精确的减法略有出入，量级约千分之一。"""
+    的分红送转；没有除权时两者相同，价位不变）。不用高低价算斜率：振幅只有几分钱时，舍入到分的误差太大。
+    派息时比例换算与精确的加回派息略有出入，误差约为 股息率 ×（价位 / 收盘 - 1），高股息低价股可达 0.5%，
+    偏向宽松（买入上限与目标略高、止损略低）。只在多日补跑跨越之后的除权时才会用到。"""
     if q is None or r is None or not (q.close > 0 and r.close > 0):
         return pick
     k = r.close / q.close
@@ -11486,7 +11532,12 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
     不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码。"""
     codes = tracked_codes(store)
-    panel, names = cache.load_panel(codes, d - timedelta(days=LOOKBACK_CAL_DAYS), d)
+    # 当天盘前推荐的代码也载入：盘前扫描用实时股票池，可能有 kv universe 之外的新成分股
+    recs = set()
+    for name in common.LLM_ACCOUNTS:
+        rec = store.load_recommendation(d, name)
+        recs.update(p.code for p in (rec[0] if rec else []))
+    panel, names = cache.load_panel(sorted(set(codes) | recs), d - timedelta(days=LOOKBACK_CAL_DAYS), d)
     qfq_bars = bars_for_day(panel, names, d)
     if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
         raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(qfq_bars)}/{len(codes)}，数据可能未更新")
@@ -11621,7 +11672,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：28 passed。
+预期：31 passed。
 
 **Step 5: 提交**
 
@@ -12627,7 +12678,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 71 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 28、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 74 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 31、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
