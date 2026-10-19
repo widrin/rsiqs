@@ -804,8 +804,7 @@ def at_limit_up(price: float, up: float) -> bool:
     to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
     adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
     than rescaled, so an old sealed price can also sit above the computed limit by more than a
-    cent; any price above it counts as limit-up too (SimBroker additionally requires
-    a one-price bar when the day's prices show the computed band is wrong). Effect on raw prices: a
+    cent; any price above it counts as limit-up too. Effect on raw prices: a
     price exactly one cent below the true limit also counts as limit-up (a buy there is skipped),
     which only makes the simulation slightly more conservative.
     """
@@ -1173,11 +1172,24 @@ def test_apply_dividend_is_idempotent_and_ignores_unknown_code():
 def test_bonus_shares_round_down_and_keep_t_plus_1_lock():
     acc = Account("t", 100_000.0)
     acc.buy(D1, "600000", "浦发银行", 10.0, 1900, 9.3, 11.0, EXIT, "test")
-    acc.apply_dividend(D1, "600000", 0.0, 0.3)  # 1900 * 1.3 = 2470（浮点误差不能变成 2469）
+    acc.apply_dividend(D1, "600000", 0.0, 0.3)
     pos = acc.positions["600000"]
     assert pos.qty == 2470 and pos.available == 0
     acc.start_day(D2)
     assert pos.available == 2470
+    acc2 = Account("t", 100_000.0)
+    acc2.buy(D1, "600000", "浦发银行", 10.0, 100, 9.3, 11.0, EXIT, "test")
+    acc2.apply_dividend(D1, "600000", 0.0, 0.15)  # 100 * 1.15 = 114.99999999999999，不能取整成 114
+    assert acc2.positions["600000"].qty == 115
+
+
+def test_apply_dividend_key_is_code_and_date():
+    acc = _bought()
+    acc.buy(D1, "000001", "平安银行", 10.0, 1000, 9.3, 11.0, EXIT, "test")
+    assert acc.apply_dividend(EX, "600000", 0.3, 0.0) is not None
+    assert acc.apply_dividend(EX, "000001", 0.3, 0.0) is not None  # 同一天另一只股票
+    assert acc.apply_dividend(date(2026, 11, 20), "600000", 0.2, 0.0) is not None  # 同一只股票另一次除权
+    assert len(acc.corporate_actions) == 3
 
 
 @pytest.mark.parametrize("cash,ratio", [(-0.1, 0.0), (0.0, -0.1), (float("nan"), 0.0), (0.0, float("inf")),
@@ -1317,7 +1329,7 @@ class Account:
         if pos is None or any(a["code"] == code and a["date"] == d.isoformat() for a in self.corporate_actions):
             return None
         qty0 = pos.qty
-        qty1 = int(qty0 * (1.0 + share_ratio) + 1e-6)  # 1900 * 1.3 must not floor to 2469
+        qty1 = int(qty0 * (1.0 + share_ratio) + 1e-6)  # 100 * 1.15 is 114.99999999999999 in floats
         net = round(qty0 * cash_per_share * (1.0 - tax_rate), 2)
         self.cash += net
         pos.cost = (pos.cost * qty0 - net) / qty1
@@ -1678,24 +1690,26 @@ def test_unreliable_band_ordinary_day_trades():
     acc4 = held(stop=1.40, target=1.80)
     f4 = run(acc4, [bar(o=1.20, h=1.34, l=1.20, c=1.30, pc=1.50)])[0]
     assert f4.reason == "止损" and f4.price == pytest.approx(1.20 * (1 - SLIP))
-    # a +3.6% open that then traded higher is not limit-up either
+    # buys only look at the open: an open at or beyond the computed limit-up is skipped, whatever
+    # the rest of the day does (conservative; the day's later path must not decide the buy)
     acc2 = Account("t", 100_000.0)
-    f2 = run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
-             [pick(entry_max=1.70, stop=1.55, target=1.90)])[0]
-    assert f2.side == "BUY" and f2.price == pytest.approx(1.66 * (1 + SLIP))
+    assert run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
+               [pick(entry_max=1.70, stop=1.55, target=1.90)]) == []
     # ex-rights day with a stale prev_close (band [18.00, 22.00]): the expiry sell goes through
     acc3 = held(exit_date=D1)
     f3 = run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)])[0]
     assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
 
 
-@pytest.mark.parametrize("h,l,c", [(1.70, 1.62, 1.66), (1.78, 1.68, 1.76)])
-def test_unreliable_band_buy_decision_ignores_the_rest_of_the_day(h, l, c):
-    # same +13% open beyond the computed limit-up 1.65: whether it later fades (open == high) or keeps
-    # rising must not decide the buy, otherwise the day's later path leaks into the decision
+@pytest.mark.parametrize("o,expect_buy", [(1.70, False), (1.65, False), (1.63, True)])
+@pytest.mark.parametrize("path", ["fade", "rise"])
+def test_buy_decision_ignores_the_rest_of_the_day(o, expect_buy, path):
+    # computed limit-up 1.65: the same open gives the same decision whether the day later fades
+    # (open is the high, band looks reliable) or keeps rising (high beyond the band, band unreliable)
+    hi, lo, cl = (o, o - 0.08, o - 0.05) if path == "fade" else (o + 0.08, o - 0.02, o + 0.06)
     acc = Account("t", 100_000.0)
-    f = run(acc, [bar(o=1.70, h=h, l=l, c=c, pc=1.50)], [pick(entry_max=1.75, stop=1.55, target=1.90)])[0]
-    assert f.side == "BUY" and f.price == pytest.approx(1.70 * (1 + SLIP))
+    fills = run(acc, [bar(o=o, h=hi, l=lo, c=cl, pc=1.50)], [pick(entry_max=1.75, stop=1.40, target=1.90)])
+    assert bool(fills) is expect_buy
 
 
 def test_unreliable_band_one_price_open_is_sealed_limit_up():
@@ -1808,11 +1822,11 @@ class SimBroker:
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
            day with a stale prev_close); then fill prices are not clipped, and a limit counts as
-           sealed only for a one-price bar (high == low, so the open was also the high and the
-           low). A wrong band can be far too narrow (e.g. later cash dividends subtracted from
-           forward-adjusted prices), so an ordinary day beyond it still trades; a one-price bar
-           beyond it is still sealed. Requiring open == high alone would let the rest of the day
-           decide the buy (a gap-up that fades is skipped, one that keeps rising is bought).
+           sealed for sells only for a one-price bar (high == low): a wrong band can be far too
+           narrow (e.g. later cash dividends subtracted from forward-adjusted prices), so an
+           ordinary down day beyond it still sells. Buys look at the open only: an open at or
+           beyond the computed limit-up is skipped whether or not the band is reliable, because
+           reliability depends on the day's high and low and must not decide the buy.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -1867,9 +1881,8 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            one_price = _cents(bar.high) == _cents(bar.low)
-            if at_limit_up(bar.open, band[0]) and (band[2] or one_price):
-                continue  # 开盘涨停, cannot buy
+            if at_limit_up(bar.open, band[0]):
+                continue  # 开盘涨停 (or beyond the computed limit-up): cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
             if bar.open <= pick.stop:
@@ -5495,7 +5508,6 @@ import numpy as np
 import pandas as pd
 from engine.types import Pick
 from engine.rules import is_st
-from strategies.base import Strategy
 
 
 class S:
@@ -5527,7 +5539,7 @@ def test_baseline_strategy_passes():
 
 
 def test_import_os_rejected():
-    for code in ["import os", "from os import path", "import engine.store",
+    for code in ["import os", "from os import path", "import engine.store", "from strategies.base import Path",
                  "from engine import ledger", "import subprocess as sp", "from . import base"]:
         v = bad(code)
         assert v and "导入" in v[0], code
@@ -5558,9 +5570,27 @@ def test_string_evaluation_and_engine_mutation_rejected():
                  "import engine.types\nengine.evaluator.GATE.update(dsr=-1)",
                  "import engine.types\nx = engine", "import strategies.base\ns = strategies.sandbox",
                  "import engine.rules as r\nr.COMMISSION_RATE = 0", "from engine.dataview import DataView\nDataView.history = None",
-                 "raise KeyboardInterrupt('x')", "class E(BaseException): pass"]:
+                 "raise KeyboardInterrupt('x')", "class E(BaseException): pass",
+                 "from typing import get_type_hints\nh = get_type_hints", "from typing import ForwardRef\nr = ForwardRef",
+                 "import typing\nt = typing._eval_type", "import engine.rules as r\nr.COMMISSION_RATE -= r.COMMISSION_RATE"]:
         assert bad(code), code
     assert bad("import engine.types\np = engine.types.Pick") == []  # 完整的白名单路径可以
+
+
+def test_attribute_stores_only_on_self():
+    for code in ["import pandas as pd\nS = pd.Series\nS.mean = None", "import math\nM = math\nM.erf = abs",
+                 "import engine.rules as r\n(r,)[0].COMMISSION_RATE = 0", "import pandas as pd\ndel pd.Series.mean",
+                 "import pandas as pd\nfor pd.x in []: pass", "o = object\no.y += 1"]:
+        assert any("self" in m for m in bad(code)), code
+    ok = OK.replace("        self.k = 20", "        self.k = 20\n        self.k += 1\n        del self.k\n        self.k = 3")
+    assert check_source(ok) == []
+    assert bad("import pandas as pd\ndf = pd.DataFrame()\ndf['x'] = 1\ndf.loc[0, 'x'] = 2") == []  # 下标赋值可以
+
+
+def test_file_access_through_pathlike_and_pandas_rejected():
+    for code in ["import pandas as pd\npd.DataFrame().to_string('leak.txt')", "import numpy as np\nnp.fromregex('a', 'b', [])",
+                 "p = None\np.write_text('x')", "p = None\np.open()", "p = None\np.read_text()"]:
+        assert bad(code), code
 
 
 def test_dynamic_access_and_process_control_rejected():
@@ -5680,12 +5710,26 @@ def test_main_reports_system_exit_as_json(captured, monkeypatch):
     assert json.loads(out.getvalue()) == {"error": "SystemExit: 0"}
 
 
-def test_mutated_rules_void_the_trial(captured, monkeypatch):
+def _tamperings(monkeypatch):
     import engine.evaluator as ev
+    import engine.rules as rules
+    return {
+        "gate": lambda: monkeypatch.setitem(ev.GATE, "dsr", -1.0),
+        "holdout_gate": lambda: monkeypatch.setitem(ev.HOLDOUT_GATE, "sharpe", -1.0),
+        "splits": lambda: monkeypatch.setitem(ev.SPLITS, "holdout", (date(2030, 1, 1), None)),
+        "run_backtest": lambda: monkeypatch.setattr(ev, "run_backtest", lambda *a, **k: None),
+        "series_mean": lambda: monkeypatch.setattr(pd.Series, "mean", lambda self, *a, **k: 0.01),
+        "commission": lambda: monkeypatch.setattr(rules, "COMMISSION_RATE", 0.0),
+    }
+
+
+@pytest.mark.parametrize("what", ["gate", "holdout_gate", "splits", "run_backtest", "series_mean", "commission"])
+def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
+    tamper_now = _tamperings(monkeypatch)[what]
 
     def tamper(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
         store.add_trial(name, {}, 1.0, 1.0, True, True)
-        monkeypatch.setitem(ev.GATE, "dsr", -1.0)  # 模拟策略代码在评估中改了门槛
+        tamper_now()  # 模拟策略代码在评估中改了评估规则
         return FakeReport()
 
     monkeypatch.setattr(run_eval, "evaluate", tamper)
@@ -5694,6 +5738,24 @@ def test_mutated_rules_void_the_trial(captured, monkeypatch):
     assert "作废" in json.loads(out.getvalue())["error"]
     t = captured["store_ref"].last_trial("baseline_momo")
     assert t["gate_pass"] is False and t["holdout_pass"] is False
+
+
+def test_rules_mutated_while_loading_strategy_void_the_trial(captured, monkeypatch):
+    import engine.evaluator as ev
+
+    def load(name):  # 策略模块在 import 时（顶层代码）就改了门槛
+        monkeypatch.setitem(ev.GATE, "dsr", -1.0)
+        return captured["sentinel"]
+
+    def evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
+        store.add_trial(name, {}, 1.0, 1.0, True, True)
+        return FakeReport()
+
+    monkeypatch.setattr(run_eval, "load_strategy", load)
+    monkeypatch.setattr(run_eval, "evaluate", evaluate)
+    out = io.StringIO()
+    assert run_eval.main(["baseline_momo"], out=out) == 1
+    assert captured["store_ref"].last_trial("baseline_momo")["gate_pass"] is False
 
 
 def test_main_usage_error():
@@ -5728,7 +5790,8 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 import ast
 
 ALLOWED_IMPORTS = {"math", "statistics", "numpy", "pandas", "dataclasses", "typing",
-                   "engine.types", "engine.dataview", "engine.rules", "strategies.base"}
+                   "engine.types", "engine.dataview", "engine.rules"}
+# strategies.base 不在白名单：它模块级导入了 pathlib.Path；策略按鸭子类型实现 Strategy 接口，不需要 import 它
 BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
                 "getattr", "setattr", "delattr", "breakpoint", "input",
                 # 评估子进程只认 stdout 最后一行和数据库里的试验记录：策略不能打印，也不能提前结束进程
@@ -5739,8 +5802,10 @@ DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins"
                  "subprocess", "attrgetter", "methodcaller", "get_type_hints", "ForwardRef",
                  "_eval_type", "_evaluate", "evaluate_forward_ref"}
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
-            "to_feather", "to_html", "to_clipboard", "load", "loadtxt", "save", "savez",
-            "savetxt", "fromfile", "tofile", "genfromtxt", "memmap"}
+            "to_feather", "to_html", "to_clipboard", "to_string", "to_latex", "to_xml", "to_stata",
+            "to_markdown", "load", "loadtxt", "save", "savez", "savetxt", "fromfile", "tofile",
+            "genfromtxt", "fromregex", "memmap", "DataSource", "open", "write_text", "write_bytes",
+            "read_text", "read_bytes", "unlink", "mkdir", "touch", "rmdir", "iterdir", "glob", "rglob"}
 
 
 def _allowed(mod: str) -> bool:
@@ -5789,16 +5854,13 @@ def check_source(src: str) -> list[str]:
     # import engine.types 会把包名 engine 绑定进来，经它能拿到 engine.evaluator 等任何已加载的模块
     pkg_roots = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
                  for a in n.names if a.asname is None and "." in a.name}
-    imported = {(a.asname or a.name.split(".")[0]) for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
-                for a in n.names}
     for node in ast.walk(tree):
         line = getattr(node, "lineno", "?")
-        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
-            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
-            for t in targets:
-                path = _dotted(t) if isinstance(t, ast.Attribute) else None
-                if path and path.split(".")[0] in imported:
-                    out.append(f"第 {line} 行: 禁止修改已导入模块或类的属性 {path}")
+        # 属性赋值、删除只允许 self.xxx：经任何别名修改模块、类或 pandas 方法（S = pd.Series; S.mean = ...）
+        # 都会改变同一进程里评估器的行为。下标赋值（df["x"] = ...）不受影响
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
+                out.append(f"第 {line} 行: 只能给 self 的属性赋值，禁止 {_dotted(node) or node.attr}")
         if isinstance(node, ast.Import):
             out += [f"第 {line} 行: 禁止导入 {a.name}" for a in node.names if not _allowed(a.name)]
         elif isinstance(node, ast.ImportFrom):
@@ -5842,13 +5904,17 @@ def check_source(src: str) -> list[str]:
 """
 import json
 import logging
+import math
 import sys
 from datetime import date
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from config import get_settings
 from data.cache import BarCache
-from engine import backtest, broker, evaluator, metrics
+from engine import backtest, broker, evaluator, metrics, rules
 from engine.calendar import TradingCalendar
 from engine.evaluator import evaluate
 from engine.store import Store
@@ -5858,11 +5924,19 @@ BENCHMARK = "sh000300"
 HISTORY_START = date(2015, 6, 1)
 
 
+_WATCHED_METHODS = ("mean", "std", "min", "max", "sum", "prod", "pct_change", "cummax", "skew", "kurt", "align",
+                    "dropna", "shift", "copy", "rank", "sort_values", "rolling", "loc", "iloc")
+
+
 def _rules_state() -> tuple:
-    """评估规则的快照。策略代码与评估器在同一进程里：评估结束后核对，被改过就作废这次试验。"""
+    """评估规则的快照，在加载策略之前取。策略代码与评估器在同一进程里（源码检查已禁止给 self 以外的属性赋值，
+    这里是纵深防御）：评估结束后核对，被改过就作废这次试验。"""
     return (repr(evaluator.GATE), repr(evaluator.HOLDOUT_GATE), repr(evaluator.SPLITS), evaluator.run_backtest,
             evaluator.deflated_sharpe, evaluator.sharpe, evaluator._passes_gate, backtest.SimBroker,
-            broker.SimBroker.execute_day, metrics.summarize, metrics.deflated_sharpe)
+            broker.SimBroker.execute_day, metrics.summarize, metrics.deflated_sharpe,
+            repr({k: v for k, v in vars(rules).items() if k.isupper()}), rules.limit_prices, rules.calc_fee,
+            rules.at_limit_up, rules.at_limit_down, math.erf, math.sqrt, np.sqrt, np.isfinite,
+            tuple(getattr(cls, m) for cls in (pd.Series, pd.DataFrame) for m in _WATCHED_METHODS))
 
 
 def run(name: str) -> dict:
@@ -5876,8 +5950,9 @@ def run(name: str) -> dict:
     calendar = TradingCalendar(ts.date() for ts in bench.index)
     panel, names = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
     benchmark_nav = bench / bench.iloc[0]
-    before = _rules_state()
-    report = evaluate(load_strategy(name), name, panel, names, calendar, benchmark_nav, store)
+    before = _rules_state()  # 先取快照再加载策略：策略模块的顶层代码也可能改动评估规则
+    strategy = load_strategy(name)
+    report = evaluate(strategy, name, panel, names, calendar, benchmark_nav, store)
     if _rules_state() != before:
         trial = store.last_trial(name)
         if trial is not None:
@@ -9496,12 +9571,12 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 # 策略代码规范
 每个草稿的 code 是一个完整的 Python 模块，会原样保存为 strategies/<name>.py：
 1. 模块 docstring 以“假设：”开头，写明假设、经济学理由、与现任策略的差异、预期何时失效；Draft.hypothesis 用一两句话概括同一个假设。
-2. 定义一个类，实现 strategies.base.Strategy 接口：类属性 name 等于草稿的 name；方法 select(self, view: DataView) -> list[Pick] 返回按优先级从高到低排序的 Pick 列表（可以多于 5 个：回测取前 5 个，盘前流程最多取前 15 个复核）。
+2. 定义一个类，实现 strategies.base.Strategy 接口（按接口写好 name 和 select 即可，不需要 import strategies.base）：类属性 name 等于草稿的 name；方法 select(self, view: DataView) -> list[Pick] 返回按优先级从高到低排序的 Pick 列表（可以多于 5 个：回测取前 5 个，盘前流程最多取前 15 个复核）。
 3. 模块末尾定义模块级实例 STRATEGY = 你的类()。
 4. 只 import 下列模块（及其子模块）：<<ALLOWED_IMPORTS>>。不要写 from __future__ import annotations。
 5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停：计算涨跌停价时把 view.asof 作为 d 传入，例如 limit_prices(code, name, prev_close, view.asof)，因为涨跌幅按当天的规则生效；判断是否涨停或跌停用 at_limit_up / at_limit_down，它们容忍一分钱的复权舍入误差。
 6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
-7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
+7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；只给 self 的属性赋值，不给模块、类或其他对象的属性赋值；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
 8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
 9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
 10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。
