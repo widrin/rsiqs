@@ -7934,7 +7934,7 @@ def git_commit(paths: list[str], message: str) -> bool:
 uv run pytest tests/test_playbook.py -v
 ```
 
-预期：17 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
+预期：28 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
 
 **Step 5: 提交**
 
@@ -9084,7 +9084,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：42 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
+预期：47 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
 
 **Step 5: Manual smoke step（真实 Claude 深度分析 + 真实竞价快照，不推送、不写正式库）**
 
@@ -9669,7 +9669,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
 uv run pytest tests/test_review.py -v
 ```
 
-预期：13 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
+预期：18 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
 
 ```
 uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py tests/test_review.py -v
@@ -10367,7 +10367,7 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
 uv run pytest tests/test_research_tools.py -v
 ```
 
-预期：34 passed。
+预期：40 passed。
 
 **Step 5: 提交**
 
@@ -11162,7 +11162,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
 uv run pytest tests/test_research_tools.py tests/test_research_loop.py -v
 ```
 
-预期：51 passed（tools 34 + loop 17）。
+预期：66 passed（tools 34 + loop 17）。
 
 **Step 5: 提交**
 
@@ -11904,7 +11904,7 @@ def context():
 ```
 uv run pytest tests/test_jobs_common.py -v
 ```
-预期：9 passed。
+预期：13 passed。
 
 **Step 5: 提交**
 
@@ -12131,7 +12131,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_bootstrap.py -v
 ```
-预期：6 passed。
+预期：7 passed。
 
 **Step 5: 提交**
 
@@ -13021,7 +13021,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：32 passed。
+预期：39 passed。
 
 **Step 5: 提交**
 
@@ -13565,7 +13565,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_entrypoints.py -v
 ```
-预期：19 passed（参数化的 4 个等待场景各算 1 个）。
+预期：25 passed（参数化的 4 个等待场景各算 1 个）。
 
 **Step 5: 提交**
 
@@ -13859,7 +13859,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_monitor.py -v
 ```
-预期：6 passed。
+预期：8 passed。
 
 **Manual smoke step（交易时段，联网）：** `uv run python -c "from jobs import common, monitor; s, st, c, _, _, n = common.context(); print(monitor.check_once(common.today(), st, c, n))"`，预期打印列表（无持仓时为 `[]`），且无异常；可再执行 `uv run python -c "from data.akshare_client import AkClient; print(AkClient().spot().columns.tolist())"` 确认 `high` 列存在（缺失时炸板判断自动跳过）。
 
@@ -14032,7 +14032,7 @@ Write-Host "RSIQS tasks removed: $($tasks.Count)"
 ```
 uv run pytest tests/test_install_tasks.py -v
 ```
-预期：3 passed。
+预期：4 passed。
 
 **Step 5: Manual smoke step（仅 Windows，本机 PowerShell）**
 
@@ -14245,7 +14245,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 78 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 6、`test_jobs_settle.py` 32、`test_jobs_entrypoints.py` 19、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 99 个测试：`test_jobs_common.py` 13、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 39、`test_jobs_entrypoints.py` 25、`test_jobs_monitor.py` 8、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 696 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
