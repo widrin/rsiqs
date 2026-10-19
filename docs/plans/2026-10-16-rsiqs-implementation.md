@@ -7381,7 +7381,7 @@ git commit -m "feat: call Claude via Claude Code CLI headless mode with strict s
 - Create: `playbook/review_system.md`
 - Test: `tests/test_playbook.py`
 
-`apply_lessons` 只依赖 lesson 的 `action/rule_id/text/evidence` 属性（鸭子类型），避免与 `agents.review` 循环导入；测试用 `SimpleNamespace` 构造。`git_commit` 返回 True 表示确实产生了提交；暂存区无变化也返回 False。`playbook/premarket_system.md` 是 08:30 盘前深度分析（Task 4.3 的 `analyze`）的系统提示词；09:25 竞价确认用的是 `agents/premarket.py` 中的常量 `AUCTION_SYSTEM`，不在本文件里。
+`apply_lessons` 只依赖 lesson 的 `action/rule_id/text/evidence` 属性（鸭子类型），避免与 `agents.review` 循环导入；测试用 `SimpleNamespace` 构造。`git_commit` 返回 True 表示确实产生了提交，没有变化返回 None，失败返回 False（调用方只把 False 当作失败）。`playbook/premarket_system.md` 是 08:30 盘前深度分析（Task 4.3 的 `analyze`）的系统提示词；09:25 竞价确认用的是 `agents/premarket.py` 中的常量 `AUCTION_SYSTEM`，不在本文件里。
 
 **Step 1: 写失败的测试**
 
@@ -7556,6 +7556,14 @@ def test_maybe_release_resets_when_premarket_ran_without_playbook(pbdir, cal):
     assert playbook.maybe_release(store, TODAY, cal) is None
     assert store.kv_get("playbook_released") == TODAY.isoformat()
     assert playbook.load("active")["version"] == 2
+
+
+def test_window_reset_never_moves_back(pbdir, cal):
+    store = Store(":memory:")
+    store.kv_set("playbook_released", TODAY.isoformat())  # 今天刚发布过
+    store.save_recommendation(TODAY - dt.timedelta(days=1), "h:candidate", [], {"playbook_version": None})
+    assert playbook.reset_window_if_degraded(store, TODAY - dt.timedelta(days=1)) is True
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
 
 
 def test_load_checked_accepts_bom(pbdir):
@@ -7835,7 +7843,9 @@ def reset_window_if_degraded(store: Store, d: dt.date) -> bool:
     损坏期间盘前按空规则交易，这段净值不能用来比较两版规则；看盘前实际用的版本，不只看复盘时的文件：
     白天修好的那天，盘前用的仍是空规则。复盘回补较早的日子时也要逐日调用。"""
     if corrupt_kinds() or _ran_without_playbook(store, d):
-        store.kv_set(RELEASE_KEY, d.isoformat())
+        cur = store.kv_get(RELEASE_KEY)
+        if cur is None or d.isoformat() > cur:  # 只往后移：补较早的日子时不能把起点退回到上次发布之前
+            store.kv_set(RELEASE_KEY, d.isoformat())
         return True
     return False
 
@@ -8037,7 +8047,7 @@ def git_commit(paths: list[str], message: str) -> bool | None:
 uv run pytest tests/test_playbook.py -v
 ```
 
-预期：30 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
+预期：31 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
 
 **Step 5: 提交**
 
@@ -11445,7 +11455,7 @@ uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research
 > - 行情缓存 `BarCache` 与 `Store` 共用 `settings.db_path` 同一个 sqlite 文件（不同表），其他部分（如 `engine.run_eval`）按同一路径构造即可读到缓存。
 > - `bootstrap` 若 `kv "playbook_released"` 不存在，则写入锚定日 ISO 字符串（视为 v1 的发布日），保证 `maybe_release` 的 10 个交易日间隔从启动日起算。
 > - `monitor` 去重键持久化在 `kv "monitor_sent:<ISO日期>"`（进程重启不重复告警）；`check_once(d, store, client, notifier, cache=None) -> list[str]`（cache 提供分红送转记录，除权除息日按换算后的价位判断）。
-> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟）；两者同时启动、Settle 还没拿到锁时，再轮询最多 2 分钟，唤醒或开机后同时补跑时不会因为结算还没完成而跳过。最近 3 个交易日里已结算、还没复盘的日子一起处理（按日期顺序，某天失败不挡住其余日子，下次重试补上），例如结算为等分红记录暂停后一次补完多天。较早的日子只补发日报：不调用 LLM、不写 lesson、不判断发布，只在盘前按空规则运行时重置发布窗口；LLM 复盘、lesson 与发布只针对最近一个交易日，顺序与平时相同（先按窗口判断发布，再写当天的 lesson）。`playbook.git_commit` 提交成功返回 True、没有变化返回 None、失败返回 False，调用方只把 False 当作失败。研究会话遇到评估环境出错（`run_eval` 退出码 3）时立即停止并告警。
+> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟）；两者同时启动、Settle 还没拿到锁时，再轮询最多 2 分钟，唤醒或开机后同时补跑时不会因为结算还没完成而跳过。最近 3 个交易日里已结算、还没复盘的日子一起处理（按日期顺序；较早的日子没补完时最近一天先不复盘、不判断发布，下次重试接着补；发布窗口的起点只往后移），例如结算为等分红记录暂停后一次补完多天。较早的日子只补发日报：不调用 LLM、不写 lesson、不判断发布，只在盘前按空规则运行时重置发布窗口；LLM 复盘、lesson 与发布只针对最近一个交易日，顺序与平时相同（先按窗口判断发布，再写当天的 lesson）。`playbook.git_commit` 提交成功返回 True、没有变化返回 None、失败返回 False，调用方只把 False 当作失败。研究会话遇到评估环境出错（`run_eval` 退出码 3）时立即停止并告警。
 > - 盘前扫描和结算给策略同样长的历史（`agents.premarket.HISTORY_DAYS` = 550 个自然日，约 370 个交易日），同一现任策略两处选出的股票一致；研究提示词写明上线后可用的历史长度。现任策略一只都没选出来时，`premarket_scan` 推一条"盘前没有候选"。
 > - 盘前分两段。`jobs.premarket_scan`（08:30）在同一个 `run_job("premarket_scan")` 里先跑 `premarket.scan`，再跑 `premarket.run_analyze`（active/candidate 两路深度分析并行，计划存 `kv "plan:<ISO日期>:<kind>"`）。分析失败（包括 `run_analyze` 本身抛异常）不算任务失败：任务照样记 ok，只推一条"盘前分析未完成"告警。启动时已过 09:25（开机补跑）则只扫描、不分析，因为定稿已经开始，计划用不上，不必白花钱。
 > - `jobs.premarket_final` 的计划任务 09:25 触发。入口先判断交易日和是否过时（晚于 09:35 跳过），再等到 09:25:15（竞价快照落定）后定稿；非交易日、过时都不等待。若当日 `premarket_scan` 未完成（开机晚或 08:30 扫描失败），先内联补跑扫描：只扫描不分析，同样记为 `premarket_scan` 完成。此时两路都没有计划，`run_final` 退回量化推荐。补跑扫描在守护线程里跑，最晚到 09:27（09:27 之后才开始时至少给 90 秒，但不晚于 09:33），超时按扫描失败告警；扫描完已过 09:35 时只推"已过时"告警。等到 09:25:15 的秒数扣掉装配依赖花的时间。
@@ -13695,15 +13705,25 @@ def test_review_backfill_only_latest_day_is_a_full_review(env):
     assert env["review_kw"] == [(dates[8], True), (dates[9], True), (dates[10], False)]  # 较早的日子只补日报
 
 
-def test_review_failed_day_does_not_block_others_and_is_retried(env):
+def test_review_failed_backfill_day_holds_back_the_latest_day(env):
     dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
     env["review_fail"].add(dates[9])
     assert review.main(now=at(dates[10], 16, 5)) is False
-    assert [c[1] for c in env["calls"]] == [dates[8], dates[10]]  # 某天失败不挡住其余日子
-    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试补上失败的那天
-    assert [c[1] for c in env["calls"]] == [dates[8], dates[10], dates[9]]
+    assert [c[1] for c in env["calls"]] == [dates[8]]  # 较早的日子没补完：最近一天先不复盘、不判断发布
+    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试按顺序接着补
+    assert [c[1] for c in env["calls"]] == dates[8:11]
+
+
+def test_review_latest_failure_is_retried_alone(env):
+    dates = env["dates"]
+    for d in dates[9:11]:
+        env["store"].mark_job("settle", d, "ok")
+    env["review_fail"].add(dates[10])
+    assert review.main(now=at(dates[10], 16, 5)) is False
+    assert review.main(now=at(dates[10], 16, 25)) is True
+    assert [c[1] for c in env["calls"]] == [dates[9], dates[10]]
 
 
 def test_review_waits_when_started_together_with_settle(env, monkeypatch, tmp_path):
@@ -13985,7 +14005,9 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         return True
     llm = common.make_llm(settings, store)
     ok = True
-    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘；某天失败不挡住其余日子
+    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘
+        if d == last and not ok:
+            return False  # 较早的日子要先重置发布窗口：它们没补完，最近一天先不判断发布，下次重试按顺序接着补
         ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
             d, settings, store, llm, cache, notifier, calendar, backfill=(d != last)), store, notifier) and ok
     return ok
@@ -14030,7 +14052,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_entrypoints.py -v
 ```
-预期：30 passed（参数化的 4 个等待场景各算 1 个）。
+预期：31 passed（参数化的 4 个等待场景各算 1 个）。
 
 **Step 5: 提交**
 
@@ -14781,7 +14803,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 113 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 43、`test_jobs_entrypoints.py` 30、`test_jobs_monitor.py` 12、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 724 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 114 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 43、`test_jobs_entrypoints.py` 31、`test_jobs_monitor.py` 12、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 726 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
