@@ -4104,9 +4104,10 @@ def test_daily_bars_normalizes_chinese_columns(monkeypatch):
 
 def test_raw_bars_unadjusted_with_reference_prev_close(monkeypatch):
     seen = {}
-    raw = pd.DataFrame({  # 1 月 6 日 10 转 5：除权参考价 10.40 / 1.5 = 6.93，当天收 7.00，涨跌幅 1.01%
+    raw = pd.DataFrame({  # 1 月 6 日 10 转 5：除权参考价 10.40 / 1.5 = 6.93，当天收 7.00，涨跌额 0.07
         "日期": ["2026-01-06", "2026-01-05"], "开盘": [6.95, 10.1], "收盘": [7.0, 10.4], "最高": [7.1, 10.5],
-        "最低": [6.9, 10.0], "成交量": [1500, 1000], "成交额": [1.05e6, 1.04e6], "涨跌幅": [1.01, 1.96]})
+        "最低": [6.9, 10.0], "成交量": [1500, 1000], "成交额": [1.05e6, 1.04e6], "涨跌幅": [1.01, 1.96],
+        "涨跌额": [0.07, 0.2]})
 
     def hist(**kw):
         seen.update(kw)
@@ -4116,7 +4117,11 @@ def test_raw_bars_unadjusted_with_reference_prev_close(monkeypatch):
     df = AkClient().raw_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
     assert seen["adjust"] == ""
     assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
-    assert df["prev_close"].tolist() == [10.2, 6.93]  # 收盘 / (1 + 涨跌幅%)：交易所当天的参考昨收
+    assert df["prev_close"].tolist() == [10.2, 6.93]  # 收盘 - 涨跌额：交易所当天的参考昨收
+    # 高价股：昨收 1500.00，收 1523.45，涨跌幅只有两位小数（1.56%），按它反推会得到 1500.05
+    raw2 = raw.iloc[:1].assign(收盘=1523.45, 最高=1530.0, 最低=1500.0, 开盘=1505.0, 涨跌幅=1.56, 涨跌额=23.45)
+    fake_ak(monkeypatch, stock_zh_a_hist=lambda **kw: raw2)
+    assert AkClient().raw_bars("600519", date(2026, 1, 6), date(2026, 1, 6))["prev_close"].tolist() == [1500.0]
 
 
 def test_daily_bars_empty_and_bad_columns(monkeypatch):
@@ -4280,7 +4285,7 @@ log = logging.getLogger(__name__)
 
 DAILY_COLS = {"日期": "date", "开盘": "open", "最高": "high", "最低": "low",
               "收盘": "close", "成交量": "volume", "成交额": "amount"}
-RAW_COLS = {**DAILY_COLS, "涨跌幅": "pct"}
+RAW_COLS = {**DAILY_COLS, "涨跌额": "change"}
 SPOT_EM_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": "prev_close",
                 "最新价": "last", "涨跌幅": "pct", "成交量": "volume", "成交额": "amount", "最高": "high"}
 SPOT_SINA_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": "prev_close",
@@ -4291,7 +4296,7 @@ CLS_COLS = {"标题": "title", "内容": "content", "发布日期": "date", "发
 STOCK_NEWS_COLS = {"新闻标题": "title", "新闻内容": "content", "发布时间": "time"}
 NOTICE_COLS = {"代码": "code", "名称": "name", "公告标题": "title", "公告类型": "type"}
 SPOT_COLS = ["code", "name", "open", "prev_close", "last", "pct", "volume", "amount", "high"]
-NUMERIC = ["open", "high", "low", "close", "volume", "amount", "prev_close", "last", "pct"]
+NUMERIC = ["open", "high", "low", "close", "volume", "amount", "prev_close", "last", "pct", "change"]
 
 
 class DataError(Exception):
@@ -4360,8 +4365,9 @@ class AkClient:
     def raw_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
         """不复权日线，供模拟盘结算撮合与估值：date open high low close volume amount prev_close。
 
-        不复权价格不会因为之后的除权而改变。prev_close 由涨跌幅反推（收盘 / (1 + 涨跌幅%)），即交易所当天的
-        参考昨收；除权除息日就是除权参考价，涨跌停区间据此计算才与交易所一致。"""
+        不复权价格不会因为之后的除权而改变。prev_close = 收盘 - 涨跌额，即交易所当天的参考昨收；除权除息日
+        就是除权参考价，涨跌停区间据此计算才与交易所一致。涨跌额精确到分；涨跌幅只有两位小数，高价股反推
+        的误差可达几角。"""
         cols = ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
         df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
                         start_date=_fmt(start), end_date=_fmt(end), adjust="")
@@ -4369,7 +4375,7 @@ class AkClient:
             return pd.DataFrame(columns=cols)
         out = _pick(df, RAW_COLS, f"stock_zh_a_hist({code}, 不复权)")
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
-        out["prev_close"] = (out["close"] / (1 + out["pct"] / 100)).round(2)
+        out["prev_close"] = (out["close"] - out["change"]).round(2)
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
@@ -5628,7 +5634,9 @@ git commit -m "feat: add strategy protocol, loader and baseline momentum strateg
 # tests/test_sandbox.py
 from pathlib import Path
 
-from strategies.sandbox import check_source
+import pytest
+
+from strategies.sandbox import IO_ATTRS, check_source
 
 OK = """
 import math
@@ -5715,6 +5723,11 @@ def test_attribute_stores_only_on_self():
     assert bad("import pandas as pd\ndf = pd.DataFrame()\ndf['x'] = 1\ndf.loc[0, 'x'] = 2") == []  # 下标赋值可以
 
 
+@pytest.mark.parametrize("attr", sorted(IO_ATTRS))
+def test_every_file_attribute_rejected(attr):
+    assert bad(f"p = None\np.{attr}()"), attr
+
+
 def test_file_access_through_pathlike_and_pandas_rejected():
     for code in ["import pandas as pd\npd.DataFrame().to_string('leak.txt')", "import numpy as np\nnp.fromregex('a', 'b', [])",
                  "p = None\np.write_text('x')", "p = None\np.open()", "p = None\np.read_text()"]:
@@ -5751,9 +5764,11 @@ def test_syntax_error_rejected():
 # tests/test_run_eval.py
 import io
 import json
+import math
 from datetime import date
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -5848,10 +5863,15 @@ def _tamperings(monkeypatch):
         "run_backtest": lambda: monkeypatch.setattr(ev, "run_backtest", lambda *a, **k: None),
         "series_mean": lambda: monkeypatch.setattr(pd.Series, "mean", lambda self, *a, **k: 0.01),
         "commission": lambda: monkeypatch.setattr(rules, "COMMISSION_RATE", 0.0),
+        "limit_prices": lambda: monkeypatch.setattr(rules, "limit_prices", lambda *a, **k: (99.0, 0.01)),
+        "calc_fee": lambda: monkeypatch.setattr(rules, "calc_fee", lambda *a, **k: 0.0),
+        "math_erf": lambda: monkeypatch.setattr(math, "erf", lambda x: 1.0),
+        "np_sqrt": lambda: monkeypatch.setattr(np, "sqrt", lambda x: x),
     }
 
 
-@pytest.mark.parametrize("what", ["gate", "holdout_gate", "splits", "run_backtest", "series_mean", "commission"])
+@pytest.mark.parametrize("what", ["gate", "holdout_gate", "splits", "run_backtest", "series_mean", "commission",
+                                  "limit_prices", "calc_fee", "math_erf", "np_sqrt"])
 def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
     tamper_now = _tamperings(monkeypatch)[what]
 
@@ -7668,7 +7688,7 @@ def test_run_final_fetches_spot_once_saves_both_and_pushes_only_active(store):
     cand, cand_meta = store.load_recommendation(D, "h:candidate")
     assert [p.code for p in act] == ["600001"] and [p.code for p in cand] == ["600003"]
     assert act_meta == {"llm_reviewed": True, "market_view": "A观点（竞价确认：A确认）", "playbook_version": 1,
-                        "ex_adjusted": True}
+                        "ref_close": {"600001": 10.0}}
     assert cand_meta["llm_reviewed"] is True and cand_meta["market_view"] == "C观点"
     assert sorted(c["purpose"] for c in llm.calls) == ["auction:active", "auction:candidate"]
     assert all(c["timeout"] <= premarket.AUCTION_TIMEOUT for c in llm.calls)
@@ -7681,7 +7701,7 @@ def test_run_final_converts_prices_on_ex_date(store):
     ak = FakeAk(opens={"600001": 5.1}, prevs={"600001": 5.0})
     premarket.run_final(D, settings(), store, FakeLLM({"auction:active": check({})}), ak, Recorder(), CAL)
     act, meta = store.load_recommendation(D, "h:active")
-    assert [p.code for p in act] == ["600001"] and meta["ex_adjusted"] is True  # 不换算的话竞价价低于止损 9.60
+    assert [p.code for p in act] == ["600001"] and meta["ref_close"] == {"600001": 5.0}  # 不换算的话竞价价低于止损 9.60
     assert (act[0].entry_max, act[0].stop, act[0].target) == pytest.approx((10.25 / 2, 9.6 / 2, 11.2 / 2), abs=0.006)  # 采用计划价位时舍入到分
     cand, _ = store.load_recommendation(D, "h:candidate")  # 没有计划的一路：量化候选同样换算
     assert cand[1].stop == pytest.approx(9.3 / 2) and cand[0].stop == pytest.approx(9.3)
@@ -7712,7 +7732,7 @@ def test_run_final_without_plans_pushes_quant_without_spot(store):
     assert ak.spot_calls() == 0
     act, meta = store.load_recommendation(D, "h:active")
     assert [p.code for p in act] == CODES[:3] and meta["llm_reviewed"] is False
-    assert meta["ex_adjusted"] is False  # 没有快照：除权换算留给结算按分红记录做
+    assert meta["ref_close"] == {c: 10.0 for c in CODES[:3]}  # 没有快照：记扫描时的昨收，结算再比较
     assert len(notifier.sent) == 1 and "未经 LLM 审核" in notifier.sent[0]
 
 
@@ -8145,6 +8165,18 @@ def _ex_adjust(cands: list[Pick], plan: PremarketPlan | None, ctx: dict, spot: p
     return cands, plan
 
 
+def _ref_close(picks: list[Pick], ctx: dict, spot: pd.DataFrame | None) -> dict[str, float]:
+    """推荐价位对应的昨收：有竞价快照昨收时价位已按它换算（或本来就一致），否则是扫描时的昨收。结算用它与当天
+    交易所的参考昨收比较，不一致（除权除息）时按比例换算。"""
+    rows, stats = _spot_rows(spot, [p.code for p in picks]), ctx.get("stats", {})
+    out = {}
+    for p in picks:
+        pc = _f(rows.get(p.code, {}).get("prev_close")) or _f(stats.get(p.code, {}).get("prev_close"))
+        if pc and pc > 0:
+            out[p.code] = pc
+    return out
+
+
 def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pick],
                  spot: pd.DataFrame | None) -> tuple[list[Pick], bool, str]:
     """不调用 LLM 的确定性结果：无计划用量化；有计划用规则过滤。也是竞价确认失败或超时时的结果。"""
@@ -8225,8 +8257,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
     for kind, (picks, reviewed, view) in results.items():
         meta = {"llm_reviewed": reviewed, "market_view": view,
                 "playbook_version": int(playbook.load(kind).get("version", 1)),
-                # 有竞价快照时价位已按除权参考价换算，结算不再换算；没有快照时由结算按分红记录换算
-                "ex_adjusted": not spot.empty}
+                "ref_close": _ref_close(picks, ctx, spot)}  # 结算据此判断价位是否需要按除权换算
         store.save_recommendation(d, f"h:{kind}", picks, meta)
     picks, reviewed, view = results["active"]
     notifier.send_markdown(format_recommendation(d, picks, reviewed, view))
@@ -11054,6 +11085,37 @@ def test_ex_rights_adjusted_before_matching(env):
     acc = store.load_account("h:active")
     assert [f for f in acc.trades if f.side == "SELL"] == []
     assert acc.positions["600001"].stop == pytest.approx(pick.stop / 2)
+    nav = store.nav_series("h:active")
+    assert nav.iloc[-1] == pytest.approx(nav.iloc[-2], rel=0.05)  # 股数翻倍、价格减半：净值连续
+
+
+def test_raw_bar_failure_pauses_and_retries(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    cache.raw_fail = {"600001"}  # 推荐的股票取不到不复权日线：按停牌处理会漏掉买入，所以暂停
+    assert settle.main(now=at(dates[101], 16)) == []
+    assert store.last_nav_date("h:active") == dates[100]
+    cache.raw_fail = set()
+    assert settle.main(now=at(dates[101], 17)) == [dates[101]]
+    assert any(f.code == "600001" for f in store.load_account("h:active").trades)
+
+
+def test_unexplained_ex_with_old_dividend_records_still_pauses(env):
+    dates, store = env["dates"], env["store"]
+    settle.main(now=at(dates[101], 16))
+    env["cache"].save_dividends("600001", pd.DataFrame({"ex_date": [dates[50]], "cash": [0.1], "ratio": [0.0]}))
+    _split_from(env, "600001", dates[102])
+    env["client"].dividend_data = {"600001": "FAIL"}  # 今天的记录取不到，历史记录不能拿来解释今天的除权
+    assert settle.main(now=at(dates[102], 16)) == []
+
+
+def test_small_unrecorded_dividend_is_detected(env):
+    dates, store = env["dates"], env["store"]
+    settle.main(now=at(dates[101], 16))
+    df = env["cache"].raw["600001"]
+    m = df.index >= pd.Timestamp(dates[102])
+    df.loc[m, ["open", "high", "low", "close", "prev_close"]] -= 0.05  # 每股派息 0.05 元，没有分红记录
+    assert settle.main(now=at(dates[102], 16)) == [dates[102]]
+    assert any("可能是配股" in str(m) for m in env["notifier"].sent)
 
 
 def test_catch_up_across_ex_date_matches_on_unadjusted_prices(env):
@@ -11075,8 +11137,9 @@ def test_missing_bar_on_ex_date_values_at_ex_rights_price(env):
     settle.main(now=at(dates[101], 16))
     env["client"].dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}
     _split_from(env, "600001", dates[102])
-    cache.raw["600001"] = cache.raw["600001"].drop(pd.Timestamp(dates[102]))  # 除权日这只股票的日线没取到
-    settle.main(now=at(dates[102], 16))
+    ts = pd.Timestamp(dates[102])  # 除权日停牌：前复权和不复权都没有这根 K 线
+    cache.raw["600001"], cache.panel["600001"] = cache.raw["600001"].drop(ts), cache.panel["600001"].drop(ts)
+    assert settle.main(now=at(dates[102], 16)) == [dates[102]]
     nav = store.nav_series("h:active")
     assert store.load_account("h:active").positions["600001"].qty % 2 == 0  # 股数已翻倍
     assert nav.iloc[-1] == pytest.approx(nav.iloc[-2], rel=0.05)  # 估值价同样减半，净值没有虚增
@@ -11123,9 +11186,24 @@ def test_recommendation_already_adjusted_is_not_adjusted_again(env):
     o = float(env["cache"].raw["600001"].loc[pd.Timestamp(dates[101]), "open"])
     pick = Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=999.0, stop=round(o * 0.9, 2),
                 target=999.0, hold_days=5, reason="测试")
-    store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True, "ex_adjusted": True})
+    ref = float(env["cache"].raw["600001"].loc[pd.Timestamp(dates[101]), "prev_close"])  # 已是除权参考价
+    store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True, "ref_close": {"600001": ref}})
     settle.main(now=at(dates[101], 16))
     assert store.load_account("h:active").positions["600001"].stop == pytest.approx(pick.stop)
+
+
+def test_recommendation_rescaled_by_ref_close(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    ts = pd.Timestamp(dates[101])
+    ref = float(cache.raw["600001"].loc[ts, "prev_close"])  # 盘前按除权前的昨收写价位（快照没取到）
+    _split_from(env, "600001", dates[101])  # 当天 10 转 10，不需要分红记录
+    o = float(cache.raw["600001"].loc[ts, "open"])
+    pick = Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=999.0, stop=round(o * 1.8, 2),
+                target=9999.0, hold_days=5, reason="测试")  # 止损按除权前价位写：不换算就高于开盘价，买不进
+    store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True, "ref_close": {"600001": ref}})
+    settle.main(now=at(dates[101], 16))
+    pos = store.load_account("h:active").positions["600001"]
+    assert pos.stop == pytest.approx(pick.stop / 2) and pos.target == pytest.approx(9999.0 / 2)
 
 
 def test_quant_pick_converted_when_adjusted_history_moved(env, monkeypatch):
@@ -11135,11 +11213,11 @@ def test_quant_pick_converted_when_adjusted_history_moved(env, monkeypatch):
     cache.panel["600001"].loc[m, ["open", "high", "low", "close", "prev_close"]] -= 0.5  # 前复权整体下调
     q_open = float(cache.panel["600001"].loc[pd.Timestamp(dates[101]), "open"])
 
-    class Tight:  # 买入上限只比前复权开盘价高 1 分：不换算的话，真实开盘价高出 0.5 元，买不进
+    class Tight:  # 买入上限只比前复权开盘价高 2%：不换算的话，真实开盘价高出 0.5 元（约 8%），买不进
         name = "tight"
 
         def select(self, view):
-            return [Pick(code="600001", name="x", score=1.0, entry_max=q_open + 0.01, stop=q_open * 0.8,
+            return [Pick(code="600001", name="x", score=1.0, entry_max=q_open * 1.02, stop=q_open * 0.8,
                          target=q_open * 1.5, hold_days=5)]
 
     monkeypatch.setattr(settle, "load_strategy", lambda name: Tight())
@@ -11150,11 +11228,13 @@ def test_quant_pick_converted_when_adjusted_history_moved(env, monkeypatch):
 
 def test_quant_pick_prices_converted_to_unadjusted():
     from engine.types import Bar
-    q = Bar("600001", dates_d := make_dates()[0], 9.5, 10.0, 9.0, 9.8, 9.6, 1e6, 1e7)
-    r = Bar("600001", dates_d, 10.0, 10.5, 9.5, 10.3, 10.1, 1e6, 1e7)  # 前复权 = 不复权 - 0.5
-    pick = Pick(code="600001", name="x", score=1.0, entry_max=10.0, stop=9.0, target=11.0, hold_days=5)
+    d0 = make_dates()[0]
+    # 窄振幅：之后 10 转 4，前复权 = 不复权 / 1.4 再舍入到分；按收盘价之比换算，误差在千分之一以内
+    r = Bar("600001", d0, 10.33, 10.36, 10.31, 10.33, 10.30, 1e6, 1e7)
+    q = Bar("600001", d0, 7.38, 7.40, 7.36, 7.38, 7.36, 1e6, 1e7)
+    pick = Pick(code="600001", name="x", score=1.0, entry_max=7.53, stop=6.79, target=8.49, hold_days=5)
     out = settle._to_raw(pick, q, r)
-    assert (out.entry_max, out.stop, out.target) == pytest.approx((10.5, 9.5, 11.5))
+    assert (out.entry_max, out.stop, out.target) == pytest.approx((7.53 * 1.4, 6.79 * 1.4, 8.49 * 1.4), rel=1e-3)
     assert settle._to_raw(pick, r, r) is pick and settle._to_raw(pick, None, r) is pick
 
 
@@ -11255,23 +11335,26 @@ def refresh_dividends(store, client, cache, d: date | None = None) -> list[str]:
 RAW_START_DAYS = 30  # 新代码的不复权日线从结算日前 30 天取起：估值和除权核对只需要最近的收盘价
 
 
+def _scale(pick, k: float):
+    return replace(pick, entry_max=pick.entry_max * k, stop=pick.stop * k, target=pick.target * k)
+
+
 def _to_raw(pick, q, r):
-    """量化策略按前复权价格写价位，结算按不复权日线撮合。两者在 d 日是仿射关系（前复权扣减了 d 日之后的分红
-    送转），用 d 日的两根 K 线换算；没有除权时两者相同，价位不变。"""
+    """量化策略按前复权价格写价位，结算按不复权日线撮合。按 d 日两根 K 线的收盘价之比换算（前复权扣减了 d 日之后
+    的分红送转；没有除权时两者相同，价位不变）。不用高低价算斜率：振幅只有几分钱时，舍入到分的误差太大；
+    派息时比例换算与精确的减法略有出入，量级约千分之一。"""
     if q is None or r is None or not (q.close > 0 and r.close > 0):
         return pick
-    if q.high - q.low > 1e-9 and r.high - r.low > 1e-9:
-        a = (r.high - r.low) / (q.high - q.low)
-    else:
-        a = r.close / q.close
-    b = r.close - a * q.close
-    if a <= 0 or (abs(a - 1.0) < 1e-9 and abs(b) < 1e-9):
+    k = r.close / q.close
+    return pick if abs(k - 1.0) < 1e-9 else _scale(pick, k)
+
+
+def _rescale_pick(pick, ref: float | None, bar):
+    """盘前推荐的价位按 ref（写价位时的昨收）写成；d 日交易所的参考昨收与它不同（除权除息）时按比例换算。
+    数据已按新基准复权、或盘前已按竞价快照换算时两者相同，不会重复换算。"""
+    if not ref or bar is None or not bar.prev_close > 0 or abs(bar.prev_close - ref) <= 0.011:
         return pick
-
-    def f(x):
-        return max(a * x + b, 0.01)
-
-    return replace(pick, entry_max=f(pick.entry_max), stop=f(pick.stop), target=f(pick.target))
+    return _scale(pick, bar.prev_close / ref)
 
 
 def _valuation(cache, code: str, d: date) -> float | None:
@@ -11333,9 +11416,12 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     def raw_bars(codes) -> dict:
         need = sorted(set(codes))
         failed = cache.update_raw(need, d, d - timedelta(days=RAW_START_DAYS))
-        if failed:
-            common.log.warning("raw bars failed on %s: %s", d, failed)
-        return cache.raw_bars(need, d, names)
+        bars = cache.raw_bars(need, d, names)
+        # 前复权有 d 日 K 线、不复权却没有：取数失败或接口返回空表。按停牌处理会漏掉止损和买入，所以暂停结算
+        missing = sorted(set(failed) | {c for c in need if c in qfq_bars and c not in bars})
+        if missing:
+            raise DataError(f"{d.isoformat()} 不复权日线获取失败：{', '.join(missing)}，暂停结算，下次重试")
+        return bars
 
     def check_unexplained_ex(code: str, bar) -> None:
         """不复权日线的参考昨收与上一个收盘价不一致，说明 d 日除权除息。没有对应的分红记录时：分红接口今天失败
@@ -11389,7 +11475,11 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
         if not _settled(store, name, d):
             rec = store.load_recommendation(d, name)
             picks = rec[0] if rec else []
-            if rec and not rec[1].get("ex_adjusted"):  # 盘前定稿已经换算过的不再换算
+            ref = rec[1].get("ref_close") if rec else None
+            if ref is not None:  # 盘前记下了每只股票写价位时的昨收：与当天参考昨收比较
+                raw = raw_bars(p.code for p in picks)
+                picks = [_rescale_pick(p, ref.get(p.code), raw.get(p.code)) for p in picks]
+            elif picks:  # 没有 ref_close 的旧推荐：按分红记录换算
                 picks = [_ex_adjust_pick(p, cache, d) for p in picks]
             run(name, picks)
 
