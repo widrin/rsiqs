@@ -1,3 +1,5 @@
+import pytest
+
 import config
 
 ENV_NAMES = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE",
@@ -43,6 +45,37 @@ def test_env_overrides(monkeypatch):
     assert s.wecom_webhook_url == "https://example.invalid/hook"
     assert s.monthly_budget_cny == 150.0 and s.usd_cny == 7.0
     assert s.db_path == ":memory:" and s.capital == 1_000_000.0 and s.max_picks == 3
+
+
+def test_empty_env_falls_back_to_defaults(monkeypatch):
+    _isolate(monkeypatch)
+    for n in ENV_NAMES:
+        monkeypatch.setenv(n, "")
+    monkeypatch.setenv("CAPITAL", "  ")
+    s = config.get_settings()
+    assert s.monthly_budget_cny == 300.0 and s.usd_cny == 7.2
+    assert s.db_path == "data/rsiqs.sqlite" and s.llm_model == "claude-opus-5-5"
+    assert s.capital == 500_000.0 and s.max_picks == 5
+    assert s.anthropic_api_key == "" and s.claude_exe == ""
+
+
+@pytest.mark.parametrize("name,value", [
+    ("MAX_PICKS", "0"), ("MAX_PICKS", "2.5"), ("CAPITAL", "0"), ("CAPITAL", "-1"),
+    ("CAPITAL", "nan"), ("MONTHLY_BUDGET_CNY", "-0.01"), ("USD_CNY", "0"), ("USD_CNY", "abc"),
+])
+def test_invalid_numbers_raise_clear_error(monkeypatch, name, value):
+    _isolate(monkeypatch)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        config.get_settings()
+
+
+def test_zero_budget_allowed_and_settings_validated_directly(monkeypatch):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("MONTHLY_BUDGET_CNY", "0")
+    assert config.get_settings().monthly_budget_cny == 0.0
+    with pytest.raises(ValueError, match="MAX_PICKS"):
+        config.Settings(anthropic_api_key="", wecom_webhook_url="", max_picks=0)
 
 
 def test_repr_hides_secrets():

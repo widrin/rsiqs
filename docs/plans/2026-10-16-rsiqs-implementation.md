@@ -103,6 +103,8 @@ uv sync
 **Step 1: 写失败测试** `tests/test_config.py`（monkeypatch 掉 `load_dotenv`，避免读到本机真实 `.env`）
 
 ```python
+import pytest
+
 import config
 
 ENV_NAMES = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE",
@@ -150,6 +152,37 @@ def test_env_overrides(monkeypatch):
     assert s.db_path == ":memory:" and s.capital == 1_000_000.0 and s.max_picks == 3
 
 
+def test_empty_env_falls_back_to_defaults(monkeypatch):
+    _isolate(monkeypatch)
+    for n in ENV_NAMES:
+        monkeypatch.setenv(n, "")
+    monkeypatch.setenv("CAPITAL", "  ")
+    s = config.get_settings()
+    assert s.monthly_budget_cny == 300.0 and s.usd_cny == 7.2
+    assert s.db_path == "data/rsiqs.sqlite" and s.llm_model == "claude-opus-5-5"
+    assert s.capital == 500_000.0 and s.max_picks == 5
+    assert s.anthropic_api_key == "" and s.claude_exe == ""
+
+
+@pytest.mark.parametrize("name,value", [
+    ("MAX_PICKS", "0"), ("MAX_PICKS", "2.5"), ("CAPITAL", "0"), ("CAPITAL", "-1"),
+    ("CAPITAL", "nan"), ("MONTHLY_BUDGET_CNY", "-0.01"), ("USD_CNY", "0"), ("USD_CNY", "abc"),
+])
+def test_invalid_numbers_raise_clear_error(monkeypatch, name, value):
+    _isolate(monkeypatch)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        config.get_settings()
+
+
+def test_zero_budget_allowed_and_settings_validated_directly(monkeypatch):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("MONTHLY_BUDGET_CNY", "0")
+    assert config.get_settings().monthly_budget_cny == 0.0
+    with pytest.raises(ValueError, match="MAX_PICKS"):
+        config.Settings(anthropic_api_key="", wecom_webhook_url="", max_picks=0)
+
+
 def test_repr_hides_secrets():
     s = config.Settings(anthropic_api_key="sk-secret-1", wecom_webhook_url="https://example.invalid/hook?key=secret-2",
                         anthropic_auth_token="secret-3", anthropic_base_url="https://relay.example.invalid")
@@ -175,7 +208,7 @@ uv run pytest tests/test_config.py -v
 ```
 预期：FAIL，`ModuleNotFoundError: No module named 'config'`。
 
-**Step 3: 最小实现** `config.py`（密钥类字段 `repr=False`：日志或异常里打印 `Settings` 时不会泄露）
+**Step 3: 最小实现** `config.py`（密钥类字段 `repr=False`：日志或异常里打印 `Settings` 时不会泄露；环境变量为空字符串或纯空白时回退到默认值；`Settings.__post_init__` 校验 `max_picks >= 1`、`capital > 0`、`monthly_budget_cny >= 0`、`usd_cny > 0`，报错信息里带环境变量名）
 
 ```python
 """Runtime settings loaded from .env / environment."""
@@ -204,19 +237,42 @@ class Settings:
     anthropic_auth_token: str = field(default="", repr=False)
     claude_exe: str = ""  # claude.exe 完整路径；留空由 agents.llm.find_claude_exe 自动查找
 
+    def __post_init__(self):
+        # 比较式遇到 NaN 为 False，所以 NaN 同样会被拒绝
+        checks = [("MAX_PICKS", self.max_picks, self.max_picks >= 1, ">= 1"),
+                  ("CAPITAL", self.capital, self.capital > 0, "> 0"),
+                  ("MONTHLY_BUDGET_CNY", self.monthly_budget_cny, self.monthly_budget_cny >= 0, ">= 0"),
+                  ("USD_CNY", self.usd_cny, self.usd_cny > 0, "> 0")]
+        for env_name, value, ok, rule in checks:
+            if not ok:
+                raise ValueError(f"配置 {env_name} 必须 {rule}，当前为 {value!r}")
+
+
+def _num(env, name: str, default: str, cast):
+    raw = env(name, default)
+    try:
+        return cast(raw)
+    except ValueError:
+        kind = "整数" if cast is int else "数字"
+        raise ValueError(f"配置 {name} 必须是{kind}，当前为 {raw!r}") from None
+
 
 def get_settings() -> Settings:
     load_dotenv(ROOT / ".env")
-    env = os.environ.get
+
+    def env(name: str, default: str) -> str:
+        value = os.environ.get(name, "")
+        return value if value.strip() else default  # 空字符串（含纯空白）回退到默认值
+
     return Settings(
         anthropic_api_key=env("ANTHROPIC_API_KEY", ""),
         wecom_webhook_url=env("WECOM_WEBHOOK_URL", ""),
-        monthly_budget_cny=float(env("MONTHLY_BUDGET_CNY", "300")),
-        usd_cny=float(env("USD_CNY", "7.2")),
+        monthly_budget_cny=_num(env, "MONTHLY_BUDGET_CNY", "300", float),
+        usd_cny=_num(env, "USD_CNY", "7.2", float),
         db_path=env("DB_PATH", "data/rsiqs.sqlite"),
         llm_model=env("LLM_MODEL", "claude-opus-5-5"),
-        capital=float(env("CAPITAL", "500000")),
-        max_picks=int(env("MAX_PICKS", "5")),
+        capital=_num(env, "CAPITAL", "500000", float),
+        max_picks=_num(env, "MAX_PICKS", "5", int),
         root=ROOT,
         anthropic_base_url=env("ANTHROPIC_BASE_URL", ""),
         anthropic_auth_token=env("ANTHROPIC_AUTH_TOKEN", ""),
@@ -229,7 +285,7 @@ def get_settings() -> Settings:
 ```powershell
 uv run pytest tests/test_config.py -v
 ```
-预期：4 passed。
+预期：14 passed（无效数值的参数化测试含 8 个用例）。
 
 **Step 5: Commit**
 
@@ -251,6 +307,7 @@ git commit -m "chore: scaffold uv project and settings"
 import dataclasses
 from datetime import date
 
+import numpy as np
 import pytest
 
 from engine.types import Bar, Fill, Pick
@@ -279,6 +336,42 @@ def test_bar_is_frozen():
     assert b.name == ""
     with pytest.raises(dataclasses.FrozenInstanceError):
         b.open = 1.0
+
+
+def _pick_kwargs(**over):
+    kw = dict(code="600000", name="浦发银行", score=1.0, entry_max=10.3, stop=9.3, target=11.0,
+              hold_days=5)
+    kw.update(over)
+    return kw
+
+
+def test_pick_coerces_prices_and_hold_days():
+    p = Pick(**_pick_kwargs(entry_max="10.3", stop=9, target=np.float64(11.0), hold_days=np.int64(3)))
+    assert (p.entry_max, p.stop, p.target, p.hold_days) == (10.3, 9.0, 11.0, 3)
+    assert type(p.stop) is float and type(p.target) is float and type(p.hold_days) is int
+    assert Pick(**_pick_kwargs(hold_days=4.0)).hold_days == 4
+
+
+@pytest.mark.parametrize("over", [
+    {"hold_days": 2.5}, {"hold_days": 0}, {"hold_days": -1}, {"hold_days": "abc"},
+    {"hold_days": True}, {"hold_days": float("nan")},
+    {"entry_max": float("nan")}, {"stop": 0}, {"target": -1.0}, {"stop": float("inf")},
+    {"entry_max": "abc"}, {"stop": None},
+    {"stop": 11.0, "target": 11.0}, {"stop": 11.5, "target": 11.0},
+])
+def test_pick_rejects_invalid(over):
+    with pytest.raises(ValueError):
+        Pick(**_pick_kwargs(**over))
+
+
+def test_pick_entry_max_may_exceed_target():
+    assert Pick(**_pick_kwargs(entry_max=12.0, target=11.0)).entry_max == 12.0
+
+
+def test_fill_side_must_be_buy_or_sell():
+    for side in ("buy", "HOLD", ""):
+        with pytest.raises(ValueError):
+            Fill(date(2026, 10, 16), "600000", side, 100, 10.0, 5.0, "x")
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -289,11 +382,13 @@ uv run pytest tests/test_types.py -v
 预期：FAIL，`ModuleNotFoundError: No module named 'engine.types'`。
 
 
-**Step 3: 最小实现** `engine/types.py`
+**Step 3: 最小实现** `engine/types.py`（`Pick.__post_init__` 把价格字段转成 float、`hold_days` 转成 int：2.5 这类非整数直接拒绝，numpy 整数可以；要求价格为有限正数、`hold_days >= 1`、`stop < target`，不要求 `entry_max < target`。`Fill.side` 只能是 "BUY" 或 "SELL"）
 
 ```python
 """Core value types shared across the engine."""
 import datetime
+import math
+import numbers
 from dataclasses import asdict, dataclass, fields
 
 
@@ -322,6 +417,30 @@ class Pick:
     hold_days: int
     reason: str = ""
 
+    def __post_init__(self):
+        """Coerce prices to float and hold_days to int; reject values the broker cannot trade.
+
+        entry_max is deliberately not compared with target (a plan may cap the buy price above it).
+        """
+        for name in ("entry_max", "stop", "target"):
+            raw = getattr(self, name)
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"Pick {self.code}: {name} must be a number, got {raw!r}") from None
+            if not (math.isfinite(v) and v > 0):
+                raise ValueError(f"Pick {self.code}: {name} must be finite and > 0, got {v}")
+            object.__setattr__(self, name, v)
+        h = self.hold_days
+        if (isinstance(h, bool) or not isinstance(h, numbers.Real) or not math.isfinite(h)
+                or h != int(h)):
+            raise ValueError(f"Pick {self.code}: hold_days must be an integer, got {h!r}")
+        object.__setattr__(self, "hold_days", int(h))
+        if self.hold_days < 1:
+            raise ValueError(f"Pick {self.code}: hold_days must be >= 1, got {self.hold_days}")
+        if not self.stop < self.target:
+            raise ValueError(f"Pick {self.code}: stop {self.stop} must be below target {self.target}")
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -340,6 +459,10 @@ class Fill:
     fee: float
     reason: str
 
+    def __post_init__(self):
+        if self.side not in ("BUY", "SELL"):
+            raise ValueError(f"Fill side must be 'BUY' or 'SELL', got {self.side!r}")
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["date"] = self.date.isoformat()
@@ -356,7 +479,7 @@ class Fill:
 ```powershell
 uv run pytest tests/test_types.py -v
 ```
-预期：4 passed。
+预期：21 passed（Pick 非法输入的参数化测试含 14 个用例）。
 
 
 **Step 5: Commit**
