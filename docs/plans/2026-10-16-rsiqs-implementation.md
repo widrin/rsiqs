@@ -14,17 +14,17 @@
 
 **修订（2026-10-19，Part 1 审查修复）：** 涨跌停与费用按日期生效，创业板含 302 号段，涨跌停判断容忍一分钱；撮合改为开盘卖出、开盘买入、盘中卖出三步；账本自保 T+1、拒绝加仓与异常价格；`Pick`、`Fill`、配置增加输入校验。后续 Part 的代码无需改动，只同步了提示词中的撮合与费用描述。
 
-**修订（2026-10-19，Part 1 第二轮审查修复）：** 当天开盘、最高、最低价超出涨跌停区间一档以上时，视为区间不可靠（例如除权日的昨收仍是除权前价格），不做封板判断、成交价也不截断；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词。
+**修订（2026-10-19，Part 1 第二、三轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断；封板判断照常进行，价格越过涨跌停价也算封板，结果偏保守；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，404 个测试全部通过（Part 1 共 131 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，407 个测试全部通过（Part 1 共 133 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
 ## Part 1: 工程脚手架与撮合核心
 
-> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价超出该区间一档以上时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时既不做封板判断也不截断。
+> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，但封板判断照常进行。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（131 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（133 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -796,7 +796,9 @@ def at_limit_up(price: float, up: float) -> bool:
 
     Daily bars are forward-adjusted (前复权): adjusted prices are raw prices rescaled and rounded
     to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
-    adjusted prev_close. The tolerance absorbs that rounding. Effect on raw prices: a price exactly
+    adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
+    than rescaled, so an old sealed price can also sit above the computed limit by more than a
+    cent; any price above it counts as limit-up too. Effect on raw prices: a price exactly
     one cent below the true limit also counts as limit-up (a buy there is skipped), which only
     makes the simulation slightly more conservative.
     """
@@ -807,8 +809,9 @@ def at_limit_down(price: float, down: float) -> bool:
     """True when ``price`` is at the limit-down price, with one tick (0.01) of tolerance.
 
     Same reason as ``at_limit_up``: forward-adjusted rounding can leave a sealed limit-down one cent
-    off. Effect on raw prices: a high exactly one cent above the true limit-down also counts as
-    sealed (the sell is skipped), again erring on the conservative side.
+    off, and any price below the computed limit counts as limit-down. Effect on raw prices: a high
+    exactly one cent above the true limit-down also counts as sealed (the sell is skipped), again
+    erring on the conservative side.
     """
     return round(price * 100) <= round(down * 100) + 1
 
@@ -1271,7 +1274,7 @@ git commit -m "feat(engine): add T+1 account ledger"
 
 执行顺序（`execute_day` 的 docstring 写明了同样的规则）：
 
-0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态），此时不做封板判断，成交价也不截断。
+0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断；下面的封板判断照常进行，价格越过涨跌停价也算封板，结果偏保守。
 1. 开盘卖出：`at_limit_down(high, down)` 说明全天封死跌停，不能卖。否则依次判断：到期按开盘价卖出；开盘价 ≤ 止损价按开盘价止损；开盘价 ≥ 目标价按开盘价止盈；只在盘中触及止损或目标的持仓推迟到第 3 步。
 2. 开盘买入（按 picks 顺序）：跳过已持仓、无效行情、`at_limit_up(open, up)`、开盘价高于 entry_max、开盘价不高于 pick 止损价的情况；股数按整手计算并考虑最低 5 元佣金，现金不会为负；exit_date 用 `calendar.offset` 计算。
 3. 盘中卖出：处理第 1 步推迟的持仓。盘中低点 ≤ 止损价按止损价卖出（止损和目标同时触及时止损优先，因为日线看不出盘中先后）；否则按目标价卖出。
@@ -1340,7 +1343,8 @@ def test_open_above_entry_max_skipped():
 def test_suspended_pick_skipped():
     acc = Account("t", 100_000.0)
     assert run(acc, [bar(vol=0)], [pick()]) == []
-    assert run(acc, [], [pick()]) == []
+    acc2 = Account("t", 100_000.0)  # fresh account: a second run on acc would be a same-day no-op
+    assert run(acc2, [], [pick()]) == [] and not acc2.positions
 
 
 def test_qty_below_one_lot_skipped():
@@ -1408,7 +1412,8 @@ def test_all_day_limit_down_blocks_sell():
 def test_suspended_position_not_sold():
     acc = held(exit_date=D1)
     assert run(acc, [bar(vol=0)]) == []
-    assert run(acc, []) == []
+    acc2 = held(exit_date=D1)
+    assert run(acc2, []) == [] and acc2.positions["600000"].qty == 1000
 
 
 def test_bought_today_not_exited_today():
@@ -1477,11 +1482,13 @@ def test_earlier_day_than_last_trade_day_raises():
 
 
 def test_last_trade_day_survives_serialization():
-    acc = Account("t", 100_000.0)
-    run(acc, [bar()], [pick()])
+    acc = held(cash=10_100.0)
+    bars, picks = [bar(o=10.5, h=11.2, l=10.4), bar(**PA_BAR)], [pick(**PA_PICK)]
+    run(acc, bars, picks)
     acc2 = Account.from_dict(acc.to_dict())
     assert acc2.last_trade_day == D1
-    assert run(acc2, [bar()], [pick(code="000001", name="平安银行")]) == []
+    before = acc2.to_dict()
+    assert run(acc2, bars, picks) == [] and acc2.to_dict() == before
 
 
 @pytest.mark.parametrize("over", [dict(o=float("nan")), dict(h=float("nan")), dict(l=0.0),
@@ -1525,10 +1532,10 @@ def test_st_sealed_limit_down_before_rule_change_blocks_sell():
 
 
 def test_open_at_or_below_stop_not_bought():
-    acc = Account("t", 100_000.0)
-    assert run(acc, [bar(o=9.6, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
-    assert run(acc, [bar(o=9.8, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
-    assert not acc.positions
+    for o in (9.6, 9.8):  # below and equal to the stop; a fresh account each time
+        acc = Account("t", 100_000.0)
+        assert run(acc, [bar(o=o, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
+        assert not acc.positions
 
 
 def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
@@ -1539,22 +1546,27 @@ def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
     assert f.side == "BUY" and f.price == pytest.approx(13.40 * (1 + SLIP))
 
 
-def test_unreliable_band_skips_limit_checks():
-    # o=h=l would look sealed at limit-down / limit-up, but the prices lie outside the band
-    acc = held(exit_date=D1)
-    f = run(acc, [bar(o=13.4, h=13.4, l=13.4, c=13.4, pc=20.0)])[0]
-    assert f.reason == "到期" and f.price == pytest.approx(13.4 * (1 - SLIP))
-    acc2 = Account("t", 100_000.0)
-    f2 = run(acc2, [bar(o=15.0, h=15.0, l=15.0, c=15.0, pc=10.0)],
-             [pick(entry_max=15.5, stop=14.0, target=17.0)])[0]
-    assert f2.side == "BUY" and f2.price == pytest.approx(15.0 * (1 + SLIP))
+def test_unreliable_band_keeps_limit_checks():
+    # forward adjustment subtracts later cash dividends, so an old one-price limit-up can sit above
+    # the limit computed from the adjusted prev_close: 9.50 gives 10.45, the bar is 10.50
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=10.5, h=10.5, l=10.5, c=10.5, pc=9.5)],
+               [pick(entry_max=11.0, stop=9.8, target=12.0)]) == []
+    # the same on the way down: limit-down 8.55, a one-price bar at 8.50 cannot be sold, even at expiry
+    acc2 = held(exit_date=D1)
+    assert run(acc2, [bar(o=8.5, h=8.5, l=8.5, c=8.5, pc=9.5)]) == []
+    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the whole day sits below
+    # limit-down, so the position stays put instead of being stopped out at a fake price
+    acc3 = held(exit_date=D1)
+    assert run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)]) == []
+    assert acc2.positions["600000"].qty == acc3.positions["600000"].qty == 1000
 
 
 def test_unreliable_band_intraday_stop_not_clipped():
-    acc = held(stop=9.3)
-    # band [18.00, 22.00] from the stale prev_close; the stop fill stays at stop * (1 - slip)
-    f = run(acc, [bar(o=9.8, h=9.9, l=9.2, c=9.5, pc=20.0)])[0]
-    assert f.reason == "止损" and f.price == pytest.approx(9.3 * (1 - SLIP))
+    acc = held(stop=11.7, target=13.0)
+    # band [9.00, 11.00] is below the whole day; the stop fill stays at stop * (1 - slip), not 11.00
+    f = run(acc, [bar(o=12.0, h=12.5, l=11.6, c=12.2, pc=10.0)])[0]
+    assert f.reason == "止损" and f.price == pytest.approx(11.7 * (1 - SLIP))
 
 
 @pytest.mark.parametrize("h,clipped", [(22.01, True), (22.02, False)])
@@ -1565,6 +1577,15 @@ def test_band_reliability_allows_one_tick(h, clipped):
             [pick(entry_max=22.5, stop=20.0, target=24.0)])[0]
     raw = 21.98 * (1 + SLIP)
     assert f.price == (22.0 if clipped else pytest.approx(raw))
+
+
+@pytest.mark.parametrize("low,clipped", [(17.99, True), (17.98, False)])
+def test_band_reliability_allows_one_tick_below(low, clipped):
+    # band [18.00, 22.00]: only the low decides; the intraday stop at 18.00 sells at 17.982 before clipping
+    acc = held(stop=18.0, target=21.0)
+    f = run(acc, [bar(o=18.5, h=18.8, l=low, c=18.6, pc=20.0)])[0]
+    assert f.reason == "止损"
+    assert f.price == (18.0 if clipped else pytest.approx(18.0 * (1 - SLIP)))
 
 
 def test_reliable_band_still_clips_buy_at_limit_up():
@@ -1594,7 +1615,7 @@ from engine.ledger import Account, Position
 from engine.rules import at_limit_down, at_limit_up, calc_fee, limit_prices, round_lot
 from engine.types import Bar, Fill, Pick
 
-Band = tuple[float, float] | None  # (limit_up, limit_down), or None when the band is unreliable
+Band = tuple[float, float, bool]  # (limit_up, limit_down, reliable)
 
 
 def _valid(bar: Bar | None) -> bool:
@@ -1605,22 +1626,22 @@ def _valid(bar: Bar | None) -> bool:
 
 
 def _band(bar: Bar, d: date) -> Band:
-    """Limit band for ``bar`` on ``d``, or None if the day's prices show the band is wrong.
+    """Limit prices for ``bar`` on ``d`` and whether the day's prices agree with them.
 
-    The band is trusted only if open, high and low all lie within [limit_down - 0.01,
+    The band is reliable only if open, high and low all lie within [limit_down - 0.01,
     limit_up + 0.01] (one tick for forward-adjusted rounding). A price outside it means the band
-    itself is off, e.g. an ex-rights day whose prev_close is still the pre-split close, or an ST
-    status taken from today's name.
+    itself is off, e.g. an ex-rights day whose prev_close is still the pre-split close, an ST
+    status taken from today's name, or later cash dividends subtracted from forward-adjusted
+    prices (which shifts an old sealed price by 10% of those dividends).
     """
     up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
     lo, hi = round(down * 100) - 1, round(up * 100) + 1
-    if all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low)):
-        return up, down
-    return None
+    return up, down, all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low))
 
 
 def _clip(price: float, band: Band) -> float:
-    return price if band is None else min(max(price, band[1]), band[0])
+    up, down, reliable = band
+    return min(max(price, down), up) if reliable else price
 
 
 class SimBroker:
@@ -1640,8 +1661,8 @@ class SimBroker:
            is treated as suspended and nothing trades in it. Limits come from
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
-           day with a stale prev_close); then no limit check is made and fill prices are not
-           clipped.
+           day with a stale prev_close); then fill prices are not clipped. The limit checks below
+           still apply: a price beyond a limit counts as sealed, which errs on the safe side.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -1674,7 +1695,7 @@ class SimBroker:
             if pos.available <= 0 or not _valid(bar):
                 continue  # locked by T+1, or suspended / bad data
             band = _band(bar, d)
-            if band and at_limit_down(bar.high, band[1]):
+            if at_limit_down(bar.high, band[1]):
                 continue  # sealed at limit-down all day: cannot sell
             if d >= pos.exit_date:
                 reason = "到期"
@@ -1695,7 +1716,7 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            if band and at_limit_up(bar.open, band[0]):
+            if at_limit_up(bar.open, band[0]):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
@@ -1729,7 +1750,7 @@ class SimBroker:
 ```powershell
 uv run pytest tests/test_broker.py -v
 ```
-预期：39 passed（无效行情的参数化测试含 6 个用例，区间可靠性的参数化测试含 2 个用例）。
+预期：41 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试各含 2 个用例）。
 
 
 **Step 4b: 全量回归**
@@ -1737,7 +1758,7 @@ uv run pytest tests/test_broker.py -v
 ```powershell
 uv run pytest -v
 ```
-预期：Part 1 共 131 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 16 + broker 39）全部通过。
+预期：Part 1 共 133 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 16 + broker 41）全部通过。
 
 
 **Step 5: Commit**
@@ -4409,6 +4430,10 @@ def test_limit_up_uses_rules_in_force_on_asof():
         dates = pd.bdate_range(end=asof, periods=80)
         v = DataView({"300001": series(limit_up_path(), dates=dates)}, {"300001": "特锐德"}, asof=asof)
         assert [p.code for p in STRATEGY.select(v)] == expected
+    # 收盘比涨停价 11.00 低一分钱也按涨停排除（容忍复权舍入）
+    c = limit_up_path()
+    c[-1] = 10.99
+    assert STRATEGY.select(DataView({"600010": series(c)}, {"600010": "股票0"}, asof=ASOF)) == []
 
 
 def test_load_and_list_strategies():
@@ -4904,7 +4929,7 @@ git commit -m "feat: add strategy source sandbox and isolated evaluation CLI"
 > 6. 本部分新增的名字：`playbook.ROOT`、`playbook.load_prompt(name)`（读 `playbook/<name>_system.md`）；`premarket.load_plan(store, d, kind)`（读回已存计划，没有或无法解析时为 None）；`premarket.SPOT_TIMEOUT`；`finalize` 的 `spot` 传 `None` 表示自行拉取，传空表表示竞价数据缺失。`premarket.AUCTION_SYSTEM` 是代码常量，不放在 `playbook/` 里；`playbook/premarket_system.md` 只用于 08:30 的深度分析。
 > 7. 竞价快照获取失败或为空时没有快照行，计划中的 keep 全部通过规则过滤，确认调用的提示里写明"竞价数据缺失"；有快照行但竞价价或昨收缺失、非正（多为停牌）视为不满足条件。竞价涨幅四舍五入到 0.01 个百分点后按闭区间 `[min_gap_pct, max_gap_pct]` 比较，避免 10.20/10.00 这类恰在边界的价格因浮点误差被误判；`min_gap_pct > max_gap_pct` 时区间为空，有快照行的该股不通过。规则过滤后为空时不再调用竞价确认。
 > 8. `maybe_release` 首次调用只记录窗口起点并返回 None；候选与现行规则相同则只重开窗口；落后时重置候选并返回提示文本。
-> 9. 价格合理性：计划价位四舍五入到分后，满足 `stop < entry_max < target` 且三者都在量化 `entry_max` 的 0.5~1.5 倍内才采用，否则沿用量化价格。规则过滤中的"竞价价 ≤ entry_max"使用最终采用的 entry_max，和撮合（Task 1.6）判断开盘价的口径一致。
+> 9. 价格合理性：计划价位四舍五入到分后，满足 `stop < entry_max < target` 且三者都在量化 `entry_max` 的 0.5~1.5 倍内才采用，否则沿用量化价格。规则过滤中的"竞价价 ≤ entry_max"和"竞价价 > stop"使用最终采用的 entry_max 和 stop，和撮合（Task 1.6）判断开盘价的口径一致。
 > 10. `run_review` 遇到 `BudgetExceeded` 以外的 LLM 异常（`LLMError`、超时、校验失败）也照常推送日报，摘要写明"复盘失败"，job 记为 ok，避免一次调用故障让当天日报丢失；每次最多采纳 `review.MAX_LESSONS = 3` 条 lesson。
 > 11. `agents.review` 以 `playbook.git_commit(...)` / `playbook.maybe_release(...)` 的模块属性方式调用，便于测试打桩；提交路径固定为 `playbook/active.json`、`playbook/candidate.json`。
 
@@ -5881,7 +5906,7 @@ def git_commit(paths: list[str], message: str) -> bool:
 # 当日流程
 
 1. 08:30 你完成本次分析，为每只候选输出 action、confidence、价位和竞价条件。
-2. 09:15~09:25 集合竞价。09:25 竞价结束后，系统按你写的条件逐只检查：竞价涨幅（相对昨收）必须落在 [min_gap_pct, max_gap_pct] 之内，并且竞价价不高于 entry_max。不满足的股票当天放弃。
+2. 09:15~09:25 集合竞价。09:25 竞价结束后，系统按你写的条件逐只检查：竞价涨幅（相对昨收）必须落在 [min_gap_pct, max_gap_pct] 之内，竞价价不高于 entry_max，并且高于 stop。不满足的股票当天放弃。
 3. 通过检查的股票按 confidence 从高到低取前几只，再做一次简短的竞价确认（只能否决，不能新增，也不改价位），09:28 前推送给用户。
 4. 09:30 模拟盘按开盘价加少量滑点买入。之后的止损、止盈和到期卖出都使用你给出的价位。
 
@@ -5959,7 +5984,7 @@ def git_commit(paths: list[str], message: str) -> bool:
 
 - T+1：当日买入次日才能卖出；涨跌幅主板 ±10%，创业板/科创板 ±20%，主板 ST 自 2026-07-06 起 ±10%（此前 ±5%），北交所 ±30%。
 - 开盘一字涨停买不进、一字跌停卖不出；成交按开盘价加滑点模拟。
-- 推荐若因开盘价高于 entry_max 或开盘涨停而未成交，也属于需要复盘的事件（价格设置过紧还是本就该放弃）。
+- 推荐若因开盘价高于 entry_max、开盘价不高于 stop 或开盘涨停而未成交，也属于需要复盘的事件（价格设置过紧还是本就该放弃）。
 
 # 复盘方法
 
@@ -6298,6 +6323,15 @@ def test_auction_filter_entry_max_uses_adopted_price():
              pp("600002", conf=0.7, entry=10.1, stop=10.5, target=11.0))  # 价位不合理 -> 量化上限 10.30，保留
     out = premarket.auction_filter(p, CANDS, FakeAk().spot())
     assert [(x.code, x.entry_max) for x in out] == [("600001", 10.2), ("600002", 10.3)]
+
+
+def test_auction_filter_drops_open_at_or_below_adopted_stop():
+    # 撮合在开盘价不高于止损价时不买（Task 1.6）；竞价过滤同样剔除，名额留给后面能成交的股票
+    p = plan(pp("600000", conf=0.9, lo=-5.0),   # 竞价 9.55 < 采用的止损 9.60
+             pp("600001", conf=0.8, lo=-5.0),   # 竞价 9.60 = 止损
+             pp("600002", conf=0.7, lo=-5.0))   # 竞价 9.65 > 止损，保留
+    spot = FakeAk(opens={"600000": 9.55, "600001": 9.6, "600002": 9.65}).spot()
+    assert [x.code for x in premarket.auction_filter(p, CANDS, spot)] == ["600002"]
 
 
 def test_auction_filter_missing_spot_row_keeps_pick():
@@ -6805,7 +6839,8 @@ def _merge(q: Pick, pp: PlannedPick) -> Pick:
 
 def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | None) -> list[Pick]:
     """确定性规则：取计划中 action=keep 且仍在候选里的股票；有竞价行时要求竞价涨幅在
-    [min_gap_pct, max_gap_pct] 内且竞价价 <= 最终采用的 entry_max；没有竞价行则保留。按 confidence 降序。"""
+    [min_gap_pct, max_gap_pct] 内，且最终采用的 stop < 竞价价 <= 最终采用的 entry_max（与撮合口径一致）；
+    没有竞价行则保留。按 confidence 降序。"""
     by_code = {p.code: p for p in cands}
     rows = _spot_rows(spot, list(by_code))
     out: list[Pick] = []
@@ -6818,8 +6853,8 @@ def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | 
         pick = _merge(by_code[code], pp)
         row = rows.get(code)
         if row is not None:
-            gap = _gap_pct(row)
-            if gap is None or not pp.min_gap_pct <= gap <= pp.max_gap_pct or _f(row["open"]) > pick.entry_max:
+            gap, op = _gap_pct(row), _f(row["open"])
+            if gap is None or not pp.min_gap_pct <= gap <= pp.max_gap_pct or not pick.stop < op <= pick.entry_max:
                 continue
         out.append(pick)
     return out
@@ -6917,7 +6952,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：30 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
+预期：31 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
 
 **Step 5: Manual smoke step（真实 Claude 深度分析 + 真实竞价快照，不推送、不写正式库）**
 
@@ -8133,7 +8168,8 @@ def run(e, llm):
 def test_system_prompt_key_points_and_neutral_wording():
     for kw in ["≤5", "沪深 300", "开盘价", "T+1", "train", "val", "holdout", "通过/不通过", "DSR",
                "n_trials", "过拟合", "经济学", "docstring", "STRATEGY", "Strategy", "不联网", "可复现",
-               "done=true", "view.asof", "at_limit_up", "at_limit_down"]:
+               "done=true", "limit_prices(code, name, prev_close, view.asof)", "at_limit_up", "at_limit_down",
+               "开盘价不高于 stop"]:
         assert kw in RESEARCH_SYSTEM, kw
     for mod in ALLOWED_IMPORTS:
         assert mod in RESEARCH_SYSTEM, mod
@@ -10670,7 +10706,7 @@ Claude 鉴权二选一（`.env.example` 里有同样的注释）：
 - 中转：填 `ANTHROPIC_BASE_URL`（中转地址）和 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 留空；
 - 官方：只填 `ANTHROPIC_API_KEY`。
 
-`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `.env` 的这几项，所以 claude.exe 子进程只用 `.env` 里的鉴权，本机 Claude Code 自己的登录状态不影响 RSIQS。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
+`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `get_settings()` 里非空的这几项，所以本机 Claude Code 自己的登录状态不影响 RSIQS。注意 `get_settings()` 每个键先取非空的系统环境变量，再取 `.env`：系统环境里如果有非空的 `ANTHROPIC_API_KEY` 等变量，会覆盖 `.env`，并随子进程发给`ANTHROPIC_BASE_URL` 指向的地址。使用中转时，先确认系统环境里没有这些变量（PowerShell：`Get-ChildItem Env:ANTHROPIC_*`）。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
 
 **Step 4: Manual smoke steps（联网）**
 
