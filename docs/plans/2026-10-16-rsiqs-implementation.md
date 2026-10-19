@@ -24,13 +24,13 @@
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，532 个测试全部通过（Part 1 共 152 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，592 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
 ## Part 1: 工程脚手架与撮合核心
 
-> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，封板只看一字形态（最高价等于最低价才算封死涨跌停）。(5) 除权除息只在模拟盘结算时由 `Account.apply_dividend` 处理：回测用的是一致的前复权历史，不需要调整；不建模配股，送转后的零碎股向下取整，分红一律按持股 1 个月以内的 20% 扣税。
+> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断；卖出侧只有一字板才算封死跌停，开盘买入只看开盘价（达到或越过算出的涨停价就不买）。(5) 除权除息只在模拟盘结算时由 `Account.apply_dividend` 处理：回测用的是一致的前复权历史，不需要调整；不建模配股，送转后的零碎股向下取整，分红一律按持股 1 个月以内的 20% 扣税。
 
 本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（152 个用例）。
 
@@ -1398,7 +1398,7 @@ git commit -m "feat(engine): add T+1 account ledger"
 
 执行顺序（`execute_day` 的 docstring 写明了同样的规则）：
 
-0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断，下面的封板判断改为只看一字形态：最高价等于最低价才算封死涨停或跌停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出。
+0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断；卖出侧只有一字板（最高价等于最低价）才算封死跌停：算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格跌三四个点就会越过算出的跌停价），普通下跌日照常卖出。开盘买入只看开盘价：开盘达到或越过算出的涨停价就不买，与区间是否可靠无关（可靠与否取决于当天的最高、最低价，不能用来决定开盘买入）。
 1. 开盘卖出：`at_limit_down(high, down)` 说明全天封死跌停，不能卖。否则依次判断：到期按开盘价卖出；开盘价 ≤ 止损价按开盘价止损；开盘价 ≥ 目标价按开盘价止盈；只在盘中触及止损或目标的持仓推迟到第 3 步。
 2. 开盘买入（按 picks 顺序）：跳过已持仓、无效行情、`at_limit_up(open, up)`、开盘价高于 entry_max、开盘价不高于 pick 止损价的情况；股数按整手计算并考虑最低 5 元佣金，现金不会为负；exit_date 用 `calendar.offset` 计算。
 3. 盘中卖出：处理第 1 步推迟的持仓。盘中低点 ≤ 止损价按止损价卖出（止损和目标同时触及时止损优先，因为日线看不出盘中先后）；否则按目标价卖出。
@@ -1945,7 +1945,7 @@ git commit -m "feat(engine): add open-auction SimBroker"
 > - `summarize` 的 `excess_ann` 与 `promotion.compare` 的年化超额 = 逐日超额收益均值 × 252（算术年化）。`compare` 先按日期对齐两条净值再算收益（一方缺日时两边都用跨过缺口的同一段收益）；`summarize` 的 `n_days` 是收益天数（净值点数减一）。
 > - `deflated_sharpe` 使用每期（日）SR；各试验 SR 的方差近似为 `1/n_obs`（零假设下 SR 估计量方差），`n_trials<=1` 时 SR0=0；逆正态用标准库 `statistics.NormalDist().inv_cdf`，CDF 用 `math.erf`。
 > - `sharpe` 把 `std <= 1e-12`（含 pandas 浮点噪声，如 `[0.1]*3` 的 std≈1.7e-17）按 `std==0` 处理，返回 0。
-> - `DataView.asof` 为只读 property；私有状态用 `__slots__` + 双下划线名字改编。改编后的 `_DataView__panel` 仍可访问，挡住它靠两层：Task 3.6 的源码检查禁止任何含 `__` 的属性、名字和标识符式字符串；`run_backtest` 只把截断到本段末尾的面板交给 DataView，训练、验证段看不到之后的数据。`codes()` 只列出 asof 时已有数据的股票；`bar_on` 当日无数据抛 `KeyError`。
+> - `DataView` 只读：面板只保存在 `codes/name/history/bar_on` 几个方法的闭包里，实例上没有任何能取到它的属性（改编后的私有名字、`str.format` 字段都拿不到）；闭包只能经 `__closure__` 这类双下划线属性取到，Task 3.6 的源码检查禁止任何含 `__` 的名字、属性和字符串。`run_backtest` 另外把面板截断到本段末尾。`codes()` 只列出 asof 时已有数据的股票；`bar_on` 当日无数据抛 `KeyError`。
 > - `run_backtest`：净值第一个点是 start 前一交易日的期初资金（首日建仓成本和涨跌计入指标，基准同样从这一天起算）；按"最近有效收盘价"估值（停牌或收盘价为 NaN 时沿用上一个有效收盘价）；持有期越过日历末尾的 pick 当日丢弃；`benchmark_nav` 索引先 `pd.to_datetime` 归一（兼容 date 对象索引）；每天的行情用 `DayBars`（一次性转成数组，按日二分查找）取，结果与 `bars_for_day` 相同。
 > - `evaluate` 增加仅供测试的可选关键字参数 `splits: dict|None=None`（默认 `SPLITS`）；holdout 的 `None` 解析为 `min(calendar.last(), 面板最后有数据日)`，因为新浪交易日历含未来日期。
 > - `evaluate` 的 DSR 用训练+验证两段日收益拼接计算，`n_trials` 含本次；所有门槛比较为 `>=`；留出期 `n_days==0` 视为不通过。试验在回放留出期之前入库（`holdout_pass` 先记为 None，跑完再更新）；训练、验证段报错时同样入库（夏普记为 None）再抛出；留出期任何异常（含 `SystemExit`）都只记为未通过，不外传异常文本。
@@ -2621,8 +2621,22 @@ def test_asof_readonly_and_state_sealed(view):
     with pytest.raises(AttributeError):
         view.asof = date(2030, 1, 1)
     assert not hasattr(view, "_panel") and not hasattr(view, "panel")
-    # 改编后的名字仍然存在：挡住它靠的是策略源码检查（Task 3.6）和 run_backtest 按段截断的面板
-    assert hasattr(view, "_DataView__panel")
+    # 面板只在闭包里：实例上没有任何属性能取到它（改编后的名字、format 字段、反射都不行）
+    assert not hasattr(view, "_DataView__panel")
+    assert all("panel" not in n for n in dir(view))
+    with pytest.raises(AttributeError):
+        "{0._DataView__panel}".format(view)
+
+
+def test_no_reference_to_future_rows_reachable(view):
+    import gc
+    for name in dir(view):
+        if not name.startswith("__"):
+            attr = getattr(type(view), name, None)
+            if isinstance(attr, property) or callable(attr):
+                continue
+            assert not isinstance(getattr(view, name), (dict, pd.DataFrame)), name
+    assert pd.Timestamp("2026-01-14") not in pd.concat([view.history(c) for c in view.codes()]).index
     with pytest.raises(TypeError):
         vars(view)  # 无 __dict__
 
@@ -2679,42 +2693,45 @@ class LookaheadError(Exception):
 
 
 class DataView:
-    # 私有状态用双下划线（名字改编为 _DataView__xxx）且无 __dict__。改编后的名字仍可访问，挡住它的是
-    # 策略源码检查（Task 3.6 禁止任何含 "__" 的属性、名字和标识符式字符串），以及 run_backtest
-    # 只把截断到本段末尾的面板交给 DataView（训练、验证段看不到之后的数据）。
-    __slots__ = ("__panel", "__names", "__asof", "__ts", "__codes")
+    # 面板只保存在方法的闭包里，实例上没有任何能取到它的属性：改编后的私有名字、str.format 的字段
+    # （"{0._DataView__panel}"）都拿不到 asof 之后的数据。闭包本身只能经 __closure__ 这类双下划线属性
+    # 取到，Task 3.6 的源码检查禁止任何含 "__" 的名字、属性和字符串。没有 __dict__，实例只读。
+    __slots__ = ("asof", "codes", "name", "history", "bar_on")
 
     def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str], asof: date):
-        self.__panel = panel
-        self.__names = names
-        self.__asof = asof
-        self.__ts = pd.Timestamp(asof)
+        ts = pd.Timestamp(asof)
         # 只列出 asof 时已经有数据的股票：之后才上市的代码本身就是未来信息
-        self.__codes = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= self.__ts)
+        listed = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= ts)
 
-    @property
-    def asof(self) -> date:
-        return self.__asof
+        def codes() -> list[str]:
+            return list(listed)
 
-    def codes(self) -> list[str]:
-        return list(self.__codes)
+        def name(code: str) -> str:
+            return names.get(code, "")
 
-    def name(self, code: str) -> str:
-        return self.__names.get(code, "")
+        def history(code: str, n: int | None = None) -> pd.DataFrame:
+            df = panel[code]
+            end = int(df.index.searchsorted(ts, side="right"))  # 索引升序
+            start = 0 if n is None else max(end - n, 0)
+            return df.iloc[start:end].copy()
 
-    def history(self, code: str, n: int | None = None) -> pd.DataFrame:
-        df = self.__panel[code]
-        end = int(df.index.searchsorted(self.__ts, side="right"))  # 索引升序
-        start = 0 if n is None else max(end - n, 0)
-        return df.iloc[start:end].copy()
+        def bar_on(code: str, d: date) -> Bar:
+            if d > asof:
+                raise LookaheadError(f"{code} {d} > asof {asof}")
+            row = panel[code].loc[pd.Timestamp(d)]  # 无数据 -> KeyError
+            return Bar(code=code, date=d, open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
+                       close=float(row["close"]), prev_close=float(row["prev_close"]), volume=float(row["volume"]),
+                       amount=float(row["amount"]), name=names.get(code, ""))
 
-    def bar_on(self, code: str, d: date) -> Bar:
-        if d > self.__asof:
-            raise LookaheadError(f"{code} {d} > asof {self.__asof}")
-        row = self.__panel[code].loc[pd.Timestamp(d)]  # 无数据 -> KeyError
-        return Bar(code=code, date=d, open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
-                   close=float(row["close"]), prev_close=float(row["prev_close"]), volume=float(row["volume"]),
-                   amount=float(row["amount"]), name=self.name(code))
+        for attr, value in (("asof", asof), ("codes", codes), ("name", name), ("history", history),
+                            ("bar_on", bar_on)):
+            object.__setattr__(self, attr, value)
+
+    def __setattr__(self, key, value):
+        raise AttributeError("DataView is read-only")
+
+    def __delattr__(self, key):
+        raise AttributeError("DataView is read-only")
 ```
 
 **Step 4: 运行，确认通过**
@@ -2913,22 +2930,21 @@ def test_nan_close_falls_back_to_last_finite_close():
 
 
 class PanelProbe:
-    """测试专用：直接读改编后的私有面板（策略源码检查不允许这样写），确认面板已截断到本段末尾。"""
+    """测试专用：记下每天策略经 history 能看到的最后一行，以及 asof。"""
     name = "probe"
 
     def __init__(self):
-        self.max_seen = None
+        self.seen = []
 
     def select(self, view):
-        panel = view._DataView__panel
-        self.max_seen = max(df.index.max() for df in panel.values())
+        self.seen.append((view.asof, max(view.history(c).index.max() for c in view.codes())))
         return []
 
 
-def test_strategy_never_receives_data_after_segment_end():
+def test_strategy_never_receives_data_after_asof():
     probe = PanelProbe()
     run_backtest(probe, _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH)
-    assert probe.max_seen == IDX[10]
+    assert probe.seen and all(last == pd.Timestamp(asof) for asof, last in probe.seen)
 
 
 def test_day_bars_matches_bars_for_day():
@@ -4009,7 +4025,7 @@ uv run pytest tests/test_store.py tests/test_metrics.py tests/test_dataview.py t
 > - `spot()` 新浪备用源的 `成交量` 单位为股，统一除以 100 换算成手（和东财一致），需在冒烟步骤中核实。
 > - `NullNotifier.sent` 是 `list[str]`（消息原文）。`notify/wecom.py` 额外导出常量 `TEXT_LIMIT`/`MARKDOWN_LIMIT`/`FAIL_PREFIX` 和函数 `split_utf8`；失败日志会把 webhook 的 `key=` 脱敏。
 > - `baseline_momo` 额外排除最后一根 K 线不在 `view.asof` 的股票（asof 当日停牌）。同分时按代码升序。策略文件不写 `from __future__ import annotations`（`__future__` 不在沙箱白名单）。
-> - `check_source` 采用更严格的口径：`getattr/setattr/delattr` 一律禁止（不只针对 dunder），另禁 `locals/vars/breakpoint/input`、任何含 `__` 的名字、属性和字符串（docstring 除外）、按字符串求值或取属性的写法、对已导入模块或类的属性赋值，以及经 `import engine.types` 绑定的包名访问白名单之外的模块，以及 pandas/numpy 的文件读写属性（`read_*`、`to_csv` 等）。允许导入白名单模块及其子模块（`numpy.linalg` 可以，`engine.store` 不行）。沙箱是尽力而为的静态检查，不是安全边界；真正的防线是 `engine/` 哈希校验和 git 审计。
+> - `check_source` 采用更严格的口径：`getattr/setattr/delattr` 一律禁止（不只针对 dunder），另禁 `locals/vars/breakpoint/input`、任何含 `__` 的名字、属性和字符串（docstring 除外）、按字符串求值或取属性的写法（含 `str.format`）、pandas 扩展接口与全局选项、除方法内真正的 `self.xxx` 以外的任何属性赋值和删除，以及经 `import engine.types` 绑定的包名访问白名单之外的模块；`strategies.base` 不在导入白名单里，以及 pandas/numpy 的文件读写属性（`read_*`、`to_csv` 等）。允许导入白名单模块及其子模块（`numpy.linalg` 可以，`engine.store` 不行）。沙箱是尽力而为的静态检查，不是安全边界；真正的防线是 `engine/` 哈希校验和 git 审计。
 > - `engine/run_eval.py` 全程不触网：交易日历取自缓存基准指数 `sh000300` 的日期，股票池为 `cache.codes()`，基准净值为指数归一化到 1。出错时也输出一行 `{"error": ...}` JSON，退出码非 0。它在 `engine/` 内，会被纳入完整性清单。
 > - 依赖前面 Part 的 `config.py`、`engine/types.py`、`engine/rules.py`、`engine/dataview.py`、`engine/calendar.py`、`engine/store.py`、`engine/evaluator.py`，以及 `data/`、`notify/`、`strategies/` 各包的 `__init__.py`（若缺失，先创建空文件）。
 
@@ -5713,6 +5729,28 @@ def test_string_evaluation_and_engine_mutation_rejected():
     assert bad("import engine.types\np = engine.types.Pick") == []  # 完整的白名单路径可以
 
 
+@pytest.mark.parametrize("code", [
+    "import statistics\nself = statistics.NormalDist\nself.inv_cdf = None",
+    "import pandas as pd\nfor self in [pd]:\n    self.concat = None",
+    "class S:\n    def f(self):\n        self = 1",
+    "class S:\n    def f(self):\n        import pandas as self",       # 只有 import ... as self 这一处绑定
+    "class S:\n    def f(self):\n        try:\n            pass\n        except Exception as self:\n            pass",
+    "class S:\n    def f(self, x):\n        match x:\n            case self:\n                pass",
+    "def patch(self):\n    return self",                                   # self 当普通函数的参数
+    "import pandas as self\nself.concat = None",                          # 模块级的 self.xxx
+    "class S:\n    self.x = 1",                                             # 不在方法里的 self.xxx（纵深防御）
+])
+def test_self_cannot_be_rebound_or_faked(code):
+    assert bad(code), code
+
+
+def test_format_and_pandas_extensions_rejected():
+    for code in ["v = None\ns = ('{0._DataView' + '_' + '_panel}').format(v)", "s = '{x}'.format_map({})",
+                 "import pandas as pd\n@pd.api.extensions.register_series_accessor('astype')\nclass A: pass",
+                 "import pandas as pd\npd.set_option('display.max_rows', None)", "import numpy as np\nnp.seterr(all='ignore')"]:
+        assert bad(code), code
+
+
 def test_attribute_stores_only_on_self():
     for code in ["import pandas as pd\nS = pd.Series\nS.mean = None", "import math\nM = math\nM.erf = abs",
                  "import engine.rules as r\n(r,)[0].COMMISSION_RATE = 0", "import pandas as pd\ndel pd.Series.mean",
@@ -5765,6 +5803,7 @@ def test_syntax_error_rejected():
 import io
 import json
 import math
+import statistics
 from datetime import date
 from types import SimpleNamespace
 
@@ -5867,11 +5906,15 @@ def _tamperings(monkeypatch):
         "calc_fee": lambda: monkeypatch.setattr(rules, "calc_fee", lambda *a, **k: 0.0),
         "math_erf": lambda: monkeypatch.setattr(math, "erf", lambda x: 1.0),
         "np_sqrt": lambda: monkeypatch.setattr(np, "sqrt", lambda x: x),
+        "series_astype": lambda: monkeypatch.setattr(pd.Series, "astype", lambda self, *a, **k: self),
+        "inv_cdf": lambda: monkeypatch.setattr(statistics.NormalDist, "inv_cdf", lambda self, p: -10.0),
+        "limit_pct": lambda: monkeypatch.setattr(rules, "limit_pct", lambda *a, **k: 0.5),
     }
 
 
 @pytest.mark.parametrize("what", ["gate", "holdout_gate", "splits", "run_backtest", "series_mean", "commission",
-                                  "limit_prices", "calc_fee", "math_erf", "np_sqrt"])
+                                  "limit_prices", "calc_fee", "math_erf", "np_sqrt", "series_astype", "inv_cdf",
+                                  "limit_pct"])
 def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
     tamper_now = _tamperings(monkeypatch)[what]
 
@@ -5930,7 +5973,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 
 **Step 3: 最小实现**
 
-沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。含 `__` 的名字、属性和字符串（docstring 除外）一律拒绝，`typing.get_type_hints`、`ForwardRef` 这类按字符串求值的入口也拒绝；对已导入模块或类的属性赋值、经包名访问白名单之外的模块（例如 `engine.evaluator`）同样拒绝。`run_eval` 在评估前后核对评估规则（门槛、切分、关键函数），被改过就作废这次试验。`DataView` 的私有面板改编后叫 `_DataView__panel`，只拦以 `__` 开头的写法挡不住它。`print`、`exit`、`SystemExit` 也拒绝：评估子进程靠 stdout 最后一行回传报告，策略不能往里写，也不能提前结束进程。
+沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。含 `__` 的名字、属性和字符串（docstring 除外）一律拒绝，`typing.get_type_hints`、`ForwardRef` 这类按字符串求值的入口也拒绝；属性赋值和删除只允许类中方法的第一个参数 `self`（`self` 不能被重新绑定，也不能用作普通函数的参数名）；`str.format`、pandas 扩展接口（`register_series_accessor` 等）、`set_option` 一类改全局状态的入口、经包名访问白名单之外的模块（例如 `engine.evaluator`）同样拒绝。`run_eval` 在加载策略之前对评估相关模块和 pandas、numpy、math、statistics 的命名空间取身份快照，评估后核对，被改过就作废这次试验。`print`、`exit`、`SystemExit` 也拒绝：评估子进程靠 stdout 最后一行回传报告，策略不能往里写，也不能提前结束进程。
 
 ```python
 # strategies/sandbox.py
@@ -5948,7 +5991,13 @@ BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "loc
 # 按字符串求值或取属性，或经白名单模块拿到解释器内部模块（例如 dataclasses.sys、typing.operator）
 DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins", "importlib",
                  "subprocess", "attrgetter", "methodcaller", "get_type_hints", "ForwardRef",
-                 "_eval_type", "_evaluate", "evaluate_forward_ref"}
+                 "_eval_type", "_evaluate", "evaluate_forward_ref",
+                 # str.format 的字段名按字符串取属性（"{0.x}".format(obj)）
+                 "format", "format_map", "vformat", "Formatter",
+                 # pandas 扩展接口会用 setattr 覆盖 Series/DataFrame 上的任意方法；set_option 改全局状态
+                 "api", "extensions", "register_series_accessor", "register_dataframe_accessor",
+                 "register_index_accessor", "register_extension_dtype", "set_option", "option_context",
+                 "seterr", "set_printoptions"}
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
             "to_feather", "to_html", "to_clipboard", "to_string", "to_latex", "to_xml", "to_stata",
             "to_markdown", "load", "loadtxt", "save", "savez", "savetxt", "fromfile", "tofile",
@@ -5990,6 +6039,23 @@ def _dotted(node) -> str | None:
     return None
 
 
+def _method_selves(tree: ast.Module, parent: dict) -> set[int]:
+    """类里直接定义的方法的第一个参数（真正的 self）所在的函数节点。"""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(parent.get(node), ast.ClassDef):
+            args = node.args.posonlyargs + node.args.args
+            if args and args[0].arg == "self":
+                out.add(id(node))
+    return out
+
+
+def _enclosing_function(node, parent: dict):
+    while node is not None and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        node = parent.get(node)
+    return node
+
+
 def check_source(src: str) -> list[str]:
     """返回违规列表；空列表表示通过。"""
     try:
@@ -5999,6 +6065,18 @@ def check_source(src: str) -> list[str]:
     out: list[str] = []
     docs = _docstrings(tree)
     parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    selves = _method_selves(tree, parent)
+    for node in ast.walk(tree):
+        # self 只能是方法的第一个参数：不能重新绑定（self = pd.Series 之后再给它赋值，就绕过了下面的检查）
+        bound = ((isinstance(node, ast.Name) and node.id == "self" and isinstance(node.ctx, (ast.Store, ast.Del)))
+                 or (isinstance(node, ast.alias) and node.asname == "self")
+                 or (isinstance(node, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                       ast.MatchAs, ast.MatchStar)) and getattr(node, "name", None) == "self")
+                 or (isinstance(node, (ast.Global, ast.Nonlocal)) and "self" in node.names))
+        if bound:
+            out.append(f"第 {getattr(node, 'lineno', '?')} 行: 禁止给 self 重新赋值")
+        elif isinstance(node, ast.arg) and node.arg == "self" and id(parent.get(parent.get(node))) not in selves:
+            out.append(f"第 {node.lineno} 行: self 只能作为类中方法的第一个参数")
     # import engine.types 会把包名 engine 绑定进来，经它能拿到 engine.evaluator 等任何已加载的模块
     pkg_roots = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
                  for a in n.names if a.asname is None and "." in a.name}
@@ -6007,7 +6085,8 @@ def check_source(src: str) -> list[str]:
         # 属性赋值、删除只允许 self.xxx：经任何别名修改模块、类或 pandas 方法（S = pd.Series; S.mean = ...）
         # 都会改变同一进程里评估器的行为。下标赋值（df["x"] = ...）不受影响
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
+            if not (isinstance(node.value, ast.Name) and node.value.id == "self"
+                    and id(_enclosing_function(node, parent)) in selves):
                 out.append(f"第 {line} 行: 只能给 self 的属性赋值，禁止 {_dotted(node) or node.attr}")
         if isinstance(node, ast.Import):
             out += [f"第 {line} 行: 禁止导入 {a.name}" for a in node.names if not _allowed(a.name)]
@@ -6053,6 +6132,7 @@ def check_source(src: str) -> list[str]:
 import json
 import logging
 import math
+import statistics
 import sys
 from datetime import date
 from pathlib import Path
@@ -6072,8 +6152,13 @@ BENCHMARK = "sh000300"
 HISTORY_START = date(2015, 6, 1)
 
 
-_WATCHED_METHODS = ("mean", "std", "min", "max", "sum", "prod", "pct_change", "cummax", "skew", "kurt", "align",
-                    "dropna", "shift", "copy", "rank", "sort_values", "rolling", "loc", "iloc")
+def _namespace(obj) -> tuple:
+    """模块或类（含基类）命名空间里全部条目的身份快照：替换、新增、删除任何属性都会改变它。"""
+    if isinstance(obj, type):
+        items = [(f"{k.__qualname__}.{n}", v) for k in obj.__mro__ for n, v in vars(k).items()]
+    else:
+        items = list(vars(obj).items())
+    return tuple(sorted((n, id(v)) for n, v in items))
 
 
 def _rules_state() -> tuple:
@@ -6082,9 +6167,10 @@ def _rules_state() -> tuple:
     return (repr(evaluator.GATE), repr(evaluator.HOLDOUT_GATE), repr(evaluator.SPLITS), evaluator.run_backtest,
             evaluator.deflated_sharpe, evaluator.sharpe, evaluator._passes_gate, backtest.SimBroker,
             broker.SimBroker.execute_day, metrics.summarize, metrics.deflated_sharpe,
-            repr({k: v for k, v in vars(rules).items() if k.isupper()}), rules.limit_prices, rules.calc_fee,
-            rules.at_limit_up, rules.at_limit_down, math.erf, math.sqrt, np.sqrt, np.isfinite,
-            tuple(getattr(cls, m) for cls in (pd.Series, pd.DataFrame) for m in _WATCHED_METHODS))
+            repr({k: v for k, v in vars(rules).items() if k.isupper()}),
+            *(_namespace(m) for m in (evaluator, backtest, broker, metrics, rules, math, statistics, np)),
+            *(_namespace(c) for c in (pd.Series, pd.DataFrame, pd.Index, statistics.NormalDist)),
+            pd.concat, pd.DataFrame.__init__)
 
 
 def run(name: str) -> dict:
@@ -6138,7 +6224,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：25 passed（sandbox 13 + run_eval 12）。
+预期：80 passed（sandbox 61 + run_eval 19；读写文件属性逐项的参数化测试含 37 个用例，self 绑定的参数化测试含 9 个用例）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -6146,7 +6232,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：75 passed。
+预期：130 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -11009,8 +11095,8 @@ def test_strategy_view_stops_at_previous_day(env, monkeypatch):
     class Probe:
         name = "probe"
 
-        def select(self, view):  # 测试专用：直接读私有面板，确认 d 日的行情不在里面
-            seen.append(max(df.index.max() for df in view._DataView__panel.values()))
+        def select(self, view):  # 策略经 history 能看到的最后一行：d 日的行情不在里面
+            seen.append(max(view.history(c).index.max() for c in view.codes()))
             return []
 
     monkeypatch.setattr(settle, "load_strategy", lambda name: Probe())
@@ -11535,7 +11621,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：24 passed。
+预期：28 passed。
 
 **Step 5: 提交**
 
@@ -12541,7 +12627,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 67 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 24、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 71 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 28、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
