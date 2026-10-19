@@ -3,6 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+import engine.store as store_mod
 from engine.ledger import Account
 from engine.store import Store
 from engine.types import Pick
@@ -20,8 +21,10 @@ def _pick(code="600000"):
 def test_account_roundtrip(store):
     acc = Account(name="q:baseline_momo", cash=500_000.0)
     acc.buy(date(2026, 1, 5), "600000", "浦发银行", 10.0, 1000, 9.3, 11.0, date(2026, 1, 12))
+    acc.last_trade_day = date(2026, 1, 5)
     store.save_account(acc)
     got = store.load_account("q:baseline_momo")
+    assert got == acc and got.last_trade_day == date(2026, 1, 5)
     assert got.cash == pytest.approx(acc.cash)
     assert got.positions["600000"].qty == 1000
     assert got.positions["600000"].exit_date == date(2026, 1, 12)
@@ -67,11 +70,15 @@ def test_jobs(store):
     assert store.job_done("settle", d)
     assert not store.job_done("settle", date(2026, 1, 6))
 
-def test_llm_usage_month_cost(store):
-    store.add_llm_usage("premarket:active", 1000, 200, 1.5)
+def test_llm_usage_month_cost(store, monkeypatch):
+    stamps = iter(["2026-01-31T23:59:59", "2026-02-01T00:00:00", "2025-01-15T10:00:00"])
+    monkeypatch.setattr(store_mod, "_now", lambda: next(stamps))
+    store.add_llm_usage("premarket:active", 1000, 200, 1.0)
     store.add_llm_usage("review", 1000, 200, 2.0)
-    today = date.today()
-    assert store.month_llm_cost(today.year, today.month) == pytest.approx(3.5)
+    store.add_llm_usage("research", 1000, 200, 4.0)
+    assert store.month_llm_cost(2026, 1) == pytest.approx(1.0)
+    assert store.month_llm_cost(2026, 2) == pytest.approx(2.0)
+    assert store.month_llm_cost(2025, 1) == pytest.approx(4.0)
     assert store.month_llm_cost(2000, 1) == 0.0
 
 
@@ -107,16 +114,42 @@ def test_kv(store):
     assert store.kv_get("k") == {"a": [1, 2]}
 
 
-def test_store_shared_across_threads(store):
+def test_store_shared_across_threads(store, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
+    monkeypatch.setattr(store_mod, "_now", lambda: "2026-03-10T09:00:00")
     with ThreadPoolExecutor(2) as ex:
         list(ex.map(lambda i: store.add_llm_usage(f"p{i}", 1, 1, 1.0), range(50)))
-    today = date.today()
-    assert store.month_llm_cost(today.year, today.month) == pytest.approx(50.0)
+    assert store.month_llm_cost(2026, 3) == pytest.approx(50.0)
 
 
 def test_file_db_persists(tmp_path):
     p = tmp_path / "sub" / "x.sqlite"
     Store(p).kv_set("a", 1)
     assert Store(p).kv_get("a") == 1
+
+
+def test_nav_series_sorted_regardless_of_insert_order(store):
+    for d in (date(2026, 1, 8), date(2026, 1, 6), date(2026, 1, 7), date(2026, 1, 5)):
+        store.record_nav("b", d, float(d.day))
+    s = store.nav_series("b")
+    assert list(s.index) == [pd.Timestamp(f"2026-01-0{i}") for i in (5, 6, 7, 8)]
+    assert list(s) == [5.0, 6.0, 7.0, 8.0]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_record_nav_rejects_non_finite(store, bad):
+    with pytest.raises(ValueError):
+        store.record_nav("a", date(2026, 1, 5), bad)
+    assert store.nav_series("a").empty
+
+
+def test_trial_holdout_update_and_last_trial(store):
+    assert store.last_trial("a") is None
+    tid = store.add_trial("a", {}, 0.6, None, True, None)  # val 夏普缺失也能入库
+    store.add_trial("b", {}, 0.1, 0.2, False, None)
+    assert store.last_trial("a")["holdout_pass"] is None and store.last_trial("a")["val_sharpe"] is None
+    store.set_trial_holdout(tid, True)
+    t = store.last_trial("a")
+    assert t["id"] == tid and t["gate_pass"] is True and t["holdout_pass"] is True
+    assert store.recent_trials(2)[1]["holdout_pass"] is True

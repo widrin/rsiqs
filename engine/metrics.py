@@ -71,5 +71,5 @@ def summarize(nav: pd.Series, bench_nav: pd.Series) -> dict:
         "sharpe": sharpe(r),
         "max_dd": max_drawdown(nav),
         "excess_ann": float(ex.mean() * 252) if len(ex) else 0.0,
-        "n_days": int(len(nav)),
+        "n_days": int(len(r)),  # 收益天数；nav 的第一个点是起点（回测为期初资金）
     }

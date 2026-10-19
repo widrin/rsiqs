@@ -55,17 +55,29 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
         start, end = splits[key]
         return run_backtest(strategy, panel, names, calendar, start, end or _data_end(panel, calendar), benchmark_nav)
 
-    tr, va = bt("train"), bt("val")
-    r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
     n_trials = store.trial_count() + 1  # 含本次
+    try:
+        tr, va = bt("train"), bt("val")
+    except BaseException:
+        # 跑不完的试验同样计入 n_trials（DSR 的多重检验校正）；训练、验证段的报错照常抛出
+        store.add_trial(name, params or {}, None, None, False, None)
+        raise
+    r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
     dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r), float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
     gate_pass = _passes_gate(tr.metrics, va.metrics, dsr)
+    # 先入库再回放留出期：留出期中途失败或进程被杀，这次试验也已计数
+    trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
     if gate_pass:
-        ho = bt("holdout").metrics
-        holdout_pass = (ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
-                        and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
-    store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, holdout_pass)
+        try:
+            ho = bt("holdout").metrics
+            holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
+                                and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
+        except KeyboardInterrupt:
+            raise
+        except BaseException:  # noqa: BLE001 - 含 SystemExit；只记未通过，异常文本可能带出留出期数值，不外传
+            holdout_pass = False
+        store.set_trial_holdout(trial_id, holdout_pass)
     return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr, gate_pass=gate_pass,
                       holdout_pass=holdout_pass, n_trials=store.trial_count())

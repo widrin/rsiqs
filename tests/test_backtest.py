@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from engine.backtest import BacktestResult, bars_for_day, run_backtest
+from engine.backtest import BacktestResult, DayBars, bars_for_day, run_backtest
 from engine.calendar import TradingCalendar
 from engine.dataview import LookaheadError
 from engine.types import Pick
@@ -83,12 +83,13 @@ def test_peeking_strategy_raises():
 def test_backtest_result_shape_and_trading():
     res = run_backtest(Recorder(), _panel(), NAMES, CAL, DAYS[2], DAYS[20], BENCH, capital=100_000, max_picks=1)
     assert isinstance(res, BacktestResult)
-    assert list(res.nav.index) == [pd.Timestamp(d) for d in CAL.between(DAYS[2], DAYS[20])]
-    assert res.nav.iloc[0] < 100_000  # 首日买入扣了费用和滑点
+    # 第一个点是 start 前一交易日的期初资金，首日的建仓成本和涨跌因此计入指标
+    assert list(res.nav.index) == [IDX[1]] + [pd.Timestamp(d) for d in CAL.between(DAYS[2], DAYS[20])]
+    assert res.nav.iloc[0] == 100_000 and res.nav.iloc[1] < 100_000  # 首日买入扣了费用和滑点
     buys = [f for f in res.fills if f.side == "BUY"]
     assert buys and all(f.code == "600001" for f in buys)
     assert any(f.side == "SELL" and f.reason == "到期" for f in res.fills)
-    assert res.metrics["n_days"] == len(res.nav)
+    assert res.metrics["n_days"] == len(CAL.between(DAYS[2], DAYS[20])) == len(res.nav) - 1
     assert res.metrics["total_return"] > 0  # 买的是上涨股
 
 
@@ -102,3 +103,92 @@ def test_benchmark_with_date_index_is_normalized():
 def test_picks_beyond_calendar_end_dropped():
     res = run_backtest(Recorder(), _panel(), NAMES, CAL, DAYS[-2], DAYS[-1], BENCH)
     assert res.fills == []
+
+
+class BuyOnce:
+    """第一次被调用时买 600001，持有 hold 个交易日；止损止盈设得很远，只靠到期卖出。"""
+
+    def __init__(self, hold=10):
+        self.name, self.hold, self.done = "buy_once", hold, False
+
+    def select(self, view):
+        if self.done:
+            return []
+        self.done = True
+        last = float(view.history("600001", 1)["close"].iloc[-1])
+        return [Pick("600001", "上涨股", 1.0, last * 1.05, last * 0.5, last * 2.0, self.hold)]
+
+
+def test_nav_marks_to_market_and_suspended_day_keeps_last_close():
+    panel = _panel()
+    panel["600001"] = panel["600001"].drop(IDX[6])  # 停牌一天
+    res = run_backtest(BuyOnce(), panel, NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert [f.side for f in res.fills] == ["BUY"]
+    nav = res.nav
+    assert nav[IDX[1]] == 100_000 > nav[IDX[2]]
+    assert nav[IDX[2]] < nav[IDX[3]] < nav[IDX[4]] < nav[IDX[5]]  # 上涨股按市值计价，不是只算现金
+    assert nav[IDX[6]] == pytest.approx(nav[IDX[5]])  # 停牌日沿用上一个收盘价，不按成本估值
+
+
+def test_first_day_loss_counts_in_metrics():
+    closes = [10.0] * 3 + [9.2] * 27
+    opens = list(closes)
+    opens[3] = 10.0  # DAYS[3] 开盘 10.00 买入，收盘 9.20，之后横盘
+    panel = {"600001": _frame(closes, opens)}
+    res = run_backtest(BuyOnce(hold=20), panel, NAMES, CAL, DAYS[3], DAYS[15], BENCH, capital=100_000, max_picks=1)
+    assert [f.side for f in res.fills] == ["BUY"]
+    assert res.metrics["total_return"] < -0.07 and res.metrics["max_dd"] < -0.07
+
+
+@pytest.mark.parametrize("start,end,hold,bought", [
+    (DAYS[-5], DAYS[-1], 4, True),   # 到期日正好是日历最后一天
+    (DAYS[-5], DAYS[-1], 5, False),  # 越过日历末尾一天：丢弃
+    (DAYS[-5], DAYS[-3], 4, True),   # 持有期可以越过回测末端，只要不越过日历
+])
+def test_hold_period_horizon_boundary(start, end, hold, bought):
+    res = run_backtest(BuyOnce(hold), _panel(), NAMES, CAL, start, end, BENCH)
+    assert any(f.side == "BUY" for f in res.fills) is bought
+
+
+@pytest.mark.parametrize("bps", [10.0, 0.0])
+def test_budget_per_pick_and_slippage(bps):
+    res = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[4], BENCH, capital=100_000, max_picks=5,
+                       slippage_bps=bps)
+    f = res.fills[0]
+    assert f.price == pytest.approx(10.0 * 1.01 ** 2 * (1 + bps / 10_000))
+    assert 15_000 < f.price * f.qty <= 20_000  # 每只约占资金的 1/max_picks
+
+
+def test_nan_close_falls_back_to_last_finite_close():
+    panel = _panel()
+    panel["600001"].loc[IDX[6], "close"] = float("nan")
+    res = run_backtest(BuyOnce(), panel, NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert res.nav.notna().all()
+    assert res.nav[IDX[6]] == pytest.approx(res.nav[IDX[5]])
+
+
+class PanelProbe:
+    """测试专用：直接读改编后的私有面板（策略源码检查不允许这样写），确认面板已截断到本段末尾。"""
+    name = "probe"
+
+    def __init__(self):
+        self.max_seen = None
+
+    def select(self, view):
+        panel = view._DataView__panel
+        self.max_seen = max(df.index.max() for df in panel.values())
+        return []
+
+
+def test_strategy_never_receives_data_after_segment_end():
+    probe = PanelProbe()
+    run_backtest(probe, _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH)
+    assert probe.max_seen == IDX[10]
+
+
+def test_day_bars_matches_bars_for_day():
+    panel = _panel()
+    panel["600002"] = panel["600002"].drop(IDX[4])
+    index = DayBars(panel, NAMES)
+    for d in DAYS + [date(2030, 1, 1)]:
+        assert index.get(d) == bars_for_day(panel, NAMES, d)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import date, datetime
@@ -72,7 +73,10 @@ class Store:
 
     # ---- nav ----
     def record_nav(self, account: str, d: date, equity: float) -> None:
-        self._exec("INSERT OR REPLACE INTO nav VALUES (?, ?, ?)", (account, d.isoformat(), float(equity)))
+        equity = float(equity)
+        if not math.isfinite(equity):  # SQLite 会把 NaN 存成 NULL，之后 nav_series 永远读不出来
+            raise ValueError(f"{account} {d}: equity must be finite, got {equity!r}")
+        self._exec("INSERT OR REPLACE INTO nav VALUES (?, ?, ?)", (account, d.isoformat(), equity))
 
     def nav_series(self, account: str) -> pd.Series:
         rows = self._all("SELECT d, equity FROM nav WHERE account=? ORDER BY d", (account,))
@@ -119,24 +123,43 @@ class Store:
         return float(row[0])
 
     # ---- trials ----
-    def add_trial(self, strategy: str, params: dict, train_sharpe: float, val_sharpe: float,
-                  gate_pass: bool, holdout_pass: bool | None) -> None:
-        self._exec("INSERT INTO trials (ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass) "
-                   "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (_now(), strategy, _dump(params), float(train_sharpe), float(val_sharpe), int(bool(gate_pass)),
-                    None if holdout_pass is None else int(bool(holdout_pass))))
+    def add_trial(self, strategy: str, params: dict, train_sharpe: float | None, val_sharpe: float | None,
+                  gate_pass: bool, holdout_pass: bool | None) -> int:
+        """记录一次试验，返回其 id。回测中途失败时夏普可以为 None。"""
+        def num(x):
+            return None if x is None or not math.isfinite(float(x)) else float(x)
+
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO trials (ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_now(), strategy, _dump(params), num(train_sharpe), num(val_sharpe), int(bool(gate_pass)),
+                 None if holdout_pass is None else int(bool(holdout_pass))))
+            return int(cur.lastrowid)
+
+    def set_trial_holdout(self, trial_id: int, holdout_pass: bool) -> None:
+        self._exec("UPDATE trials SET holdout_pass=? WHERE id=?", (int(bool(holdout_pass)), int(trial_id)))
 
     def trial_count(self, strategy: str | None = None) -> int:
         if strategy is None:
             return int(self._one("SELECT COUNT(*) FROM trials")[0])
         return int(self._one("SELECT COUNT(*) FROM trials WHERE strategy=?", (strategy,))[0])
 
+    _TRIAL_COLS = "id, ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass"
+
+    @staticmethod
+    def _trial(r) -> dict:
+        return {"id": r[0], "ts": r[1], "strategy": r[2], "params": json.loads(r[3]), "train_sharpe": r[4],
+                "val_sharpe": r[5], "gate_pass": bool(r[6]), "holdout_pass": None if r[7] is None else bool(r[7])}
+
     def recent_trials(self, n: int = 20) -> list[dict]:
-        rows = self._all("SELECT ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass "
-                         "FROM trials ORDER BY id DESC LIMIT ?", (n,))
-        return [{"ts": r[0], "strategy": r[1], "params": json.loads(r[2]), "train_sharpe": r[3],
-                 "val_sharpe": r[4], "gate_pass": bool(r[5]), "holdout_pass": None if r[6] is None else bool(r[6])}
-                for r in rows]
+        rows = self._all(f"SELECT {self._TRIAL_COLS} FROM trials ORDER BY id DESC LIMIT ?", (n,))
+        return [self._trial(r) for r in rows]
+
+    def last_trial(self, strategy: str) -> dict | None:
+        row = self._one(f"SELECT {self._TRIAL_COLS} FROM trials WHERE strategy=? ORDER BY id DESC LIMIT 1",
+                        (strategy,))
+        return self._trial(row) if row else None
 
     # ---- strategy status ----
     def set_status(self, strategy: str, status: str, d: date) -> None:

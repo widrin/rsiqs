@@ -52,7 +52,7 @@ def test_promote_after_20_days_retires_old():
 
 
 def test_no_promotion_with_fewer_than_20_days():
-    store = _setup(cand_daily=0.002, shadow_from=45)  # 15 个交易日
+    store = _setup(cand_daily=0.002, shadow_from=45)  # 15 个收益日
     assert pr.decide(store, DAYS[-1], CAL) == []
     assert store.get_status("new") == "shadow" and store.get_status("old") == "incumbent"
 
@@ -72,7 +72,7 @@ def test_at_most_one_promotion():
 
 
 def test_demotion_when_incumbent_lags(monkeypatch):
-    # 晋升门槛设为不可达，单独验证降级规则
+    # 晋升门槛设为不可达，单独验证降级规则（降级用自己的 DEMOTE_T）
     monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
     store = _setup(cand_daily=0.0005, inc_daily=0.0)
     events = pr.decide(store, DAYS[-1], CAL)
@@ -94,3 +94,99 @@ def test_no_incumbent_compares_to_benchmark():
     _record(store, "q:new", _nav(0.002, noise=0.001))
     events = pr.decide(store, DAYS[-1], CAL)
     assert [(e.kind, e.strategy) for e in events] == [("promote", "new")]
+
+
+@pytest.mark.parametrize("shadow_from,promoted", [(40, True), (41, False)])
+def test_min_shadow_days_counts_return_days(shadow_from, promoted):
+    # 影子期从 DAYS[shadow_from] 开始：前一交易日的净值是基线，之后每天一个收益日
+    store = _setup(cand_daily=0.002, shadow_from=shadow_from)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert bool(events) is promoted, (60 - shadow_from, events)
+
+
+def test_shadow_set_on_weekend_keeps_friday_baseline():
+    store = Store(":memory:")
+    friday = DAYS[29]
+    assert friday.weekday() == 4
+    saturday = pd.Timestamp(friday) + pd.Timedelta(days=1)
+    store.set_status("new", "shadow", saturday.date())  # 研究任务在周六运行
+    _record(store, "q:new", _nav(0.002)[29:], days=DAYS[29:])  # 周一首次结算时在周五记基线
+    nav = pr._shadow_nav(store, "new", DAYS[-1], CAL)
+    assert nav.index[0] == pd.Timestamp(friday) and len(nav) == 31
+
+
+def test_shadow_nav_stops_at_today():
+    store = _setup(cand_daily=0.002, shadow_from=30)
+    assert pr._shadow_nav(store, "new", DAYS[45], CAL).index[-1] == IDX[45]
+    assert pr.decide(store, DAYS[45], CAL) == []  # 截至当天只有 16 个收益日
+
+
+def test_compare_aligns_nav_before_returns():
+    base = pd.Series(_nav(0.003, noise=0.01), index=IDX)
+    gappy = base.drop(IDX[3::4])  # 同一条净值，每 4 天缺一个点
+    assert pr.compare(base, gappy) == pytest.approx((0.0, 0.0))
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status("dup", "shadow", DAYS[0])
+    _record(store, "q:old", list(base))
+    for ts, v in gappy.items():
+        store.record_nav("q:dup", ts.date(), v)
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def test_small_steady_excess_neither_promotes_nor_demotes():
+    # 超额恒定约年化 2.5%：t 值极大，但没到晋升的 5%，现任也没落后到降级的 -5%
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status("new", "shadow", DAYS[0])
+    _record(store, "q:old", _nav(0.0, noise=0.002))
+    _record(store, "q:new", _nav(0.0001, noise=0.002))
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def _two_navs(store, inc_rets, cand_rets, name="new"):
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status(name, "shadow", DAYS[0])
+    for acct, rets in (("q:old", inc_rets), (f"q:{name}", cand_rets)):
+        v, vals = 100.0, []
+        for r in rets:
+            v *= 1 + r
+            vals.append(v)
+        _record(store, acct, vals)
+
+
+def test_demotion_uses_only_recent_window(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    # 影子前 19 天每天领先 1%，之后与现任完全同步：近 40 个收益日没有落后，不降级
+    inc = [0.001 if i % 2 else -0.001 for i in range(60)]
+    cand = [r + (0.01 if i < 20 else 0.0) for i, r in enumerate(inc)]
+    _two_navs(store, inc, cand)
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def test_demotion_requires_significant_lag(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    lag = -0.0003  # 现任每天落后约 0.03%，年化约 -7.5%
+    noisy, quiet = Store(":memory:"), Store(":memory:")
+    # 噪声很大时同样的落后幅度只是运气，不降级
+    _two_navs(noisy, [lag + (0.01 if i % 2 else -0.01) for i in range(60)], [0.0] * 60)
+    assert pr.decide(noisy, DAYS[-1], CAL) == []
+    _two_navs(quiet, [lag + (0.0002 if i % 2 else -0.0002) for i in range(60)], [0.0] * 60)
+    assert [e.kind for e in pr.decide(quiet, DAYS[-1], CAL)] == ["demote", "promote"]
+
+
+def test_demotion_picks_the_shadow_incumbent_lags_most(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    inc = [0.0002 if i % 2 else -0.0002 for i in range(60)]
+    jitter = [0.0001 if i % 3 else -0.0002 for i in range(60)]  # 超额不能恒定，否则 t 值无穷大
+    _two_navs(store, inc, [r + 0.0005 + j for r, j in zip(inc, jitter)], name="mild")
+    store.set_status("strong", "shadow", DAYS[0])
+    v, vals = 100.0, []
+    for r, j in zip(inc, jitter):
+        v *= 1 + r + 0.001 + j
+        vals.append(v)
+    _record(store, "q:strong", vals)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert [(e.kind, e.strategy) for e in events] == [("demote", "old"), ("promote", "strong")]

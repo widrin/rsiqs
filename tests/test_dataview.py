@@ -51,6 +51,8 @@ def test_asof_readonly_and_state_sealed(view):
     with pytest.raises(AttributeError):
         view.asof = date(2030, 1, 1)
     assert not hasattr(view, "_panel") and not hasattr(view, "panel")
+    # 改编后的名字仍然存在：挡住它靠的是策略源码检查（Task 3.6）和 run_backtest 按段截断的面板
+    assert hasattr(view, "_DataView__panel")
     with pytest.raises(TypeError):
         vars(view)  # 无 __dict__
 
@@ -59,3 +61,23 @@ def test_history_zero_and_unknown(view):
     assert view.history("600000", 0).empty
     with pytest.raises(KeyError):
         view.history("999999")
+
+
+def test_codes_exclude_stocks_not_yet_listed():
+    panel = {"600000": _frame(), "000001": _frame(start="2026-01-12")}  # 000001 在 asof 之后才上市
+    v = DataView(panel, {}, asof=date(2026, 1, 9))
+    assert v.codes() == ["600000"]
+    assert DataView(panel, {}, asof=date(2026, 1, 12)).codes() == ["000001", "600000"]
+    assert DataView({"600000": _frame().iloc[:0]}, {}, asof=date(2026, 1, 9)).codes() == []
+
+
+def test_history_n_larger_than_available(view):
+    assert len(view.history("600000", 7)) == 5
+
+
+def test_bar_on_missing_day_raises_key_error(view):
+    with pytest.raises(KeyError):
+        view.bar_on("600000", date(2026, 1, 3))  # 周六
+    panel = {"600000": _frame().drop(pd.Timestamp("2026-01-07"))}  # 停牌日没有这一行
+    with pytest.raises(KeyError):
+        DataView(panel, {}, asof=date(2026, 1, 9)).bar_on("600000", date(2026, 1, 7))
