@@ -24,7 +24,7 @@
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，620 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，639 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -6706,7 +6706,7 @@ git commit -m "feat: add strategy source sandbox and isolated evaluation CLI"
 背景（2026-10-19 实测，Claude Code 2.1.223，经用户中转 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`）：
 
 - 中转拒绝 Anthropic SDK 直连（报 "Please use authentic Claude Code client"），只有 Claude Code CLI 能用。所以本模块不用 SDK，每次调用起一个 `claude.exe` 子进程。
-- 可用的命令行：`claude.exe -p --bare --output-format json --model claude-opus-5-5 --effort <lvl> --tools "" --no-session-persistence --max-budget-usd <x> --system-prompt-file <file> --json-schema <json>`。用户提示词以 UTF-8 字节经 stdin 传入，既不受 Windows 命令行长度限制，也不经过控制台代码页。子进程环境里不能有 `CLAUDECODE`。`--bare` 不加载用户的插件、hooks 和 CLAUDE.md，鉴权只读环境变量：`ANTHROPIC_API_KEY`，或 `ANTHROPIC_AUTH_TOKEN` 加 `ANTHROPIC_BASE_URL`。
+- 可用的命令行：`claude.exe -p --bare --output-format json --model claude-opus-5-5 --effort <lvl> --tools "" --no-session-persistence --setting-sources "" --max-budget-usd <x> --system-prompt-file <file> --json-schema <json>`。`--setting-sources ""` 不加载用户、项目、本地设置文件：设置文件里的 `env`（例如本机 Claude Code 在 `~/.claude/settings.json` 里配的中转地址和 Token）会被 claude.exe 写进自己的进程环境、覆盖 `child_env`，鉴权就不再只由 `.env` 决定（这一点读 claude.exe 内嵌代码得出，需在 Task 6.8 冒烟中确认）。用户提示词以 UTF-8 字节经 stdin 传入，既不受 Windows 命令行长度限制，也不经过控制台代码页。子进程环境里不能有 `CLAUDECODE`。`--bare` 不加载用户的插件、hooks 和 CLAUDE.md，鉴权只读环境变量：`ANTHROPIC_API_KEY`，或 `ANTHROPIC_AUTH_TOKEN` 加 `ANTHROPIC_BASE_URL`。
 - stdout 是一个 JSON 对象，字段有 `is_error`（bool）、`subtype`（`"success"` 或错误类型）、`result`（str）、`structured_output`（dict 或 null）、`total_cost_usd`（float）、`usage`（`input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`、`output_tokens`）、`duration_ms`、`num_turns`。
 - 嵌套 schema（对象数组、enum、`$defs`/`$ref`）可用，schema 用 `json.dumps(..., ensure_ascii=True)` 传。小调用耗时 10–25 秒，花费 0.01–0.03 美元。
 - 必须直接运行真正的 `claude.exe`，不能经 npm 的 `claude.cmd`/`claude.ps1` 包装脚本，因为 cmd.exe 的引号规则会破坏 JSON 参数。npm 安装时 exe 位于 `<claude.cmd 所在目录>/node_modules/@anthropic-ai/claude-code/bin/claude.exe`，原生安装位于 `~/.local/bin/claude.exe`。
@@ -6838,7 +6838,7 @@ def test_build_args_is_the_verified_command(tmp_path):
     args = build_args(s, r"C:\cc\claude.exe", tmp_path / "sys.md", '{"type": "object"}', "high", 1.5)
     assert args == [r"C:\cc\claude.exe", "-p", "--bare", "--output-format", "json",
                     "--model", "claude-opus-5-5", "--effort", "high", "--tools", "",
-                    "--no-session-persistence", "--max-budget-usd", "1.50",
+                    "--no-session-persistence", "--setting-sources", "", "--max-budget-usd", "1.50",
                     "--system-prompt-file", str(tmp_path / "sys.md"), "--json-schema", '{"type": "object"}']
     with pytest.raises(ValueError):
         build_args(s, "claude.exe", "sys.md", "{}", "extreme", 1.0)
@@ -6942,9 +6942,11 @@ def test_structured_output_failing_validation_raises_llm_error(store, settings):
 def test_timeout_propagates_and_cleans_up(store, settings):
     runner = FakeRunner(exc=subprocess.TimeoutExpired(["claude.exe"], 5.0))
     with pytest.raises(subprocess.TimeoutExpired):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0)
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0, max_budget_usd=0.3)
     assert runner.system_seen == [SYSTEM.encode("utf-8")] and not runner.system_file().exists()
-    assert usage_rows(store) == []
+    # 超时时服务端可能已经计费，CLI 来不及报告：按单次上限保守记一笔，月度预算不会少算
+    [(purpose, _, _, cost)] = usage_rows(store)
+    assert purpose == "unit:timeout" and cost == pytest.approx(0.3 * 7.2)
 
 
 def test_launch_failure_raises_llm_error(store, settings):
@@ -7030,6 +7032,22 @@ def test_find_path_exe_then_native_install_then_error(no_claude, tmp_path):
     native.unlink()
     with pytest.raises(LLMError, match="找不到 claude.exe"):
         find_claude_exe(make_settings(tmp_path))
+
+
+def test_cli_error_reason_from_errors_field(store, settings):
+    out = {k: v for k, v in cli_output(structured=None, is_error=True, subtype="error_during_execution").items()
+           if k != "result"}
+    out["errors"] = ["API Error: 400 model not available"]
+    runner = FakeRunner(out, returncode=1)
+    with pytest.raises(LLMError, match="model not available"):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+
+
+def test_tiny_budget_is_budget_exceeded(store, settings):
+    runner = FakeRunner()
+    with pytest.raises(BudgetExceeded):  # --max-budget-usd 0.00 会被 CLI 拒绝
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, max_budget_usd=0.004)
+    assert runner.calls == []
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -7154,8 +7172,10 @@ def build_args(settings: Settings, exe: str, system_file: str | Path, schema_jso
     """已实测可用的无头调用命令行；用户提示词不在命令行里，走 stdin。"""
     if effort not in EFFORTS:
         raise ValueError(f"unknown effort: {effort!r}")
+    # --setting-sources ""：不加载用户、项目、本地设置文件。设置文件里的 env（例如本机 Claude Code 配的中转地址和
+    # Token）会被 claude.exe 写进自己的进程环境，覆盖 child_env，鉴权就不再只由 .env 决定
     return [exe, "-p", "--bare", "--output-format", "json", "--model", settings.llm_model,
-            "--effort", effort, "--tools", "", "--no-session-persistence",
+            "--effort", effort, "--tools", "", "--no-session-persistence", "--setting-sources", "",
             "--max-budget-usd", f"{max_budget_usd:.2f}", "--system-prompt-file", str(system_file),
             "--json-schema", schema_json]
 
@@ -7199,6 +7219,8 @@ class LLM:
         claude.exe 启动失败、CLI 报错、拒答、没有 structured_output、输出不是 JSON、结构校验失败都抛 LLMError。
         """
         self.check_budget(essential)
+        if max_budget_usd < 0.01:  # 格式化成 0.00 后会被 CLI 拒绝
+            raise BudgetExceeded(f"{purpose}: 单次预算 {max_budget_usd:.4f} 美元不足 0.01 美元")
         exe = self._claude_exe()
         schema_json = json.dumps(strict_schema(schema), ensure_ascii=True)
         fd, system_file = tempfile.mkstemp(prefix="rsiqs_system_", suffix=".md")
@@ -7208,6 +7230,10 @@ class LLM:
             args = build_args(self.settings, exe, system_file, schema_json, effort, max_budget_usd)
             proc = self.runner(args, input=user.encode("utf-8"), capture_output=True,
                                env=child_env(self.settings), cwd=str(self.settings.root), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 子进程已被杀掉，CLI 没来得及报告用量，服务端可能已经计费：按单次上限保守记一笔
+            self.store.add_llm_usage(f"{purpose}:timeout", 0, 0, max_budget_usd * self.settings.usd_cny)
+            raise
         except OSError as e:  # claude.exe 启动不了（安装后被删除、没有权限等）
             raise LLMError(f"{purpose}: 无法运行 claude.exe：{e!r}") from e
         finally:
@@ -7227,7 +7253,8 @@ class LLM:
                                  float(out.get("total_cost_usd") or 0.0) * self.settings.usd_cny)
         structured = out.get("structured_output")
         if proc.returncode != 0 or out.get("is_error") or structured is None:
-            raise LLMError(f"{purpose}: {out.get('subtype', '')} {str(out.get('result') or '')[:300]}")
+            reason = out.get("result") or "; ".join(map(str, out.get("errors") or []))  # 错误结果的原因在 errors
+            raise LLMError(f"{purpose}: {out.get('subtype', '')} {str(reason)[:300]}")
         try:
             return schema.model_validate(structured)
         except ValidationError as e:
@@ -7248,7 +7275,7 @@ class LLM:
 uv run pytest tests/test_llm.py -v
 ```
 
-预期：27 passed（两个参数化测试各 4 个用例）。
+预期：29 passed（两个参数化测试各 4 个用例）。
 
 **Step 5: Manual smoke step（真实调用一次 Claude，约 0.1~0.2 元）**
 
@@ -7406,10 +7433,10 @@ def test_caps_drop_oldest():
     assert "r1" not in [r["id"] for r in pb["rules"]]
     assert pb["rules"][-1]["text"] == "新规则"
 
-    big = [L("add", "长" * 2500, evidence="e") for _ in range(3)]
+    big = [L("add", "长" * playbook.MAX_RULE_CHARS, evidence="e") for _ in range(20)]  # 20 × 301 字 > 6000
     pb = playbook.apply_lessons({"version": 1, "created": "x", "rules": []}, big, TODAY)
     assert sum(len(r["text"]) + len(r["evidence"]) for r in pb["rules"]) <= playbook.MAX_CHARS
-    assert [r["id"] for r in pb["rules"]] == ["r2", "r3"]
+    assert [r["id"] for r in pb["rules"]] == [f"r{i}" for i in range(2, 21)]
 
 
 def _rules(*texts):
@@ -7433,6 +7460,28 @@ def test_maybe_release_first_call_starts_window(pbdir, cal):
     store = Store(":memory:")
     assert playbook.maybe_release(store, TODAY, cal) is None
     assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+@pytest.mark.parametrize("gap,released", [(playbook.MIN_DAYS_BETWEEN_RELEASES - 1, False),
+                                          (playbook.MIN_DAYS_BETWEEN_RELEASES, True)])
+def test_maybe_release_window_boundary(pbdir, cal, gap, released):
+    start = cal.between(dt.date(2026, 8, 3), TODAY)[-(gap + 1)]  # 从 start 到 TODAY 相隔 gap 个交易日
+    store = _setup_release(pbdir, cal, 1.05, 1.01, start=start)
+    assert bool(playbook.maybe_release(store, TODAY, cal)) is released
+
+
+def test_save_is_atomic_and_load_survives_corruption(pbdir):
+    playbook.save("candidate", {"version": 3, "created": "x", "rules": _rules("a")})
+    assert not list(pbdir.glob("*.tmp"))
+    (pbdir / "candidate.json").write_text('{"version": 1, "rules": [', encoding="utf-8")
+    pb = playbook.load("candidate")  # 损坏时退回空 playbook，不让盘前和复盘整体失败
+    assert pb["rules"] == []
+
+
+def test_long_lesson_is_truncated_not_wiping_rules():
+    pb = {"version": 1, "rules": [{"id": f"r{i}", "text": "旧" * 10, "evidence": "e", "created": "x"} for i in range(10)]}
+    out = playbook.apply_lessons(pb, [L("add", text="长" * 6001)], TODAY)
+    assert len(out["rules"]) == 11 and len(out["rules"][-1]["text"]) == playbook.MAX_RULE_CHARS
 
 
 def test_maybe_release_too_early(pbdir, cal):
@@ -7519,6 +7568,8 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -7528,12 +7579,15 @@ import pandas as pd
 from engine.calendar import TradingCalendar
 from engine.store import Store
 
+log = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parent.parent
 PLAYBOOK_DIR = ROOT / "playbook"
 KINDS = ("active", "candidate")
 MAX_RULES = 30
 MAX_CHARS = 6000
 MIN_DAYS_BETWEEN_RELEASES = 10
+MAX_RULE_CHARS = 300  # 单条规则的 text、evidence 各自的上限：一条超长规则不能挤掉其余规则
 RELEASE_KEY = "playbook_released"
 TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
@@ -7545,16 +7599,32 @@ def _path(kind: str) -> Path:
 
 
 def load(kind: str) -> dict:
+    """读取 playbook；文件缺失或损坏（写到一半断电、手工编辑出错）时退回空 playbook 并记日志，
+    盘前和复盘照常运行，只是不带规则。"""
     p = _path(kind)
+    empty = {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
     if not p.exists():
-        return {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
-    return json.loads(p.read_text(encoding="utf-8"))
+        return empty
+    try:
+        pb = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(pb, dict) or not isinstance(pb.get("rules", []), list):
+            raise ValueError("playbook 格式不对")
+        return pb
+    except (ValueError, OSError):
+        log.exception("playbook %s 损坏，按空 playbook 处理：%s", kind, p)
+        return empty
 
 
 def save(kind: str, pb: dict) -> None:
+    """先写临时文件再原子替换：写到一半中断时，原文件保持完整。"""
     p = _path(kind)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(pb, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(pb, ensure_ascii=False, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
 
 
 def load_prompt(name: str) -> str:
@@ -7582,8 +7652,8 @@ def apply_lessons(pb: dict, lessons: list, today: dt.date) -> dict:
     out = copy.deepcopy(pb)
     rules: list[dict] = out.setdefault("rules", [])
     for les in lessons:
-        evidence = (les.evidence or "").strip()
-        text = (les.text or "").strip()
+        evidence = (les.evidence or "").strip()[:MAX_RULE_CHARS]
+        text = (les.text or "").strip()[:MAX_RULE_CHARS]
         if not evidence:
             continue
         idx = next((i for i, r in enumerate(rules) if r["id"] == les.rule_id), None)
@@ -7750,9 +7820,9 @@ def git_commit(paths: list[str], message: str) -> bool:
 # 复盘方法
 
 1. 逐只对比：推荐理由 vs 当日实际（开盘价相对昨收、最高、最低、收盘、是否成交、是否触发止损/止盈）。
-2. 区分运气与规律：单日单只的结果大多是噪声。只有当现象能用明确、可执行的条件描述（如"竞价高开超过 5% 且竞价成交额低于近 20 日均额 3% 的主板股"），并且今天的数据提供了支持时，才提出新规则。
-3. 优先修正而不是堆砌：已有规则被今天的事实反驳时用 remove；两条规则重叠时用 merge（rule_id 填被保留的那条，text 写合并后的完整表述）。
-4. 规则必须可在盘前执行：只能依赖盘前可得的信息（昨日及以前行情、隔夜新闻公告、竞价数据），不能依赖当日收盘后才知道的信息。
+2. 区分运气与规律：单日单只的结果大多是噪声。只有当现象能用明确、可执行的条件描述（如"主板股竞价高开超过 5% 时放弃买入"，可以落实为竞价涨幅上限），并且今天的数据提供了支持时，才提出新规则。
+3. 优先修正而不是堆砌：已有规则被今天的事实反驳时用 remove；两条规则重叠时用 merge（rule_id 填被保留的那条，text 写合并后的完整表述），并对另一条单独给一条 remove。
+4. 规则必须可在盘前执行：规则在 08:30 的盘前分析里使用，只能依赖那时可得的信息（昨日及以前行情、隔夜新闻公告），不能依赖当日收盘后才知道的信息。涉及竞价的条件要写成竞价涨幅区间或买入价上限，由 09:25 的规则过滤执行；竞价成交额这类条件无法执行。
 
 # 证据要求
 
@@ -7773,7 +7843,7 @@ def git_commit(paths: list[str], message: str) -> bool:
 uv run pytest tests/test_playbook.py -v
 ```
 
-预期：13 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
+预期：17 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
 
 **Step 5: 提交**
 
@@ -7793,7 +7863,7 @@ git commit -m "feat: add playbook store, lesson caps, release gate and system pr
 
 `scan`（08:30，与上一版相同）用 `client.universe()` 取股票池，先 `cache.update(codes, asof)` 增量补齐昨日数据，再用最近 `HISTORY_DAYS`（400）个自然日的面板构造 `DataView`。新闻、公告类的单项抓取失败时置空，不影响扫描；行情数据失败照常抛出，由 `run_job` 告警。`context` 里另加 `"stats"`（每只候选的昨收 `prev_close` 和 20 日均成交额 `avg_amount20`）。
 
-`analyze` 紧接着 scan 运行（`run_analyze` 让两套 playbook 并发）。提示中给出每只候选的量化分、昨收、涨跌停价、20 日均额、量化价位（含相对昨收的幅度）和资讯，Claude 返回 `PremarketPlan`；代码不在候选里的条目被丢弃，重复代码只保留第一条，结果存入 kv `plan:<ISO日期>:<kind>`。09:25 `run_final` 拉一次竞价快照，两路并发 `finalize`：先用 `auction_filter` 做确定性过滤（竞价涨幅区间、买入上限、价格合理性），取前 `max_picks` 只，再用 `AUCTION_SYSTEM` 做一次只能否决的竞价确认。确认提示列出全市场竞价概况（高开/低开家数、中位竞价涨幅），以及每只入选股的竞价价、涨幅、竞价额及其占 20 日均额的比例、涨跌停价、盘前条件和理由。`run_final` 的 `calendar` 参数只为与 jobs 的调用签名保持一致，目前没有用到。
+`analyze` 紧接着 scan 运行（`run_analyze` 让两套 playbook 并发）。提示中给出每只候选的量化分、昨收、涨跌停价、20 日均额、量化价位（含相对昨收的幅度）和资讯，Claude 返回 `PremarketPlan`；代码不在候选里的条目被丢弃，重复代码只保留第一条，结果存入 kv `plan:<ISO日期>:<kind>`。09:25 `run_final` 拉一次竞价快照，两路并发 `finalize`：先用 `auction_filter` 做确定性过滤（竞价涨幅区间、买入上限、价格合理性），取前 `max_picks` 只，再用 `AUCTION_SYSTEM` 做一次只能否决的竞价确认。确认提示列出候选整体竞价概况（高开/低开家数、中位竞价涨幅），以及每只入选股的竞价价、涨幅、竞价额及其占 20 日均额的比例、涨跌停价、盘前条件和理由。`run_final` 的 `calendar` 参数只为与 jobs 的调用签名保持一致，目前没有用到。
 
 **Step 1: 写失败的测试**
 
@@ -8063,6 +8133,70 @@ def test_run_analyze_runs_both_kinds_concurrently(store):
     assert "ACTIVE规则" in users["analyze:active"] and "CANDIDATE规则" in users["analyze:candidate"]
 
 
+def test_analyze_skips_llm_when_no_candidates():
+    s = Store(":memory:")
+    s.save_candidates(D, [], CTX)
+    llm = FakeLLM({})
+    assert premarket.run_analyze(D, settings(), s, llm) == {"active": False, "candidate": False}
+    assert llm.calls == []  # 没有候选就不花深度分析的钱
+
+
+def test_run_analyze_timeout_capped_by_deadline(store):
+    llm = FakeLLM({"analyze:active": plan(pp("600001")), "analyze:candidate": plan(pp("600002"))})
+    now = dt.datetime.combine(D, dt.time(9, 15))
+    premarket.run_analyze(D, settings(), store, llm, deadline=dt.datetime.combine(D, dt.time(9, 22)), now=now)
+    assert {c["timeout"] for c in llm.calls} == {420.0}  # 离截止还有 7 分钟，不再给满 900 秒
+    llm2 = FakeLLM({})
+    late = dt.datetime.combine(D, dt.time(9, 21, 30))
+    assert premarket.run_analyze(D, settings(), store, llm2, deadline=dt.datetime.combine(D, dt.time(9, 22)),
+                                 now=late) == {"active": False, "candidate": False}
+    assert llm2.calls == []  # 剩余时间不够一次分析：不发起
+
+
+def test_confidence_normalized_to_unit_interval():
+    assert pp("600001", conf=85).confidence == pytest.approx(0.85)  # 百分数
+    assert pp("600001", conf=-1).confidence == 0.0 and pp("600001", conf=1.0).confidence == 1.0
+
+
+def test_all_vetoed_note_differs_from_auction_failure(store):
+    p = plan(pp("600001", "veto", 0.0), pp("600002", "veto", 0.0))
+    picks, reviewed, view = premarket._rule_result(settings(), p, CANDS, FakeAk().spot())
+    assert picks == [] and reviewed is True and view.endswith(premarket.NOTE_ALL_VETOED)
+
+
+def test_ex_adjusted_prices_rounded_to_cents(store):
+    cands, _ = premarket._ex_adjust(CANDS, None, {"stats": {c: {"prev_close": 10.0} for c in CODES}},
+                                    FakeAk(prevs={"600001": 9.80}).spot())
+    p = next(x for x in cands if x.code == "600001")
+    assert (p.entry_max, p.stop, p.target) == (round(10.3 * 0.98, 2), round(9.3 * 0.98, 2), round(11.0 * 0.98, 2))
+
+
+def test_small_dividend_triggers_conversion_but_one_cent_does_not():
+    ctx = {"stats": {c: {"prev_close": 10.0} for c in CODES}}
+    small, _ = premarket._ex_adjust(CANDS, None, ctx, FakeAk(prevs={"600001": 9.70}).spot())  # 派息 0.30
+    tiny, _ = premarket._ex_adjust(CANDS, None, ctx, FakeAk(prevs={"600001": 9.99}).spot())   # 舍入差异
+    assert next(x for x in small if x.code == "600001").stop == round(9.3 * 0.97, 2)
+    assert next(x for x in tiny if x.code == "600001").stop == 9.3
+
+
+def test_run_final_time_limits(store, monkeypatch):
+    save_plan(store, "active", plan(pp("600001")))
+    seen = {}
+    monkeypatch.setattr(premarket, "_fetch_spot", lambda client, timeout, codes: seen.setdefault("spot", timeout)
+                        and FakeAk().spot(codes))
+    llm = FakeLLM({"auction:active": check({})})
+    premarket.run_final(D, settings(), store, llm, FakeAk(), Recorder(), CAL)
+    assert seen["spot"] == premarket.SPOT_TIMEOUT
+    assert all(c["timeout"] <= premarket.AUCTION_TIMEOUT for c in llm.calls)
+
+
+def test_run_final_survives_corrupt_playbook(store, pbdir):
+    (pbdir / "candidate.json").write_text("", encoding="utf-8")  # 写到一半时断电
+    n = Recorder()
+    premarket.run_final(D, settings(), store, FakeLLM({}), FakeAk(), n, CAL)
+    assert len(n.sent) == 1 and store.load_recommendation(D, "h:candidate") is not None
+
+
 def test_run_analyze_reports_each_kind(store):
     llm = FakeLLM({"analyze:active": plan(pp("600001")), "analyze:candidate": LLMError("refused")})
     assert premarket.run_analyze(D, settings(), store, llm) == {"active": True, "candidate": False}
@@ -8324,7 +8458,7 @@ from dataclasses import replace
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from agents import playbook
 from agents.llm import LLM
@@ -8352,6 +8486,8 @@ SPOT_TIMEOUT = 40.0      # run_final 等待竞价快照的上限（秒），超�
 KINDS = ("active", "candidate")
 NOTE_UNCONFIRMED = "（竞价二次确认未完成，按盘前条件过滤）"
 NOTE_NONE_PASSED = "（竞价条件均未满足，今日不推荐）"
+NOTE_ALL_VETOED = "（盘前分析全部否决，今日不推荐）"
+MIN_ANALYZE_SECONDS = 120.0  # 离截止不到这么多秒就不再发起深度分析
 SPOT_MISSING = "（竞价数据缺失：未取到竞价快照，以下股票未经竞价条件检查，请依据盘前分析判断，并在 note 中注明）"
 
 
@@ -8365,6 +8501,15 @@ class PlannedPick(BaseModel):
     min_gap_pct: float
     max_gap_pct: float
     reason: str
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _unit_interval(cls, v):
+        """提示词要求 0~1；模型偶尔写成百分数（85）或越界：统一换算并截断，免得排序被打乱。"""
+        v = float(v)
+        if 1.0 < v <= 100.0:
+            v /= 100.0
+        return min(max(v, 0.0), 1.0)
 
 
 class PremarketPlan(BaseModel):
@@ -8599,6 +8744,9 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
     """为每只候选给出 keep/veto、价位与竞价条件，存入 kv。任何异常都记录日志并返回 None。"""
     try:
         cands, ctx = _load_candidates(d, store)
+        if not cands:  # 策略当天一只都没选出来：不花深度分析的钱
+            log.info("premarket analyze %s: no candidates", playbook_kind)
+            return None
         raw = llm.parse(purpose=f"analyze:{playbook_kind}", system=playbook.load_prompt("premarket"),
                         user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx), schema=PremarketPlan,
                         effort="high", timeout=timeout, max_budget_usd=1.5, essential=True)
@@ -8621,10 +8769,20 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
     return plan
 
 
-def run_analyze(d: dt.date, settings: Settings, store: Store, llm: LLM) -> dict[str, bool]:
-    """两套 playbook 各一个线程并发分析，返回 {"active": ok, "candidate": ok}。"""
+def run_analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, deadline: dt.datetime | None = None,
+                now: dt.datetime | None = None) -> dict[str, bool]:
+    """两套 playbook 各一个线程并发分析，返回 {"active": ok, "candidate": ok}。
+
+    deadline（墙钟时刻）给出时，单次超时取 ANALYZE_TIMEOUT 与剩余秒数的较小者，剩余不到 MIN_ANALYZE_SECONDS
+    就不发起：开机晚、补跑扫描时，分析不能拖到 09:25 定稿之后。"""
+    timeout = ANALYZE_TIMEOUT
+    if deadline is not None:
+        timeout = min(ANALYZE_TIMEOUT, (deadline - (now or dt.datetime.now())).total_seconds())
+        if timeout < MIN_ANALYZE_SECONDS:
+            log.warning("premarket analyze skipped: only %.0fs left before %s", timeout, deadline.time())
+            return {k: False for k in KINDS}
     with cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="analyze") as pool:
-        futures = {k: pool.submit(analyze, d, settings, store, llm, k) for k in KINDS}
+        futures = {k: pool.submit(analyze, d, settings, store, llm, k, timeout) for k in KINDS}
         return {k: fut.result() is not None for k, fut in futures.items()}
 
 
@@ -8677,8 +8835,9 @@ def _ex_adjust(cands: list[Pick], plan: PremarketPlan | None, ctx: dict, spot: p
     if not factor:
         return cands, plan
 
-    def scaled(obj, k):
-        return {"entry_max": obj.entry_max * k, "stop": obj.stop * k, "target": obj.target * k}
+    def scaled(obj, k):  # 舍入到分：推送显示的价位与过滤、撮合用的价位一致
+        return {"entry_max": round(obj.entry_max * k, 2), "stop": round(obj.stop * k, 2),
+                "target": round(obj.target * k, 2)}
 
     cands = [replace(p, **scaled(p, factor[p.code])) if p.code in factor else p for p in cands]
     if plan is not None:
@@ -8708,7 +8867,8 @@ def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pic
         return cands[: settings.max_picks], False, ""
     prelim = auction_filter(plan, cands, spot)[: settings.max_picks]
     if not prelim:
-        return [], True, plan.market_view + NOTE_NONE_PASSED
+        vetoed_all = not any(pp.action == "keep" for pp in plan.picks)
+        return [], True, plan.market_view + (NOTE_ALL_VETOED if vetoed_all else NOTE_NONE_PASSED)
     return prelim, True, plan.market_view + NOTE_UNCONFIRMED
 
 
@@ -8737,6 +8897,14 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
         log.info("premarket auction %s vetoed %s", playbook_kind, [p.code for p in prelim if p.code in vetoed])
     note = check.note.strip()
     return picks, True, plan.market_view + (f"（竞价确认：{note}）" if note else "")
+
+
+def _playbook_version(kind: str) -> int | None:
+    try:  # 只为记录版本号：playbook 文件出问题也不能耽误 09:28 前推送
+        return int(playbook.load(kind).get("version", 1))
+    except Exception:  # noqa: BLE001
+        log.exception("playbook %s unreadable", kind)
+        return None
 
 
 def _fetch_spot(client: AkClient, timeout: float, codes: list[str]) -> pd.DataFrame:
@@ -8786,7 +8954,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
         pool.shutdown(wait=False, cancel_futures=True)  # 超时的线程留在后台跑完，结果丢弃
     for kind, (picks, reviewed, view) in results.items():
         meta = {"llm_reviewed": reviewed, "market_view": view,
-                "playbook_version": int(playbook.load(kind).get("version", 1)),
+                "playbook_version": _playbook_version(kind),
                 "ref_close": _ref_close(picks, ctx, spot)}  # 结算据此判断价位是否需要按除权换算
         store.save_recommendation(d, f"h:{kind}", picks, meta)
     picks, reviewed, view = results["active"]
@@ -8801,7 +8969,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：34 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
+预期：42 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
 
 **Step 5: Manual smoke step（真实 Claude 深度分析 + 真实竞价快照，不推送、不写正式库）**
 
@@ -9081,6 +9249,30 @@ def test_review_release_message_is_pushed_and_committed(env, monkeypatch):
                                "playbook: 2026-10-16 playbook v2 上线：测试")]
 
 
+def test_release_happens_before_todays_lessons(env, monkeypatch):
+    order = []
+    monkeypatch.setattr(playbook, "maybe_release", lambda store, today, calendar: order.append("release"))
+    real = playbook.apply_lessons
+    monkeypatch.setattr(playbook, "apply_lessons", lambda *a, **k: order.append("lessons") or real(*a, **k))
+    run(env, FakeLLM(OUTPUT))
+    assert order == ["release", "lessons"]  # 当天新写的规则没有前向模拟过，不能随这次发布上线
+
+
+def test_commit_counts_only_effective_changes(env):
+    from agents.review import Lesson
+    out = ReviewOutput(summary="s", lessons=[Lesson(action="add", rule_id="", text="新", evidence="2026-10-16 600001"),
+                                             Lesson(action="remove", rule_id="r99", text="", evidence="e")])
+    run(env, FakeLLM(out))
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
+
+
+def test_report_marks_accounts_without_todays_nav(env):
+    env["store"].record_nav("q:late", PREV, 500_000.0)
+    env["store"].save_account(Account(name="q:late", cash=500_000.0))
+    run(env, FakeLLM(ReviewOutput(summary="s", lessons=[])))
+    assert "q:late（今日未结算）" in env["notifier"].sent[0]
+
+
 def test_review_without_recommendations_skips_llm(env):
     store = Store(":memory:")
     for name in ACCOUNTS:
@@ -9212,6 +9404,13 @@ def _bar_lines(cache: BarCache, codes: set[str], d: dt.date) -> list[str]:
     return out
 
 
+def _effective_changes(old: dict, new: dict) -> int:
+    """实际生效的改动条数（新增、删除、改写），不计指向不存在规则的 remove/merge。"""
+    a = {r["id"]: r["text"] for r in old.get("rules", [])}
+    b = {r["id"]: r["text"] for r in new.get("rules", [])}
+    return len(a.keys() ^ b.keys()) + sum(a[k] != b[k] for k in a.keys() & b.keys())
+
+
 def _report_rows(store: Store, d: dt.date) -> list[dict]:
     rows = []
     for name in store.list_accounts():
@@ -9222,8 +9421,10 @@ def _report_rows(store: Store, d: dt.date) -> list[dict]:
         if nav.empty:
             continue
         equity = float(nav.iloc[-1])
-        day_ret = equity / float(nav.iloc[-2]) - 1.0 if len(nav) >= 2 else 0.0
-        rows.append({"account": name, "equity": equity, "day_ret": day_ret,
+        today = nav.index[-1] == pd.Timestamp(d)
+        day_ret = equity / float(nav.iloc[-2]) - 1.0 if len(nav) >= 2 and today else 0.0
+        label = name if today else f"{name}（今日未结算）"  # 选股失败当天跳过结算：不把前一天的涨跌当成今天的
+        rows.append({"account": label, "equity": equity, "day_ret": day_ret,
                      "total_ret": equity / float(nav.iloc[0]) - 1.0})
     return rows
 
@@ -9246,6 +9447,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
 
+    # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
+    release = playbook.maybe_release(store, d, calendar)
     changed = 0
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
@@ -9267,9 +9470,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
             new = playbook.apply_lessons(cand, lessons, d)
             if new != cand:
                 playbook.save("candidate", new)
-                changed = len(lessons)
+                changed = _effective_changes(cand, new)
 
-    release = playbook.maybe_release(store, d, calendar)
     parts = ([f"复盘更新 {changed} 条"] if changed else []) + ([release] if release else [])
     if parts:
         playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts))
@@ -9286,7 +9488,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
 uv run pytest tests/test_review.py -v
 ```
 
-预期：10 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
+预期：13 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
 
 ```
 uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py tests/test_review.py -v
@@ -9299,7 +9501,7 @@ uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py t
 前提：已执行 `python -m jobs.bootstrap`，至少结算过一个有推荐的交易日，且 Task 4.1 的 `scripts/smoke_llm.py` 已跑通（claude.exe 与 `.env` 鉴权可用）。
 
 ```
-uv run python -c "import datetime as dt; from agents import playbook, review; from agents.llm import LLM; from config import get_settings; from data.akshare_client import AkClient; from data.cache import BarCache; from engine.calendar import TradingCalendar; from engine.store import Store; from notify.wecom import NullNotifier; s=get_settings(); st=Store(s.root / s.db_path); c=AkClient(); cal=TradingCalendar(c.trade_calendar()); playbook.git_commit=lambda *a, **k: False; n=NullNotifier(); d=cal.prev_day(dt.date.today() + dt.timedelta(days=1)); review.run_review(d, s, st, LLM(s, st), BarCache(s.root / s.db_path, c), n, cal); print(n.sent[0]); print(playbook.load('candidate'))"
+uv run python -c "import datetime as dt; from agents import playbook, review; from agents.llm import LLM; from config import get_settings; from data.akshare_client import AkClient; from data.cache import BarCache; from engine.calendar import TradingCalendar; from engine.store import Store; from notify.wecom import NullNotifier; s=get_settings(); st=Store(s.root / s.db_path); c=AkClient(); cal=TradingCalendar(c.trade_calendar()); playbook.git_commit=lambda *a, **k: False; playbook.maybe_release=lambda *a, **k: None; n=NullNotifier(); d=cal.prev_day(dt.date.today() + dt.timedelta(days=1)); review.run_review(d, s, st, LLM(s, st), BarCache(s.root / s.db_path, c), n, cal); print(n.sent[0]); print(playbook.load('candidate'))"
 ```
 
 预期：约半分钟到一两分钟后打印日报 markdown，"复盘"段为 Claude 写的中文摘要；`candidate` 中新增的规则（若有）`evidence` 含日期和股票代码。人工检查摘要中没有编造输入里不存在的数字。若摘要是"LLM 复盘失败（…）"，终端会同时打印 `review LLM failed: ...` 警告，按 Task 4.1 Step 5 排查。检查后用 `git checkout -- playbook/candidate.json` 撤销冒烟写入的规则（`git_commit` 已打桩，不会产生提交）。
@@ -12180,14 +12382,16 @@ def env(tmp_path, monkeypatch):
     cache, store, notifier = FakeCache(panel, NAMES, index), new_store(), NullNotifier()
     install_context(monkeypatch, make_settings(tmp_path), store, client, cache, cal(dates),
                     notifier)
-    calls, analysis = [], {"active": True, "candidate": True}
+    calls, analysis, analysis_kw = [], {"active": True, "candidate": True}, {}
 
     def fake_scan(d, settings, store, cache, client, strategy, calendar):
         calls.append(("scan", d, strategy.name))
+        store.save_candidates(d, [], {})
         return []
 
-    def fake_analyze(d, settings, store, llm):
+    def fake_analyze(d, settings, store, llm, deadline=None, now=None):
         calls.append(("analyze", d, llm))
+        analysis_kw.update(deadline=deadline, now=now)
         return dict(analysis)
 
     def fake_final(d, settings, store, llm, client, notifier, calendar):
@@ -12207,7 +12411,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(research_agent, "run_research", fake_research)
     monkeypatch.setattr(common, "make_llm", lambda settings, store: "LLM")
     return dict(dates=dates, store=store, notifier=notifier, calls=calls, analysis=analysis,
-                slept=[])
+                slept=[], analysis_kw=analysis_kw)
 
 
 def at(d, hh, mm=0, ss=0):
@@ -12250,6 +12454,21 @@ def test_scan_started_after_0925_skips_analyze(env):
     assert premarket_scan.main(now=at(d, 9, 28)) is True  # 开机补跑
     assert env["calls"] == [("scan", d, "baseline_momo")]
     assert env["notifier"].sent == []
+
+
+def test_scan_passes_analysis_deadline(env):
+    d = env["dates"][10]
+    premarket_scan.main(now=at(d, 9, 15))
+    kw = env["analysis_kw"]
+    assert kw["deadline"] == at(d, 9, 22) and at(d, 9, 15) <= kw["now"] < at(d, 9, 16)
+
+
+def test_final_does_not_rescan_while_analysis_runs(env):
+    d = env["dates"][10]
+    env["store"].save_candidates(d, [], {})  # 扫描已完成，深度分析还在跑：premarket_scan 尚未记 ok
+    assert not env["store"].job_done("premarket_scan", d)
+    assert premarket_final.main(now=at(d, 9, 25, 15), sleep=env["slept"].append) is True
+    assert [c[0] for c in env["calls"]] == ["final"]
 
 
 def test_scan_skips_non_trading_day(env):
@@ -12351,7 +12570,8 @@ uv run pytest tests/test_jobs_entrypoints.py -v
 推一条"盘前分析未完成"告警，09:25 时那一路按量化/规则推荐。"""
 from __future__ import annotations
 
-from datetime import date, datetime, time
+import time as _time
+from datetime import date, datetime, time, timedelta
 
 from agents import premarket
 from jobs import common
@@ -12360,6 +12580,7 @@ from strategies.base import load_strategy
 
 KINDS = ("active", "candidate")
 ANALYZE_CUTOFF = time(9, 25)  # 晚于此刻启动（开机补跑）只扫描：定稿已开始，计划用不上
+ANALYZE_DEADLINE = time(9, 22)  # 深度分析必须在此前结束，给 09:25 定稿留出余量
 
 
 def scan(d: date, settings, store, client, cache, calendar) -> list:
@@ -12368,10 +12589,11 @@ def scan(d: date, settings, store, client, cache, calendar) -> list:
     return premarket.scan(d, settings, store, cache, client, strategy, calendar)
 
 
-def analyze_all(d: date, settings, store) -> dict[str, bool]:
-    """两路深度分析；run_analyze 本身抛异常时按两路都未完成处理。"""
+def analyze_all(d: date, settings, store, now: datetime) -> dict[str, bool]:
+    """两路深度分析，最晚到 ANALYZE_DEADLINE；run_analyze 本身抛异常时按两路都未完成处理。"""
     try:
-        return premarket.run_analyze(d, settings, store, common.make_llm(settings, store))
+        return premarket.run_analyze(d, settings, store, common.make_llm(settings, store),
+                                     deadline=datetime.combine(d, ANALYZE_DEADLINE), now=now)
     except Exception:  # noqa: BLE001 — 分析只影响推荐质量，不能让扫描任务失败
         common.log.exception("premarket analyze %s crashed", d)
         return {k: False for k in KINDS}
@@ -12385,13 +12607,15 @@ def main(now: datetime | None = None) -> bool:
         common.log.info("premarket_scan %s: not a trading day", d)
         return False
     status: dict[str, bool] = {}
+    t0 = _time.monotonic()
 
     def job() -> None:
         scan(d, settings, store, client, cache, calendar)
         if now.time() >= ANALYZE_CUTOFF:
             common.log.info("premarket_scan %s: started at %s, analysis skipped", d, now.time())
             return
-        status.update(analyze_all(d, settings, store))
+        # 扫描本身可能要几分钟：按实际经过的时间算出分析开始的时刻
+        status.update(analyze_all(d, settings, store, now + timedelta(seconds=_time.monotonic() - t0)))
 
     ok = common.run_job("premarket_scan", d, job, store, notifier)
     failed = sorted(k for k, done in status.items() if not done)
@@ -12437,8 +12661,9 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
     if wait > 0:
         common.log.info("premarket_final %s: waiting %.0fs for auction data", d, wait)
         sleep(wait)
-    if not store.job_done("premarket_scan", d):
-        # 开机晚或 08:30 扫描失败：只补跑扫描（不做深度分析），run_final 会退回量化推荐
+    if store.load_candidates(d) is None:
+        # 开机晚或 08:30 扫描失败：只补跑扫描（不做深度分析），run_final 会退回量化推荐。
+        # 看候选是否已保存而不是看 premarket_scan 任务是否 ok：扫描完成后深度分析可能还在跑，任务尚未记 ok
         scanned = common.run_job("premarket_scan", d, lambda: premarket_scan.scan(
             d, settings, store, client, cache, calendar), store, notifier)
         if not scanned:
@@ -12515,7 +12740,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_entrypoints.py -v
 ```
-预期：17 passed（参数化的 4 个等待场景各算 1 个）。
+预期：19 passed（参数化的 4 个等待场景各算 1 个）。
 
 **Step 5: 提交**
 
@@ -13135,7 +13360,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 76 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 6、`test_jobs_settle.py` 32、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 78 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 6、`test_jobs_settle.py` 32、`test_jobs_entrypoints.py` 19、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
@@ -13156,7 +13381,7 @@ Claude 鉴权二选一（`.env.example` 里有同样的注释）：
 - 中转：填 `ANTHROPIC_BASE_URL`（中转地址）和 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 留空；
 - 官方：只填 `ANTHROPIC_API_KEY`。
 
-`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `get_settings()` 里非空的这几项，所以本机 Claude Code 自己的登录状态不影响 RSIQS。注意 `get_settings()` 每个键先取非空的系统环境变量，再取 `.env`：系统环境里如果有非空的 `ANTHROPIC_API_KEY` 等变量，会覆盖 `.env`，并随子进程发给 `ANTHROPIC_BASE_URL` 指向的地址（官方模式下，系统里残留的 `ANTHROPIC_BASE_URL` 也会让官方 Key 发往那个地址）。无论使用中转还是官方，都先确认系统环境里没有非空的 `ANTHROPIC_*` 变量（PowerShell：`Get-ChildItem Env:ANTHROPIC_*`）。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
+`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `get_settings()` 里非空的这几项，再加上 `--setting-sources ""` 不加载 Claude Code 的设置文件，所以本机 Claude Code 自己的登录状态和 `~/.claude/settings.json` 里的 `env` 都不影响 RSIQS。冒烟时确认：在 `~/.claude/settings.json` 的 `env` 里临时放一个假的 `ANTHROPIC_BASE_URL`，`scripts/smoke_llm.py` 仍应按 `.env` 的配置成功；如果失败，说明这个 claude.exe 版本仍会读设置文件，需要把 `CLAUDE_CONFIG_DIR` 指到一个空目录。注意 `get_settings()` 每个键先取非空的系统环境变量，再取 `.env`：系统环境里如果有非空的 `ANTHROPIC_API_KEY` 等变量，会覆盖 `.env`，并随子进程发给 `ANTHROPIC_BASE_URL` 指向的地址（官方模式下，系统里残留的 `ANTHROPIC_BASE_URL` 也会让官方 Key 发往那个地址）。无论使用中转还是官方，都先确认系统环境里没有非空的 `ANTHROPIC_*` 变量（PowerShell：`Get-ChildItem Env:ANTHROPIC_*`）。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
 
 **Step 4: Manual smoke steps（联网）**
 
