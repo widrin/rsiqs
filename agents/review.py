@@ -1,0 +1,145 @@
+"""16:00 盘后复盘：对比两套 LLM 账户的推荐与实际，经验只写入 candidate playbook，并推送日报。"""
+from __future__ import annotations
+
+import datetime as dt
+import logging
+from typing import Literal
+
+import pandas as pd
+from pydantic import BaseModel
+
+from agents import playbook
+from agents.llm import LLM, BudgetExceeded
+from config import Settings
+from data.cache import BarCache
+from engine.calendar import TradingCalendar
+from engine.store import Store
+from notify.format import format_daily_report
+
+log = logging.getLogger(__name__)
+
+LLM_ACCOUNTS = ("h:active", "h:candidate")
+MAX_LESSONS = 3
+BAR_LOOKBACK_DAYS = 10
+PLAYBOOK_FILES = ["playbook/active.json", "playbook/candidate.json"]
+REVIEW_TIMEOUT = 300.0  # claude.exe 子进程超时（秒）；复盘没有硬性截止时间
+REVIEW_BUDGET_USD = 1.0  # 单次复盘调用的 --max-budget-usd
+
+
+class Lesson(BaseModel):
+    action: Literal["add", "remove", "merge"]
+    rule_id: str  # add 时为 ""
+    text: str
+    evidence: str
+
+
+class ReviewOutput(BaseModel):
+    summary: str
+    lessons: list[Lesson]
+
+
+def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], set[str]]:
+    rec = store.load_recommendation(d, name)
+    acc = store.load_account(name)
+    fills = [t for t in acc.trades if t.date == d] if acc else []
+    positions = list(acc.positions.values()) if acc else []
+    codes = {p.code for p in rec[0]} if rec else set()
+    codes |= {t.code for t in fills} | {p.code for p in positions}
+    lines = [f"## 账户 {name}"]
+    if rec is None:
+        lines.append("推荐：（当日无推荐）")
+    else:
+        picks, meta = rec
+        tag = "经 LLM 审核" if meta.get("llm_reviewed") else "未经 LLM 审核，退回量化"
+        lines.append(f"推荐（{tag}）：" + ("" if picks else "经审核后不推荐"))
+        lines += [f"- {p.code} {p.name} 买≤{p.entry_max:.2f} 止损 {p.stop:.2f} 止盈 {p.target:.2f}"
+                  f" 持有 {p.hold_days} 日｜{p.reason}" for p in picks]
+    lines.append("### 当日成交")
+    lines += [f"- {t.side} {t.code} {t.qty} 股 @ {t.price:.2f}，费用 {t.fee:.2f}，{t.reason or '开盘成交'}"
+              for t in fills] or ["（无）"]
+    lines.append("### 收盘持仓")
+    lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
+              f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
+    return lines, codes
+
+
+def _bar_lines(cache: BarCache, codes: set[str], d: dt.date) -> list[str]:
+    panel, names = cache.load_panel(sorted(codes), d - dt.timedelta(days=BAR_LOOKBACK_DAYS), d)
+    ts, out = pd.Timestamp(d), ["## 个股当日行情"]
+    for code in sorted(codes):
+        df = panel.get(code)
+        if df is None or ts not in df.index:
+            out.append(f"- {code}：当日无行情（可能停牌）")
+            continue
+        r = df.loc[ts]
+        pc = float(r["prev_close"])
+        out.append(f"- {code} {names.get(code, '')}：开 {r['open']:.2f}（{r['open'] / pc - 1:+.2%}）"
+                   f" 高 {r['high']:.2f} 低 {r['low']:.2f} 收 {r['close']:.2f}（{r['close'] / pc - 1:+.2%}）"
+                   f" 成交额 {r['amount'] / 1e8:.2f} 亿")
+    return out
+
+
+def _report_rows(store: Store, d: dt.date) -> list[dict]:
+    rows = []
+    for name in store.list_accounts():
+        nav = store.nav_series(name)
+        if nav.empty:
+            continue
+        nav = nav.loc[: pd.Timestamp(d)]
+        if nav.empty:
+            continue
+        equity = float(nav.iloc[-1])
+        day_ret = equity / float(nav.iloc[-2]) - 1.0 if len(nav) >= 2 else 0.0
+        rows.append({"account": name, "equity": equity, "day_ret": day_ret,
+                     "total_ret": equity / float(nav.iloc[0]) - 1.0})
+    return rows
+
+
+def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) -> str:
+    return "\n".join([f"# 复盘日 {d.isoformat()}", "",
+                      f"## 候选版经验规则（playbook v{pb.get('version', 1)}，你的 lesson 只作用于这一版）",
+                      playbook.render(pb), "", *sections, "", *bars, "",
+                      f"请写当日复盘 summary，并给出不超过 {MAX_LESSONS} 条带证据的 lesson（可以为空）。"])
+
+
+def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: BarCache, notifier,
+               calendar: TradingCalendar) -> None:
+    sections: list[str] = []
+    codes: set[str] = set()
+    has_rec = False
+    for name in LLM_ACCOUNTS:
+        lines, c = _account_section(store, d, name)
+        sections += lines
+        codes |= c
+        has_rec = has_rec or store.load_recommendation(d, name) is not None
+
+    changed = 0
+    if not has_rec and not codes:
+        summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
+    else:
+        cand = playbook.load("candidate")
+        try:
+            out = llm.parse(purpose="review", system=playbook.load_prompt("review"),
+                            user=_build_prompt(d, cand, sections, _bar_lines(cache, codes, d)),
+                            schema=ReviewOutput, effort="medium", timeout=REVIEW_TIMEOUT,
+                            max_budget_usd=REVIEW_BUDGET_USD, essential=False)
+        except BudgetExceeded:
+            summary = "本月 LLM 预算已用完，今日未做 LLM 复盘。"
+        except Exception as e:  # noqa: BLE001 - LLMError（CLI 报错/拒答/无结构化输出）、超时等：日报照发
+            log.warning("review LLM failed: %r", e)
+            summary = f"LLM 复盘失败（{type(e).__name__}），今日 playbook 未更新。"
+        else:
+            summary = out.summary
+            lessons = [les for les in out.lessons[:MAX_LESSONS] if les.evidence.strip()]
+            new = playbook.apply_lessons(cand, lessons, d)
+            if new != cand:
+                playbook.save("candidate", new)
+                changed = len(lessons)
+
+    release = playbook.maybe_release(store, d, calendar)
+    parts = ([f"复盘更新 {changed} 条"] if changed else []) + ([release] if release else [])
+    if parts:
+        playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts))
+        if release:
+            summary = f"{summary}\n{release}"
+    notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary))
