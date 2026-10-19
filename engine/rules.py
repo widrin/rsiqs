@@ -77,9 +77,10 @@ def at_limit_up(price: float, up: float) -> bool:
     to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
     adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
     than rescaled, so an old sealed price can also sit above the computed limit by more than a
-    cent; any price above it counts as limit-up too. Effect on raw prices: a price exactly
-    one cent below the true limit also counts as limit-up (a buy there is skipped), which only
-    makes the simulation slightly more conservative.
+    cent; any price above it counts as limit-up too (SimBroker additionally requires
+    open == high when the day's prices show the computed band is wrong). Effect on raw prices: a
+    price exactly one cent below the true limit also counts as limit-up (a buy there is skipped),
+    which only makes the simulation slightly more conservative.
     """
     return round(price * 100) >= round(up * 100) - 1
 

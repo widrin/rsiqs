@@ -17,6 +17,10 @@ def _valid(bar: Bar | None) -> bool:
     return all(math.isfinite(v) and v > 0 for v in (bar.open, bar.high, bar.low, bar.prev_close))
 
 
+def _cents(v: float) -> int:
+    return round(v * 100)
+
+
 def _band(bar: Bar, d: date) -> Band:
     """Limit prices for ``bar`` on ``d`` and whether the day's prices agree with them.
 
@@ -27,8 +31,8 @@ def _band(bar: Bar, d: date) -> Band:
     prices (which shifts an old sealed price by 10% of those dividends).
     """
     up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
-    lo, hi = round(down * 100) - 1, round(up * 100) + 1
-    return up, down, all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low))
+    lo, hi = _cents(down) - 1, _cents(up) + 1
+    return up, down, all(lo <= _cents(v) <= hi for v in (bar.open, bar.high, bar.low))
 
 
 def _clip(price: float, band: Band) -> float:
@@ -53,8 +57,11 @@ class SimBroker:
            is treated as suspended and nothing trades in it. Limits come from
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
-           day with a stale prev_close); then fill prices are not clipped. The limit checks below
-           still apply: a price beyond a limit counts as sealed, which errs on the safe side.
+           day with a stale prev_close); then fill prices are not clipped, and a limit counts as
+           sealed only when the bar shows it: at limit-down only if high == low (one price all
+           day), at limit-up only if open == high. A wrong band can be far too narrow (e.g. later
+           cash dividends subtracted from forward-adjusted prices), so an ordinary day beyond it
+           still trades; a one-price bar beyond it is still sealed.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -87,7 +94,8 @@ class SimBroker:
             if pos.available <= 0 or not _valid(bar):
                 continue  # locked by T+1, or suspended / bad data
             band = _band(bar, d)
-            if at_limit_down(bar.high, band[1]):
+            one_price = _cents(bar.high) == _cents(bar.low)
+            if at_limit_down(bar.high, band[1]) and (band[2] or one_price):
                 continue  # sealed at limit-down all day: cannot sell
             if d >= pos.exit_date:
                 reason = "到期"
@@ -108,7 +116,8 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            if at_limit_up(bar.open, band[0]):
+            opened_at_high = _cents(bar.open) == _cents(bar.high)
+            if at_limit_up(bar.open, band[0]) and (band[2] or opened_at_high):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone

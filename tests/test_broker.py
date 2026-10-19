@@ -260,7 +260,7 @@ def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
     assert f.side == "BUY" and f.price == pytest.approx(13.40 * (1 + SLIP))
 
 
-def test_unreliable_band_keeps_limit_checks():
+def test_unreliable_band_one_price_bar_still_sealed():
     # forward adjustment subtracts later cash dividends, so an old one-price limit-up can sit above
     # the limit computed from the adjusted prev_close: 9.50 gives 10.45, the bar is 10.50
     acc = Account("t", 100_000.0)
@@ -269,11 +269,35 @@ def test_unreliable_band_keeps_limit_checks():
     # the same on the way down: limit-down 8.55, a one-price bar at 8.50 cannot be sold, even at expiry
     acc2 = held(exit_date=D1)
     assert run(acc2, [bar(o=8.5, h=8.5, l=8.5, c=8.5, pc=9.5)]) == []
-    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the whole day sits below
-    # limit-down, so the position stays put instead of being stopped out at a fake price
+    assert acc2.positions["600000"].qty == 1000
+
+
+def test_unreliable_band_ordinary_day_trades():
+    # 工商银行-like: adjusted prev_close 1.50 after ~3.00 of later dividends, so the computed band
+    # [1.35, 1.65] is far narrower than the real one; a -3.6% day that traded is not limit-down
+    acc = held(stop=1.40, target=1.80)
+    f = run(acc, [bar(o=1.34, h=1.35, l=1.20, c=1.25, pc=1.50)])[0]
+    assert f.reason == "止损" and f.price == pytest.approx(1.34 * (1 - SLIP))
+    # opened at the low and then traded up: still not one price all day
+    acc4 = held(stop=1.40, target=1.80)
+    f4 = run(acc4, [bar(o=1.20, h=1.34, l=1.20, c=1.30, pc=1.50)])[0]
+    assert f4.reason == "止损" and f4.price == pytest.approx(1.20 * (1 - SLIP))
+    # a +3.6% open that then traded higher is not limit-up either
+    acc2 = Account("t", 100_000.0)
+    f2 = run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
+             [pick(entry_max=1.70, stop=1.55, target=1.90)])[0]
+    assert f2.side == "BUY" and f2.price == pytest.approx(1.66 * (1 + SLIP))
+    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the expiry sell goes through
     acc3 = held(exit_date=D1)
-    assert run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)]) == []
-    assert acc2.positions["600000"].qty == acc3.positions["600000"].qty == 1000
+    f3 = run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)])[0]
+    assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
+
+
+def test_unreliable_band_open_at_high_counts_as_sealed_limit_up():
+    # the open beyond the computed limit-up is also the day's high: treated as opening sealed
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=1.70, h=1.70, l=1.62, c=1.66, pc=1.50)],
+               [pick(entry_max=1.75, stop=1.55, target=1.90)]) == []
 
 
 def test_unreliable_band_intraday_stop_not_clipped():
