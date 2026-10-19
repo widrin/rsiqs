@@ -4,6 +4,7 @@
 列名映射是模块级字典，AKShare 升级改列名时只改一行；用 scripts/smoke_akshare.py 实网核实。
 """
 import logging
+import socket
 import time
 from datetime import date
 
@@ -26,6 +27,11 @@ STOCK_NEWS_COLS = {"新闻标题": "title", "新闻内容": "content", "发布�
 NOTICE_COLS = {"代码": "code", "名称": "name", "公告标题": "title", "公告类型": "type"}
 SPOT_COLS = ["code", "name", "open", "prev_close", "last", "pct", "volume", "amount", "high"]
 NUMERIC = ["open", "high", "low", "close", "volume", "amount", "prev_close", "last", "pct", "change"]
+# 东财个股报价（stock_bid_ask_em，item/value 两列）：盘前定稿和盘中监控只需要少数代码，不必翻全市场
+BID_ASK_COLS = {"今开": "open", "昨收": "prev_close", "最新": "last", "涨幅": "pct", "总手": "volume",
+                "金额": "amount", "最高": "high"}
+HTTP_TIMEOUT = 15.0  # 支持 timeout 参数的接口（stock_zh_a_hist）单次请求的超时，秒
+SOCKET_TIMEOUT = 30.0  # 兜底：akshare 多数接口内部用不带 timeout 的 requests.get，连接卡住时会无限阻塞
 
 
 class DataError(Exception):
@@ -67,12 +73,25 @@ def _records(df: pd.DataFrame, limit: int) -> list[dict]:
             for r in df.head(limit).itertuples(index=False)]
 
 
+def _empty_on_key_error(fn, *args, **kwargs):
+    """akshare 在没有结果时对空表取列，抛 KeyError（如 stock_notice_report 遇到没有公告的日子）：视为空结果。"""
+    try:
+        return fn(*args, **kwargs)
+    except KeyError:
+        return pd.DataFrame()
+
+
 class AkClient:
-    """所有方法都经 with_retry；spot() 东财失败时切新浪。"""
+    """所有方法都经 with_retry；快照与指数日线有备用源。
+
+    构造时设置进程级的 socket 默认超时（SOCKET_TIMEOUT）：akshare 多数接口不设超时，连接卡住时重试和告警都
+    不会触发，任务会一直挂住。"""
 
     def __init__(self, attempts: int = 3, wait: float = 2.0):
         self.attempts = attempts
         self.wait = wait
+        if socket.getdefaulttimeout() is None:
+            socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
     def _call(self, fn, *args, **kwargs):
         return with_retry(fn, *args, attempts=self.attempts, wait=self.wait, **kwargs)
@@ -83,7 +102,7 @@ class AkClient:
 
     def daily_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
         df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
+                        start_date=_fmt(start), end_date=_fmt(end), adjust="qfq", timeout=HTTP_TIMEOUT)
         cols = ["date", "open", "high", "low", "close", "volume", "amount"]
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
@@ -99,7 +118,7 @@ class AkClient:
         的误差可达几角。"""
         cols = ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
         df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="")
+                        start_date=_fmt(start), end_date=_fmt(end), adjust="", timeout=HTTP_TIMEOUT)
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
         out = _pick(df, RAW_COLS, f"stock_zh_a_hist({code}, 不复权)")
@@ -108,7 +127,15 @@ class AkClient:
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
-        df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+        """新浪指数日线，失败时切东财（stock_zh_index_daily_em，symbol 同样带 sh/sz 前缀）。"""
+        try:
+            df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+        except Exception as e:  # noqa: BLE001
+            log.warning("新浪指数日线失败，切换东财: %s", e)
+            try:
+                df = self._call(ak.stock_zh_index_daily_em, symbol=symbol)
+            except Exception as e2:  # noqa: BLE001
+                raise DataError(f"指数日线新浪/东财均失败: {e2}") from e2
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
         s = pd.Series(pd.to_numeric(df["close"]).astype(float).to_numpy(), index=idx, name=symbol)
         return s.sort_index()
@@ -141,7 +168,19 @@ class AkClient:
             codes.update(str(c).zfill(6) for c in df[CONS_CODE_COL])
         return sorted(codes)
 
-    def spot(self) -> pd.DataFrame:
+    def names(self) -> dict[str, str]:
+        """沪深京全部 A 股的当前简称（交易所列表，含 ST/*ST 前缀）。每天刷新：新纳入的成分股和新戴帽的股票都靠它。"""
+        df = self._call(ak.stock_info_a_code_name)
+        return {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
+
+    def spot(self, codes: list[str] | None = None) -> pd.DataFrame:
+        """实时快照（竞价时段的"今开"即竞价价）。
+
+        给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
+        和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空。
+        不给 codes 时取全市场：东财失败切新浪。"""
+        if codes is not None:
+            return self._spot_codes(codes)
         try:
             out = _pick(self._call(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
         except Exception as e:  # noqa: BLE001
@@ -156,17 +195,38 @@ class AkClient:
         out["name"] = out["name"].astype(str)
         return out[SPOT_COLS].reset_index(drop=True)
 
+    def _spot_codes(self, codes: list[str]) -> pd.DataFrame:
+        rows = []
+        for code in codes:
+            try:
+                df = self._call(ak.stock_bid_ask_em, symbol=code)
+            except Exception as e:  # noqa: BLE001 - 单只失败不影响其他代码
+                log.warning("个股报价 %s 失败: %s", code, e)
+                continue
+            kv = dict(zip(df["item"], df["value"]))
+            row = {"code": str(code).zfill(6), "name": ""}
+            row.update({v: kv.get(k) for k, v in BID_ASK_COLS.items()})
+            rows.append(row)
+        out = pd.DataFrame(rows, columns=SPOT_COLS)
+        for c in SPOT_COLS[2:]:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)  # 停牌时报价为 "-"
+        return out
+
     def news_global(self, limit: int = 50) -> list[dict]:
+        """财联社电报，最新的在前。接口只返回最近 20 条（按时间升序），limit 超过 20 也只有 20 条。"""
         df = _pick(self._call(ak.stock_info_global_cls, symbol="全部"), CLS_COLS, "stock_info_global_cls")
         df["time"] = df["date"].astype(str) + " " + df["time"].astype(str)
-        return _records(df, limit)
+        return _records(df.sort_values("time", ascending=False), limit)
 
     def stock_news(self, code: str, limit: int = 5) -> list[dict]:
-        df = _pick(self._call(ak.stock_news_em, symbol=code), STOCK_NEWS_COLS, f"stock_news_em({code})")
+        df = self._call(_empty_on_key_error, ak.stock_news_em, symbol=code)
+        if df is None or df.empty:
+            return []
+        df = _pick(df, STOCK_NEWS_COLS, f"stock_news_em({code})")
         return _records(df.sort_values("time", ascending=False), limit)
 
     def notices(self, d: date) -> pd.DataFrame:
-        df = self._call(ak.stock_notice_report, symbol="全部", date=_fmt(d))
+        df = self._call(_empty_on_key_error, ak.stock_notice_report, symbol="全部", date=_fmt(d))
         if df is None or df.empty:
             return pd.DataFrame(columns=list(NOTICE_COLS.values()))
         out = _pick(df, NOTICE_COLS, "stock_notice_report")

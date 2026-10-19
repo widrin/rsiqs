@@ -68,7 +68,7 @@ def test_daily_bars_normalizes_chinese_columns(monkeypatch):
     fake_ak(monkeypatch, stock_zh_a_hist=hist)
     df = AkClient().daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
     assert seen == {"symbol": "600000", "period": "daily", "start_date": "20260105",
-                    "end_date": "20260106", "adjust": "qfq"}
+                    "end_date": "20260106", "adjust": "qfq", "timeout": akc.HTTP_TIMEOUT}
     assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
     assert df["date"].tolist() == [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]
     assert df["close"].tolist() == [10.2, 10.3]
@@ -199,14 +199,14 @@ def test_news_global(monkeypatch):
     raw = pd.DataFrame({"标题": ["a", "b", "c"], "内容": ["ca", "cb", "cc"],
                         "发布日期": ["2026-10-15"] * 3, "发布时间": ["09:00:00", "09:01:00", "09:02:00"]})
     fake_ak(monkeypatch, stock_info_global_cls=lambda symbol: raw)
-    items = AkClient().news_global(limit=2)
-    assert items == [{"title": "a", "content": "ca", "time": "2026-10-15 09:00:00"},
+    items = AkClient().news_global(limit=2)  # 接口按时间升序返回：取最新的两条，最新的在前
+    assert items == [{"title": "c", "content": "cc", "time": "2026-10-15 09:02:00"},
                      {"title": "b", "content": "cb", "time": "2026-10-15 09:01:00"}]
 
 
 def test_stock_news(monkeypatch):
-    raw = pd.DataFrame({"关键词": ["600000"] * 2, "新闻标题": ["t1", "t2"], "新闻内容": ["c1", "c2"],
-                        "发布时间": ["2026-10-15 08:00:00", "2026-10-14 08:00:00"],
+    raw = pd.DataFrame({"关键词": ["600000"] * 2, "新闻标题": ["t2", "t1"], "新闻内容": ["c2", "c1"],
+                        "发布时间": ["2026-10-14 08:00:00", "2026-10-15 08:00:00"],
                         "文章来源": ["x", "y"], "新闻链接": ["u1", "u2"]})
     fake_ak(monkeypatch, stock_news_em=lambda symbol: raw)
     assert AkClient().stock_news("600000", limit=1) == [
@@ -215,7 +215,7 @@ def test_stock_news(monkeypatch):
 
 def test_notices(monkeypatch):
     seen = {}
-    raw = pd.DataFrame({"代码": ["600000"], "名称": ["浦发银行"], "公告标题": ["年报"],
+    raw = pd.DataFrame({"代码": [600], "名称": ["浦发银行"], "公告标题": ["年报"],
                         "公告类型": ["定期报告"], "公告日期": ["2026-10-15"], "网址": ["u"]})
 
     def report(symbol, date):
@@ -226,4 +226,84 @@ def test_notices(monkeypatch):
     df = AkClient().notices(date(2026, 10, 15))
     assert seen == {"symbol": "全部", "date": "20261015"}
     assert list(df.columns) == ["code", "name", "title", "type"]
-    assert df.iloc[0].tolist() == ["600000", "浦发银行", "年报", "定期报告"]
+    assert df.iloc[0].tolist() == ["000600", "浦发银行", "年报", "定期报告"]
+
+
+def test_empty_results_raising_key_error_are_empty(monkeypatch):
+    def no_rows(**kw):  # akshare 在没有结果时对空表取列，抛 KeyError
+        raise KeyError("代码")
+
+    fake_ak(monkeypatch, stock_notice_report=no_rows, stock_news_em=no_rows)
+    assert AkClient().notices(date(2026, 10, 1)).empty
+    assert AkClient().stock_news("600000") == []
+
+
+def test_spot_em_retries_before_falling_back(monkeypatch, no_sleep):
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("em blip")
+        return EM_SPOT
+
+    fake_ak(monkeypatch, stock_zh_a_spot_em=flaky, stock_zh_a_spot=lambda: pytest.fail("no fallback"))
+    assert len(AkClient().spot()) == 2 and len(calls) == 2
+
+
+BID_ASK = {"今开": 10.2, "昨收": 10.0, "最新": 10.3, "最高": 10.4, "总手": 1200.0, "金额": 1.2e6, "涨幅": 3.0}
+
+
+def _bid_ask(values):
+    return pd.DataFrame({"item": list(values), "value": list(values.values())})
+
+
+def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
+    seen = []
+
+    def quote(symbol):
+        seen.append(symbol)
+        if symbol == "000002":
+            raise ConnectionError("down")
+        return _bid_ask({**BID_ASK, "今开": "-"} if symbol == "000003" else BID_ASK)
+
+    fake_ak(monkeypatch, stock_bid_ask_em=quote, stock_zh_a_spot_em=lambda: pytest.fail("no full-market spot"))
+    df = AkClient(wait=0).spot(["600000", "000002", "000003"])
+    assert list(df.columns) == SPOT_COLS
+    assert df["code"].tolist() == ["600000", "000003"]  # 取不到的代码不出现（按竞价数据缺失处理）
+    r = df.set_index("code").loc["600000"]
+    assert (r["open"], r["prev_close"], r["last"], r["high"], r["volume"], r["pct"]) == (10.2, 10.0, 10.3, 10.4, 1200.0, 3.0)
+    assert pd.isna(df.set_index("code").loc["000003", "open"])  # 停牌时报价为 "-"
+    assert AkClient().spot([]).empty and list(AkClient().spot([]).columns) == SPOT_COLS
+
+
+def test_names_from_exchange_lists(monkeypatch):
+    fake_ak(monkeypatch, stock_info_a_code_name=lambda: pd.DataFrame({"code": ["600000", 1], "name": ["浦发银行", "*ST平安"]}))
+    assert AkClient().names() == {"600000": "浦发银行", "000001": "*ST平安"}
+
+
+def test_index_daily_falls_back_to_eastmoney(monkeypatch):
+    def sina(symbol):
+        raise ConnectionError("sina down")
+
+    seen = {}
+
+    def em(symbol, start_date="19900101", end_date="20500101"):
+        seen["symbol"] = symbol
+        return pd.DataFrame({"date": ["2026-01-05", "2026-01-06"], "open": [1, 1], "close": [4000.0, 4010.5],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    fake_ak(monkeypatch, stock_zh_index_daily=sina, stock_zh_index_daily_em=em)
+    s = AkClient(wait=0).index_daily("sh000300")
+    assert seen == {"symbol": "sh000300"} and s.tolist() == [4000.0, 4010.5] and s.name == "sh000300"
+
+
+def test_client_sets_a_default_socket_timeout():
+    import socket
+    old = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(None)
+        AkClient()
+        assert socket.getdefaulttimeout() == akc.SOCKET_TIMEOUT
+    finally:
+        socket.setdefaulttimeout(old)
