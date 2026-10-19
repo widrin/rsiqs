@@ -445,6 +445,32 @@ def test_warnings_before_a_pause_are_not_lost(env, monkeypatch):
     monkeypatch.setattr(settle, "settle_day", real_run)
 
 
+def test_paused_day_warnings_pushed_once_per_day(env, monkeypatch):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    store.set_status("broken_one", "shadow", dates[100])
+    real = settle.load_strategy
+    monkeypatch.setattr(settle, "load_strategy",
+                        lambda name: (_ for _ in ()).throw(ImportError("坏策略")) if name == "broken_one" else real(name))
+    out_pick = Pick(code="600010", name=NAMES["600010"], score=1.0, entry_max=999.0, stop=0.01, target=999.0,
+                    hold_days=5, reason="测试")
+    store.save_recommendation(dates[101], "h:candidate", [out_pick], {"llm_reviewed": True})
+    cache.raw_fail = {"600010"}  # h:candidate 取不到不复权日线：每次重试都在这里暂停
+    for hh in (16, 17, 18):
+        assert settle.main(now=at(dates[101], hh)) == []
+    assert sum("broken_one" in str(m) for m in env["notifier"].sent) == 1
+
+
+def test_settle_history_window_starts_from_asof(env, monkeypatch):
+    dates, cache = env["dates"], env["cache"]
+    starts = []
+    real = cache.load_panel
+    monkeypatch.setattr(cache, "load_panel", lambda codes, a, b: starts.append(a) or real(codes, a, b))
+    settle.main(now=at(dates[101], 16))
+    from agents.premarket import HISTORY_DAYS
+    from datetime import timedelta
+    assert starts[0] == dates[100] - timedelta(days=HISTORY_DAYS)  # 与盘前扫描相同（asof - HISTORY_DAYS）
+
+
 def test_retired_account_not_tracked(env):
     dates, store = env["dates"], env["store"]
     settle.main(now=at(dates[101], 16))

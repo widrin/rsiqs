@@ -247,6 +247,15 @@ def test_commit_counts_only_effective_changes(env):
     assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
 
 
+def test_backfilled_day_shows_holdings_at_that_close(env):
+    llm = FakeLLM(ReviewOutput(summary="s", lessons=[]))
+    review.run_review(PREV, settings(), env["store"], llm, env["cache"], env["notifier"], CAL, latest=False,
+                      release=None)
+    user = llm.calls[0]["user"]
+    assert "600009 100 股（按成交回放" in user  # PREV 收盘时持有 600009
+    assert "600001 1000 股" not in user          # D 才买入
+
+
 def test_git_failure_is_noted_in_report(env, monkeypatch):
     monkeypatch.setattr(playbook, "git_commit", lambda paths, message: False)
     run(env, FakeLLM(OUTPUT))

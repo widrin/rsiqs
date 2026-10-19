@@ -41,12 +41,13 @@ def _levels(pos, acc, cache, d: date) -> tuple[float, float]:
     return stop, target
 
 
-def _unexplained_ex(code: str, prev: float, cache, d: date) -> str:
-    """报价的参考昨收比缓存里最近的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。"""
-    if cache is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
+def _unexplained_ex(code: str, prev: float, cache, d: date, calendar) -> str:
+    """报价的参考昨收比上一交易日的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
+    缓存里最近的不复权收盘不是上一交易日的（前一天没结算到这只）时不判断：正常的大跌不能当成除权。"""
+    if cache is None or calendar is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
         return ""
     last = cache.last_raw_close(code, d - timedelta(days=1))
-    if last is None or prev >= last[1] * (1 - BIG_EX_GAP):
+    if last is None or last[0] != calendar.prev_day(d) or prev >= last[1] * (1 - BIG_EX_GAP):
         return ""
     if any(last[0] < ex <= d for ex, _, _ in cache.dividends(code)):
         return ""
@@ -54,7 +55,7 @@ def _unexplained_ex(code: str, prev: float, cache, d: date) -> str:
             "止损止盈未换算，今天暂不按它们提醒")
 
 
-def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
+def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> list[str]:
     """检查一次持仓，返回本次新发出的告警；(code, 事件) 去重键按日持久化在 kv。
     cache 提供分红送转记录：建仓后除权除息、结算还没调整的持仓按换算后的止损、止盈价判断。
     报价源没有返回的持仓每天记一次警告日志。"""
@@ -80,7 +81,7 @@ def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
             continue
         events = []
         stop, target = _levels(pos, acc, cache, d)
-        unexplained = _unexplained_ex(code, prev, cache, d)
+        unexplained = _unexplained_ex(code, prev, cache, d, calendar)
         if unexplained:  # 结算在等分红记录（疑似送转）：止损止盈没有换算，按旧价位判断会误报
             events.append(("疑似除权", unexplained))
         elif last <= stop:
@@ -118,7 +119,7 @@ def main(now: datetime | None = None, interval: float = INTERVAL_SEC) -> None:
             break
         if in_session(t.time()):
             try:
-                check_once(d, store, client, notifier, cache)
+                check_once(d, store, client, notifier, cache, calendar)
                 fails = 0
             except Exception as e:  # noqa: BLE001 — 单次失败不退出循环
                 fails += 1

@@ -38,13 +38,24 @@ class ReviewOutput(BaseModel):
     lessons: list[Lesson]
 
 
-def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], set[str]]:
+def _holdings_at(acc, d: dt.date) -> dict[str, int]:
+    """按成交回放 d 日收盘时的持股（回补较早的日子时用；不计之后的送转）。"""
+    qty: dict[str, int] = {}
+    for t in acc.trades:
+        if t.date <= d:
+            qty[t.code] = qty.get(t.code, 0) + (t.qty if t.side == "BUY" else -t.qty)
+    return {c: q for c, q in qty.items() if q > 0}
+
+
+def _account_section(store: Store, d: dt.date, name: str, latest: bool = True) -> tuple[list[str], set[str]]:
+    """latest=False 表示回补较早的日子：账户已经结算到更晚的日子，收盘持仓按成交回放到 d。"""
     rec = store.load_recommendation(d, name)
     acc = store.load_account(name)
     fills = [t for t in acc.trades if t.date == d] if acc else []
-    positions = list(acc.positions.values()) if acc else []
+    positions = list(acc.positions.values()) if acc and latest else []
+    held = {} if acc is None or latest else _holdings_at(acc, d)
     codes = {p.code for p in rec[0]} if rec else set()
-    codes |= {t.code for t in fills} | {p.code for p in positions}
+    codes |= {t.code for t in fills} | {p.code for p in positions} | set(held)
     lines = [f"## 账户 {name}"]
     if rec is None:
         lines.append("推荐：（当日无推荐）")
@@ -58,8 +69,11 @@ def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], se
     lines += [f"- {t.side} {t.code} {t.qty} 股 @ {t.price:.2f}，费用 {t.fee:.2f}，{t.reason or '开盘成交'}"
               for t in fills] or ["（无）"]
     lines.append("### 收盘持仓")
-    lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
-              f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
+    if latest:
+        lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
+                  f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
+    else:
+        lines += [f"- {c} {q} 股（按成交回放，未计之后的送转）" for c, q in sorted(held.items())] or ["（空仓）"]
     return lines, codes
 
 
@@ -118,12 +132,14 @@ def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) ->
 
 
 def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: BarCache, notifier,
-               calendar: TradingCalendar) -> None:
+               calendar: TradingCalendar, latest: bool = True, release: str | None | bool = True) -> None:
+    """latest=False：回补较早的日子，持仓按成交回放到 d。release=True 时按 d 判断是否发布；
+    传入字符串或 None 时表示调用方已经判断过（回补时先判断发布、再写各天的 lesson），这里直接沿用。"""
     sections: list[str] = []
     codes: set[str] = set()
     has_rec = False
     for name in LLM_ACCOUNTS:
-        lines, c = _account_section(store, d, name)
+        lines, c = _account_section(store, d, name, latest)
         sections += lines
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
@@ -131,7 +147,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
     bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
+    if release is True:
+        release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
     parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"

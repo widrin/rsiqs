@@ -49,7 +49,14 @@ def _rules_state() -> tuple:
             pd.concat, pd.DataFrame.__init__)
 
 
-def run(name: str) -> dict:
+SETUP_EXIT = 3  # 评估环境本身出错（配置、缓存、数据库），与策略无关：调用方不计入试验
+
+
+class SetupError(RuntimeError):
+    """加载策略之前的准备步骤失败。"""
+
+
+def _setup():
     settings = get_settings()
     db = Path(settings.root) / settings.db_path
     store = Store(db)
@@ -59,7 +66,14 @@ def run(name: str) -> dict:
         raise RuntimeError(f"缓存中没有基准指数 {BENCHMARK}，请先运行 python -m jobs.bootstrap")
     calendar = TradingCalendar(ts.date() for ts in bench.index)
     panel, names = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
-    benchmark_nav = bench / bench.iloc[0]
+    return store, calendar, panel, names, bench / bench.iloc[0]
+
+
+def run(name: str) -> dict:
+    try:
+        store, calendar, panel, names, benchmark_nav = _setup()
+    except Exception as e:  # noqa: BLE001 — 统一标成环境错误
+        raise SetupError(f"{type(e).__name__}: {e}") from e
     before = _rules_state()  # 先取快照再加载策略：策略模块的顶层代码也可能改动评估规则
     strategy = load_strategy(name)
     report = evaluate(strategy, name, panel, names, calendar, benchmark_nav, store)
@@ -81,6 +95,10 @@ def main(argv: list[str] | None = None, out=None) -> int:
         result = run(argv[0])
     except KeyboardInterrupt:
         raise
+    except SetupError as e:
+        logging.exception("评估 %s 的准备步骤失败", argv[0])
+        print(json.dumps({"error": f"评估环境出错：{e}", "stage": "setup"}, ensure_ascii=False), file=out)
+        return SETUP_EXIT
     except BaseException as e:  # noqa: BLE001 - 含策略抛出的 SystemExit：任何失败都要以 JSON 回传给 agent
         logging.exception("评估 %s 失败", argv[0])
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), file=out)

@@ -233,17 +233,38 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
 
 
-def test_git_commit_has_timeout_and_skips_signing(tmp_path, monkeypatch):
-    calls = []
+def test_git_commit_timeout_kills_process_tree_and_skips_hooks(monkeypatch):
+    started, killed = [], []
 
-    def fake_run(args, **kw):
-        calls.append((args, kw))
-        raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+    class HangingGit:
+        pid = 4242
 
-    monkeypatch.setattr(playbook.subprocess, "run", fake_run)
+        def __init__(self, args, **kw):
+            started.append((args, kw))
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("git", timeout)
+            return -9
+
+    monkeypatch.setattr(playbook.subprocess, "Popen", HangingGit)
+    monkeypatch.setattr(playbook, "_kill_tree", lambda proc: killed.append(proc.pid))
     assert playbook.git_commit(["playbook/active.json"], "m") is False  # 超时不抛异常
-    args, kw = calls[0]
-    assert kw["timeout"] == playbook.GIT_TIMEOUT and "commit.gpgsign=false" in args
+    args, kw = started[0]
+    assert "commit.gpgsign=false" in args and any(a.startswith("core.hooksPath=") for a in args)
+    assert kw["stdout"] is not subprocess.PIPE and killed == [4242]  # 输出不走管道；超时后结束整个进程树
+
+
+def test_git_commit_skips_hooks_in_real_repo(tmp_path, monkeypatch):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "t")
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")  # 会让提交失败的钩子
+    monkeypatch.setattr(playbook, "ROOT", tmp_path)
+    monkeypatch.setattr(playbook, "NO_HOOKS", tmp_path / ".no-hooks")
+    (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+    assert playbook.git_commit(["a.json"], "playbook: 测试") is True
 
 
 def test_git_commit_outside_repo_returns_false(tmp_path, monkeypatch):

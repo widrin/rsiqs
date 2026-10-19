@@ -205,6 +205,20 @@ def test_evaluate_timeout(written):
     assert store.trial_count() == 1 and trial["gate_pass"] is False and trial["holdout_pass"] is None
 
 
+def test_evaluate_setup_error_is_not_counted(written):
+    settings, store = written
+    stdout = '{"error": "评估环境出错：RuntimeError: 缓存中没有基准指数", "stage": "setup"}\n'
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(stdout, returncode=3))
+    assert out["ok"] is False and "评估环境出错" in out["error"] and store.trial_count() == 0
+
+
+def test_incomplete_trial_is_labelled_in_context(env):
+    settings, store = env
+    store.add_trial("slow_one", {"incomplete": "评估超时（1800 秒）"}, None, None, False, None)
+    ctx = build_context(settings, store)
+    assert "slow_one：评估未完成" in ctx and "slow_one：train" not in ctx
+
+
 def test_evaluate_cannot_start_is_not_counted(written):
     settings, store = written
 

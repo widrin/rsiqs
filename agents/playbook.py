@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -144,14 +145,20 @@ def _ran_without_playbook(store: Store, d: dt.date) -> bool:
     return False
 
 
+def reset_window_if_degraded(store: Store, d: dt.date) -> bool:
+    """任一份 playbook 损坏，或 d 日盘前有一路按空规则运行时，把发布窗口起点移到 d，返回 True。
+    损坏期间盘前按空规则交易，这段净值不能用来比较两版规则；看盘前实际用的版本，不只看复盘时的文件：
+    白天修好的那天，盘前用的仍是空规则。复盘回补较早的日子时也要逐日调用。"""
+    if corrupt_kinds() or _ran_without_playbook(store, d):
+        store.kv_set(RELEASE_KEY, d.isoformat())
+        return True
+    return False
+
+
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
-    if corrupt_kinds() or _ran_without_playbook(store, today):
-        # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
-        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始。
-        # 看盘前实际用的版本，不只看复盘时的文件：白天修好的那天，盘前用的仍是空规则
-        store.kv_set(RELEASE_KEY, today.isoformat())
-        return None
+    if reset_window_if_degraded(store, today):
+        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     last = store.kv_get(RELEASE_KEY)
     if last is None:
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -180,22 +187,45 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
 
 
 GIT_TIMEOUT = 60  # 秒：计划任务里没有人能输入口令，钩子或签名卡住时不能挡住日报
+NO_HOOKS = ROOT / ".git-no-hooks"  # 不存在的目录：core.hooksPath 指向它，所有钩子都不跑
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":  # git.exe 可能已经起了子进程：连同子进程一起结束
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
+    proc.wait()
+
+
+def _git(*args) -> tuple[int, str]:
+    """运行一次 git：不签名、不跑任何钩子；输出写临时文件而不是管道（残留的子进程不会挡住等待），
+    超时就结束整个进程树并抛 TimeoutExpired。"""
+    cmd = ["git", "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={NO_HOOKS}", *args]
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=out, stdin=subprocess.DEVNULL)
+        try:
+            code = proc.wait(timeout=GIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            raise
+        out.seek(0)
+        return code, out.read().decode("utf-8", "replace")
 
 
 def git_commit(paths: list[str], message: str) -> bool:
-    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。
-    计划任务里不签名、不跑钩子（-c commit.gpgsign=false、--no-verify），每次调用都有超时。"""
-    def git(*args, check=True):
-        return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=ROOT, check=check,
-                              capture_output=True, timeout=GIT_TIMEOUT)
-
+    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。"""
     try:
-        git("add", "--", *paths)
-        if git("diff", "--cached", "--quiet", "--", *paths, check=False).returncode == 0:
+        code, text = _git("add", "--", *paths)
+        if code == 0:
+            code, text = _git("diff", "--cached", "--quiet", "--", *paths)
+            if code == 0:
+                return False  # 没有变化
+            code, text = _git("commit", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
+        if code != 0:
+            log.warning("git commit failed (exit %s): %s", code, text[-500:])
             return False
-        git("commit", "--no-verify", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
         return True
     except (OSError, subprocess.SubprocessError) as e:
-        err = getattr(e, "stderr", None) or b""
-        log.warning("git commit failed: %s %s", e, err.decode("utf-8", "replace")[-500:])
+        log.warning("git commit failed: %s（如果留下了 .git/index.lock，确认没有 git 在运行后手动删除）", e)
         return False

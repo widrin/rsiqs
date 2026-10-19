@@ -175,7 +175,9 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     codes = tracked_codes(store)
     # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
     recs = recommended_codes(store, [d])
-    panel, names = cache.load_panel(sorted(set(codes) | recs), d - timedelta(days=LOOKBACK_CAL_DAYS), d)
+    asof = calendar.prev_day(d)
+    # 与盘前扫描一样从 asof 往前取 LOOKBACK_CAL_DAYS 个自然日：同一策略两处看到的历史行数相同
+    panel, names = cache.load_panel(sorted(set(codes) | recs), asof - timedelta(days=LOOKBACK_CAL_DAYS), d)
     qfq_bars = bars_for_day(panel, names, d)
     if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
         raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(qfq_bars)}/{len(codes)}，数据可能未更新")
@@ -183,7 +185,6 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     index = cache.load_index(common.INDEX_SYMBOL)
     bench_equity = settings.capital * _index_close(index, d) / _index_close(index, bench_start)
 
-    asof = calendar.prev_day(d)
     # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合。选股范围是股票池加持仓，不含当天 LLM 推荐的代码
     tracked = set(codes)
     view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
@@ -275,14 +276,22 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     return warnings
 
 
+def _send_warnings(d: date, warnings: list[str], store, notifier, today: date) -> None:
+    """推送结算警告；同一结算日的同一条警告每个自然日只推一次（暂停期间每 20 分钟重试会重新生成）。"""
+    key = f"settle_warned:{d.isoformat()}:{today.isoformat()}"
+    sent = set(store.kv_get(key) or [])
+    new = [w for w in dict.fromkeys(warnings) if w not in sent]
+    if new and notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(new))):
+        store.kv_set(key, sorted(sent | set(new)))
+
+
 def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset(),
                       run_date: date | None = None) -> None:
     warnings: list[str] = []
     try:
         settle_day(d, settings, store, cache, calendar, div_failed, run_date, warnings=warnings)
     finally:  # 暂停时已结算账户的警告（除权调整等）也要推出去：重跑时这些账户会跳过，不再生成
-        if warnings:
-            notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
+        _send_warnings(d, warnings, store, notifier, run_date or common.today())
     for ev in promotion.decide(store, d, calendar):
         notifier.send_text(format_alert(f"策略{KIND_CN.get(ev.kind, ev.kind)}",
                                         f"{ev.strategy}：{ev.detail}"))

@@ -167,8 +167,9 @@ def test_missing_benchmark(tmp_path, monkeypatch):
     monkeypatch.setattr(run_eval, "get_settings",
                         lambda: SimpleNamespace(db_path=str(tmp_path / "empty.sqlite"), root=tmp_path))
     out = io.StringIO()
-    assert run_eval.main(["baseline_momo"], out=out) == 1
-    assert "sh000300" in json.loads(out.getvalue())["error"]
+    assert run_eval.main(["baseline_momo"], out=out) == run_eval.SETUP_EXIT  # 环境错误，与策略无关
+    msg = json.loads(out.getvalue())
+    assert "sh000300" in msg["error"] and msg["stage"] == "setup"
 
 
 def test_real_evaluation_is_not_voided(tmp_path, monkeypatch):

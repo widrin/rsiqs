@@ -2,6 +2,7 @@ from datetime import date, time
 
 import pandas as pd
 
+from engine.calendar import TradingCalendar
 from engine.ledger import Account, Position
 from engine.store import Store
 from jobs.monitor import check_once, in_session
@@ -126,14 +127,24 @@ class RawDivCache(DivCache):
         return self.last_close
 
 
+CAL = TradingCalendar(pd.bdate_range("2026-09-01", "2026-12-31").date)
+
+
 def test_unexplained_ex_gap_does_not_alert_stop():
     store = make_store(("600001", 9.3, 11.0))
     cache = RawDivCache({}, (date(2026, 10, 15), 10.0))  # 昨收 10.0，今天参考昨收 5.0：疑似 10 转 10，没有记录
-    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), cache)
+    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), cache, CAL)
     assert len(out) == 1 and "疑似除权" in out[0] and "触发止损" not in out[0]
     explained = RawDivCache({"600001": [(D, 0.0, 1.0)]}, (date(2026, 10, 15), 10.0))  # 有记录：按换算后的价位
     out = check_once(D, make_store(("600001", 9.3, 11.0)), SpotClient([row("600001", 4.5, 5.0, prev_close=5.0)]),
-                     NullNotifier(), explained)
+                     NullNotifier(), explained, CAL)
+    assert len(out) == 1 and "触发止损" in out[0]
+
+
+def test_stale_raw_close_is_not_taken_for_ex_rights():
+    store = make_store(("600001", 9.0, 11.0))
+    stale = RawDivCache({}, (date(2026, 10, 14), 10.0))  # 缓存停在前天：昨天正常跌 5% 不能当成除权
+    out = check_once(D, store, SpotClient([row("600001", 8.9, 9.6, prev_close=9.5)]), NullNotifier(), stale, CAL)
     assert len(out) == 1 and "触发止损" in out[0]
 
 

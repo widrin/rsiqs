@@ -25,6 +25,7 @@ from agents.premarket import HISTORY_DAYS
 from config import Settings
 from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
+from engine.run_eval import SETUP_EXIT
 from engine.store import Store
 from notify.format import format_alert
 from strategies.base import NAME_RE, RESERVED
@@ -108,6 +109,9 @@ def _trial_line(store: Store, t: dict) -> str:
     hyp = _hypothesis(store, t["strategy"])[:120]
     if store.kv_get(f"research:voided:{t['strategy']}"):  # 作废会把门槛和 holdout 记为未通过，这里如实说明
         return (f"- {t['ts'][:10]} {t['strategy']}：已作废（评估期间 engine/ 校验不符），结果不代表策略本身"
+                + (f"；假设：{hyp}" if hyp else ""))
+    if (t.get("params") or {}).get("incomplete"):  # 超时或出错时补记的试验
+        return (f"- {t['ts'][:10]} {t['strategy']}：评估未完成（超时或出错），不代表假设本身"
                 + (f"；假设：{hyp}" if hyp else ""))
     ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     return (f"- {t['ts'][:10]} {t['strategy']}：train 夏普 {f(t['train_sharpe'])}，val 夏普 "
@@ -255,6 +259,9 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
     except OSError as e:
         return {"ok": False, "report": None, "error": f"无法启动评估进程：{e}", "count": False}
     report = _last_json_line(proc.stdout)
+    if proc.returncode == SETUP_EXIT and report and report.get("stage") == "setup":
+        return {"ok": False, "report": None, "error": str(report.get("error", "评估环境出错"))[:EVAL_ERROR_CHARS],
+                "count": False}  # 与策略无关的环境错误不计入试验
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
             detail = str(report["error"])[:EVAL_ERROR_CHARS]
