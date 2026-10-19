@@ -230,7 +230,7 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     log = _git(tmp_path, "log", "-1", "--format=%B")
     assert log.startswith("playbook: 复盘更新")
     assert "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" in log
-    assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
+    assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is None  # 没有变化不是失败
 
 
 def test_git_commit_timeout_kills_process_tree_and_skips_hooks(monkeypatch):

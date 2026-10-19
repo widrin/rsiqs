@@ -301,7 +301,8 @@ def main(now: datetime | None = None) -> list[date]:
     """补跑所有待结算交易日；返回本次结算成功的日期。某日失败即停止（次日依赖前日持仓）。"""
     now = now or datetime.now()
     settings, store, client, cache, calendar, notifier = common.context()
-    with common.job_lock("settle_main") as got:  # 复盘等这把锁：结算跑完再判断是否已结算
+    # 复盘等这把锁：结算跑完再判断是否已结算。复盘轮询时会短暂拿一下锁，这里等几秒，不因此跳过本次结算
+    with common.job_lock("settle_main", wait=10) as got:
         if not got:
             common.log.info("settle: running in another process")
             return []

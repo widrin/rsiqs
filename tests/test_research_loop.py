@@ -18,6 +18,7 @@ from notify.wecom import NullNotifier
 from strategies.sandbox import ALLOWED_IMPORTS
 
 PROJECT = Path(__file__).resolve().parents[1]
+REAL_EVALUATE = research.evaluate_strategy  # env 夹具会把它换成用假 runner 的版本
 SOURCES = ["strategies/base.py", "strategies/baseline_momo.py",
            "engine/types.py", "engine/dataview.py", "engine/rules.py"]
 # 提示词里不能出现的措辞（会触发分类器，导致调用失败）
@@ -423,6 +424,25 @@ def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
     monkeypatch.setattr(research, "verify", real)
     ctx = research.build_context(e.settings, e.store)
     assert "a_one：已作废" in ctx and "a_one：train" not in ctx            # 下次背景里不当作真实失败
+
+
+def test_setup_error_stops_the_session_with_alert(env, monkeypatch):
+    e = env
+
+    def setup_fail(cmd, **kw):
+        e.evals.names.append(cmd[-1])
+        stdout = '{"error": "评估环境出错：RuntimeError: 缓存中没有基准指数", "stage": "setup"}\n'
+        return subprocess.CompletedProcess(cmd, 3, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(research, "evaluate_strategy",
+                        lambda s, st, name, runner=None: REAL_EVALUATE(s, st, name, runner=setup_fail))
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
+    out = run(e, llm)
+    assert out["status"] == "error" and e.evals.names == ["a_one"] and len(llm.calls) == 1  # 不再评估、不再请求 LLM
+    assert set(out) == {"status", "rounds", "written", "results", "cost_cny", "analysis"}
+    assert e.store.trial_count() == 0
+    msg = e.notifier.sent[-1]
+    assert "告警" in msg and "评估环境出错" in msg and "a_one" in msg
 
 
 def test_commit_failure_is_reported(env, monkeypatch):

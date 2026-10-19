@@ -261,7 +261,7 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
     report = _last_json_line(proc.stdout)
     if proc.returncode == SETUP_EXIT and report and report.get("stage") == "setup":
         return {"ok": False, "report": None, "error": str(report.get("error", "评估环境出错"))[:EVAL_ERROR_CHARS],
-                "count": False}  # 与策略无关的环境错误不计入试验
+                "count": False, "setup": True}  # 与策略无关的环境错误：不计入试验，会话随即停止
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
             detail = str(report["error"])[:EVAL_ERROR_CHARS]
@@ -441,6 +441,11 @@ def _summary(today: date, out: dict, error: str) -> str:
     return f"RSIQS {title}\n" + "\n".join(lines)
 
 
+def res_names(out: dict) -> str:
+    """本次写入、但因评估环境出错没有试验记录的草稿名。"""
+    return "、".join(r["name"] for r in out["results"] if r["saved"] and r.get("setup")) or "无"
+
+
 def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
                    evals: int, out: dict) -> tuple[list[dict], int]:
     """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
@@ -461,6 +466,9 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
             out["written"].append(res["name"])
             evals += 1  # 先计数：超时、失败同样消耗一次额度
             res.update(evaluate_strategy(settings, store, res["name"]))
+            if res.get("setup"):  # 评估环境出错：后面的草稿评估了也一样失败，停止会话
+                out["setup_error"] = res["error"]
+                break
             changed = verify(Path(settings.root))
             if changed:
                 out["engine_changed"] = changed
@@ -514,6 +522,9 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             history.append({"round": rnd_no, "analysis": rnd.analysis, "results": results,
                             "drafts": rnd.drafts[:MAX_DRAFTS_PER_ROUND],
                             "ignored": max(0, len(rnd.drafts) - MAX_DRAFTS_PER_ROUND)})
+            if out.get("setup_error"):
+                out["status"], error = "error", f"{out['setup_error']}（草稿 {res_names(out)} 已写入但没有评估）"
+                break
             if out.get("engine_changed") or rnd.done or not rnd.drafts or evals >= MAX_EVALS_PER_SESSION:
                 break  # engine/ 被改动：立即停止，不再请求 LLM，也不再评估
     except Exception as e:  # noqa: BLE001 — 写文件、数据库等本地故障：停止，但照常做会后校验与提交
@@ -521,6 +532,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         out["status"], error = "error", f"{type(e).__name__}: {e}"
     out["cost_cny"] = _month_cost(store) - cost0
 
+    out.pop("setup_error", None)
     mid = out.pop("engine_changed", None) or []
     bad = verify(root)
     if bad or mid:
@@ -547,7 +559,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
     text = _summary(today, out, error)
     if saved:
         paths = [f"strategies/{r['name']}.py" for r in saved]
-        if not git_commit(paths, _commit_message(today, saved)):
+        if git_commit(paths, _commit_message(today, saved)) is False:
             log.warning("research commit failed: %s", paths)
             text += "\n注意：git 提交失败，请人工提交：" + "、".join(paths)
     notifier.send_text(text)

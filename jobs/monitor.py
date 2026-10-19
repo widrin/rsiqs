@@ -41,13 +41,14 @@ def _levels(pos, acc, cache, d: date) -> tuple[float, float]:
     return stop, target
 
 
-def _unexplained_ex(code: str, prev: float, cache, d: date, calendar) -> str:
-    """报价的参考昨收比上一交易日的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
-    缓存里最近的不复权收盘不是上一交易日的（前一天没结算到这只）时不判断：正常的大跌不能当成除权。"""
+def _unexplained_ex(code: str, prev: float, cache, d: date, calendar, settled_prev: bool = False) -> str:
+    """报价的参考昨收比缓存里最近的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
+    最近的不复权收盘不是上一交易日的：上一交易日已结算（这只是停牌，复牌当天可能就是除权日）时照常判断；
+    还没结算（数据没更新，正常的大跌不能当成除权）时不判断。"""
     if cache is None or calendar is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
         return ""
     last = cache.last_raw_close(code, d - timedelta(days=1))
-    if last is None or last[0] != calendar.prev_day(d) or prev >= last[1] * (1 - BIG_EX_GAP):
+    if last is None or (last[0] != calendar.prev_day(d) and not settled_prev) or prev >= last[1] * (1 - BIG_EX_GAP):
         return ""
     if any(last[0] < ex <= d for ex, _, _ in cache.dividends(code)):
         return ""
@@ -66,6 +67,8 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
     key = f"monitor_sent:{d.isoformat()}"
     sent = set(store.kv_get(key) or [])
     out, dirty = [], False
+    last_nav = store.last_nav_date(ACCOUNT)
+    settled_prev = calendar is not None and last_nav is not None and last_nav >= calendar.prev_day(d)
     for code, pos in acc.positions.items():
         if pos.exit_date <= d:  # 到期的持仓开盘已按到期卖出，盘中不再提醒止损、止盈
             continue
@@ -81,7 +84,7 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
             continue
         events = []
         stop, target = _levels(pos, acc, cache, d)
-        unexplained = _unexplained_ex(code, prev, cache, d, calendar)
+        unexplained = _unexplained_ex(code, prev, cache, d, calendar, settled_prev)
         if unexplained:  # 结算在等分红记录（疑似送转）：止损止盈没有换算，按旧价位判断会误报
             events.append(("疑似除权", unexplained))
         elif last <= stop:

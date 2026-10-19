@@ -141,6 +141,14 @@ def test_unexplained_ex_gap_does_not_alert_stop():
     assert len(out) == 1 and "触发止损" in out[0]
 
 
+def test_ex_rights_on_resumption_after_suspension():
+    store = make_store(("600001", 9.3, 11.0))
+    store.record_nav("h:active", date(2026, 10, 15), 100_000.0)  # 上一交易日已结算：600001 只是停牌
+    stale = RawDivCache({}, (date(2026, 10, 12), 10.0))  # 停牌前最后的收盘；复牌当天 10 转 10，记录还没到
+    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), stale, CAL)
+    assert len(out) == 1 and "疑似除权" in out[0] and "触发止损" not in out[0]
+
+
 def test_stale_raw_close_is_not_taken_for_ex_rights():
     store = make_store(("600001", 9.0, 11.0))
     stale = RawDivCache({}, (date(2026, 10, 14), 10.0))  # 缓存停在前天：昨天正常跌 5% 不能当成除权

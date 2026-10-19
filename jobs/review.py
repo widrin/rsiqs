@@ -5,7 +5,6 @@ from __future__ import annotations
 import time as _time
 from datetime import datetime
 
-from agents import playbook
 from agents import review as review_agent
 from jobs import common
 
@@ -16,7 +15,8 @@ MAX_BACKFILL = 3        # 最多复盘这么多个交易日（含当天）：结
 
 
 def pending_reviews(store, calendar, last) -> list:
-    """last 及之前共 MAX_BACKFILL 个交易日里已结算、还没复盘的日子（遇到未结算的日子就停），按日期升序。"""
+    """last 及之前共 MAX_BACKFILL 个交易日里已结算、还没复盘的日子（遇到未结算的日子就停），按日期升序。
+    更早漏掉的日子不再补（日报只是记录，LLM 复盘只做最近一天）。"""
     days, d = [], last
     for _ in range(MAX_BACKFILL):
         if not store.job_done("settle", d):
@@ -53,20 +53,11 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         common.log.info("skip review %s (already ok)", last)
         return True
     llm = common.make_llm(settings, store)
-    release: str | None | bool = True
-    if len(days) > 1 or days[-1] != last:
-        # 回补：先逐日检查发布窗口、再按最近一天决定是否发布，都在写任何一天的 lesson 之前：
-        # 回补期间新写的规则没有前向模拟过，不能随这次发布上线
-        for d in days[:-1]:
-            playbook.reset_window_if_degraded(store, d)
-        release = playbook.maybe_release(store, days[-1], calendar)
-    for d in days:
-        msg = release if d == days[-1] else None
-        if not common.run_job("review", d, lambda d=d, msg=msg: review_agent.run_review(
-                d, settings, store, llm, cache, notifier, calendar, latest=(d == last), release=msg),
-                store, notifier):
-            return False  # 按日期顺序：这一天失败就停下，下次重试从这一天接着补
-    return True
+    ok = True
+    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘；某天失败不挡住其余日子
+        ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
+            d, settings, store, llm, cache, notifier, calendar, backfill=(d != last)), store, notifier) and ok
+    return ok
 
 
 if __name__ == "__main__":

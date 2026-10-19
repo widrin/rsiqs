@@ -40,12 +40,12 @@ def env(tmp_path, monkeypatch):
     def fake_final(d, settings, store, llm, client, notifier, calendar):
         calls.append(("final", d, llm))
 
-    def fake_review(d, settings, store, llm, cache, notifier, calendar, latest=True, release=True):
+    def fake_review(d, settings, store, llm, cache, notifier, calendar, backfill=False):
         if d in review_fail:
             review_fail.discard(d)
             raise RuntimeError("复盘失败")
         calls.append(("review", d, llm))
-        review_kw.append((d, latest, release))
+        review_kw.append((d, backfill))
 
     def fake_research(settings, store, notifier, llm=None):
         calls.append(("research", llm))
@@ -278,28 +278,23 @@ def test_review_backfills_settled_days_without_review(env):
     assert [c[1] for c in env["calls"]] == dates[8:11]  # 最多 3 天，按日期顺序
 
 
-def test_review_backfill_decides_release_before_any_lesson(env, monkeypatch):
-    import agents.playbook as pb
-
-    dates, order = env["dates"], []
+def test_review_backfill_only_latest_day_is_a_full_review(env):
+    dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
-    monkeypatch.setattr(pb, "reset_window_if_degraded", lambda store, d: order.append(("check", d)) or False)
-    monkeypatch.setattr(pb, "maybe_release", lambda store, d, cal: order.append(("release", d)) or "发布消息")
     assert review.main(now=at(dates[10], 16, 5)) is True
-    assert order == [("check", dates[8]), ("check", dates[9]), ("release", dates[10])]
-    assert env["review_kw"] == [(dates[8], False, None), (dates[9], False, None), (dates[10], True, "发布消息")]
+    assert env["review_kw"] == [(dates[8], True), (dates[9], True), (dates[10], False)]  # 较早的日子只补日报
 
 
-def test_review_backfill_stops_at_failure_and_resumes(env):
+def test_review_failed_day_does_not_block_others_and_is_retried(env):
     dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
     env["review_fail"].add(dates[9])
     assert review.main(now=at(dates[10], 16, 5)) is False
-    assert [c[1] for c in env["calls"]] == [dates[8]]  # 按日期顺序：失败就停
-    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试接着补
-    assert [c[1] for c in env["calls"]] == dates[8:11]
+    assert [c[1] for c in env["calls"]] == [dates[8], dates[10]]  # 某天失败不挡住其余日子
+    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试补上失败的那天
+    assert [c[1] for c in env["calls"]] == [dates[8], dates[10], dates[9]]
 
 
 def test_review_waits_when_started_together_with_settle(env, monkeypatch, tmp_path):

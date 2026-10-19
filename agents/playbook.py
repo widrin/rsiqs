@@ -213,14 +213,15 @@ def _git(*args) -> tuple[int, str]:
         return code, out.read().decode("utf-8", "replace")
 
 
-def git_commit(paths: list[str], message: str) -> bool:
-    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。"""
+def git_commit(paths: list[str], message: str) -> bool | None:
+    """git add + commit（附 trailer）。提交成功返回 True，没有变化返回 None，失败返回 False（记警告日志），
+    不抛异常。调用方用 `is False` 判断失败：没有变化不是失败。"""
     try:
         code, text = _git("add", "--", *paths)
         if code == 0:
             code, text = _git("diff", "--cached", "--quiet", "--", *paths)
             if code == 0:
-                return False  # 没有变化
+                return None  # 没有变化
             code, text = _git("commit", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
         if code != 0:
             log.warning("git commit failed (exit %s): %s", code, text[-500:])
