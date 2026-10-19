@@ -14,17 +14,17 @@
 
 **修订（2026-10-19，Part 1 审查修复）：** 涨跌停与费用按日期生效，创业板含 302 号段，涨跌停判断容忍一分钱；撮合改为开盘卖出、开盘买入、盘中卖出三步；账本自保 T+1、拒绝加仓与异常价格；`Pick`、`Fill`、配置增加输入校验。后续 Part 的代码无需改动，只同步了提示词中的撮合与费用描述。
 
-**修订（2026-10-19，Part 1 第二、三轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断；封板判断照常进行，价格越过涨跌停价也算封板，结果偏保守；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
+**修订（2026-10-19，Part 1 第二至四轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断，封板只看一字形态：最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，407 个测试全部通过（Part 1 共 133 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，409 个测试全部通过（Part 1 共 135 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
 ## Part 1: 工程脚手架与撮合核心
 
-> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，但封板判断照常进行。
+> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，封板只看一字形态（最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停）。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（133 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（135 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -798,9 +798,10 @@ def at_limit_up(price: float, up: float) -> bool:
     to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
     adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
     than rescaled, so an old sealed price can also sit above the computed limit by more than a
-    cent; any price above it counts as limit-up too. Effect on raw prices: a price exactly
-    one cent below the true limit also counts as limit-up (a buy there is skipped), which only
-    makes the simulation slightly more conservative.
+    cent; any price above it counts as limit-up too (SimBroker additionally requires
+    open == high when the day's prices show the computed band is wrong). Effect on raw prices: a
+    price exactly one cent below the true limit also counts as limit-up (a buy there is skipped),
+    which only makes the simulation slightly more conservative.
     """
     return round(price * 100) >= round(up * 100) - 1
 
@@ -1274,7 +1275,7 @@ git commit -m "feat(engine): add T+1 account ledger"
 
 执行顺序（`execute_day` 的 docstring 写明了同样的规则）：
 
-0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断；下面的封板判断照常进行，价格越过涨跌停价也算封板，结果偏保守。
+0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断，下面的封板判断改为只看一字形态：最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出。
 1. 开盘卖出：`at_limit_down(high, down)` 说明全天封死跌停，不能卖。否则依次判断：到期按开盘价卖出；开盘价 ≤ 止损价按开盘价止损；开盘价 ≥ 目标价按开盘价止盈；只在盘中触及止损或目标的持仓推迟到第 3 步。
 2. 开盘买入（按 picks 顺序）：跳过已持仓、无效行情、`at_limit_up(open, up)`、开盘价高于 entry_max、开盘价不高于 pick 止损价的情况；股数按整手计算并考虑最低 5 元佣金，现金不会为负；exit_date 用 `calendar.offset` 计算。
 3. 盘中卖出：处理第 1 步推迟的持仓。盘中低点 ≤ 止损价按止损价卖出（止损和目标同时触及时止损优先，因为日线看不出盘中先后）；否则按目标价卖出。
@@ -1546,7 +1547,7 @@ def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
     assert f.side == "BUY" and f.price == pytest.approx(13.40 * (1 + SLIP))
 
 
-def test_unreliable_band_keeps_limit_checks():
+def test_unreliable_band_one_price_bar_still_sealed():
     # forward adjustment subtracts later cash dividends, so an old one-price limit-up can sit above
     # the limit computed from the adjusted prev_close: 9.50 gives 10.45, the bar is 10.50
     acc = Account("t", 100_000.0)
@@ -1555,11 +1556,35 @@ def test_unreliable_band_keeps_limit_checks():
     # the same on the way down: limit-down 8.55, a one-price bar at 8.50 cannot be sold, even at expiry
     acc2 = held(exit_date=D1)
     assert run(acc2, [bar(o=8.5, h=8.5, l=8.5, c=8.5, pc=9.5)]) == []
-    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the whole day sits below
-    # limit-down, so the position stays put instead of being stopped out at a fake price
+    assert acc2.positions["600000"].qty == 1000
+
+
+def test_unreliable_band_ordinary_day_trades():
+    # 工商银行-like: adjusted prev_close 1.50 after ~3.00 of later dividends, so the computed band
+    # [1.35, 1.65] is far narrower than the real one; a -3.6% day that traded is not limit-down
+    acc = held(stop=1.40, target=1.80)
+    f = run(acc, [bar(o=1.34, h=1.35, l=1.20, c=1.25, pc=1.50)])[0]
+    assert f.reason == "止损" and f.price == pytest.approx(1.34 * (1 - SLIP))
+    # opened at the low and then traded up: still not one price all day
+    acc4 = held(stop=1.40, target=1.80)
+    f4 = run(acc4, [bar(o=1.20, h=1.34, l=1.20, c=1.30, pc=1.50)])[0]
+    assert f4.reason == "止损" and f4.price == pytest.approx(1.20 * (1 - SLIP))
+    # a +3.6% open that then traded higher is not limit-up either
+    acc2 = Account("t", 100_000.0)
+    f2 = run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
+             [pick(entry_max=1.70, stop=1.55, target=1.90)])[0]
+    assert f2.side == "BUY" and f2.price == pytest.approx(1.66 * (1 + SLIP))
+    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the expiry sell goes through
     acc3 = held(exit_date=D1)
-    assert run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)]) == []
-    assert acc2.positions["600000"].qty == acc3.positions["600000"].qty == 1000
+    f3 = run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)])[0]
+    assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
+
+
+def test_unreliable_band_open_at_high_counts_as_sealed_limit_up():
+    # the open beyond the computed limit-up is also the day's high: treated as opening sealed
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=1.70, h=1.70, l=1.62, c=1.66, pc=1.50)],
+               [pick(entry_max=1.75, stop=1.55, target=1.90)]) == []
 
 
 def test_unreliable_band_intraday_stop_not_clipped():
@@ -1625,6 +1650,10 @@ def _valid(bar: Bar | None) -> bool:
     return all(math.isfinite(v) and v > 0 for v in (bar.open, bar.high, bar.low, bar.prev_close))
 
 
+def _cents(v: float) -> int:
+    return round(v * 100)
+
+
 def _band(bar: Bar, d: date) -> Band:
     """Limit prices for ``bar`` on ``d`` and whether the day's prices agree with them.
 
@@ -1635,8 +1664,8 @@ def _band(bar: Bar, d: date) -> Band:
     prices (which shifts an old sealed price by 10% of those dividends).
     """
     up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
-    lo, hi = round(down * 100) - 1, round(up * 100) + 1
-    return up, down, all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low))
+    lo, hi = _cents(down) - 1, _cents(up) + 1
+    return up, down, all(lo <= _cents(v) <= hi for v in (bar.open, bar.high, bar.low))
 
 
 def _clip(price: float, band: Band) -> float:
@@ -1661,8 +1690,11 @@ class SimBroker:
            is treated as suspended and nothing trades in it. Limits come from
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
-           day with a stale prev_close); then fill prices are not clipped. The limit checks below
-           still apply: a price beyond a limit counts as sealed, which errs on the safe side.
+           day with a stale prev_close); then fill prices are not clipped, and a limit counts as
+           sealed only when the bar shows it: at limit-down only if high == low (one price all
+           day), at limit-up only if open == high. A wrong band can be far too narrow (e.g. later
+           cash dividends subtracted from forward-adjusted prices), so an ordinary day beyond it
+           still trades; a one-price bar beyond it is still sealed.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -1695,7 +1727,8 @@ class SimBroker:
             if pos.available <= 0 or not _valid(bar):
                 continue  # locked by T+1, or suspended / bad data
             band = _band(bar, d)
-            if at_limit_down(bar.high, band[1]):
+            one_price = _cents(bar.high) == _cents(bar.low)
+            if at_limit_down(bar.high, band[1]) and (band[2] or one_price):
                 continue  # sealed at limit-down all day: cannot sell
             if d >= pos.exit_date:
                 reason = "到期"
@@ -1716,7 +1749,8 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            if at_limit_up(bar.open, band[0]):
+            opened_at_high = _cents(bar.open) == _cents(bar.high)
+            if at_limit_up(bar.open, band[0]) and (band[2] or opened_at_high):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
@@ -1750,7 +1784,7 @@ class SimBroker:
 ```powershell
 uv run pytest tests/test_broker.py -v
 ```
-预期：41 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试各含 2 个用例）。
+预期：43 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试各含 2 个用例）。
 
 
 **Step 4b: 全量回归**
@@ -1758,7 +1792,7 @@ uv run pytest tests/test_broker.py -v
 ```powershell
 uv run pytest -v
 ```
-预期：Part 1 共 133 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 16 + broker 41）全部通过。
+预期：Part 1 共 135 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 16 + broker 43）全部通过。
 
 
 **Step 5: Commit**
@@ -6853,7 +6887,7 @@ def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | 
         pick = _merge(by_code[code], pp)
         row = rows.get(code)
         if row is not None:
-            gap, op = _gap_pct(row), _f(row["open"])
+            gap, op = _gap_pct(row), _f(row.get("open"))
             if gap is None or not pp.min_gap_pct <= gap <= pp.max_gap_pct or not pick.stop < op <= pick.entry_max:
                 continue
         out.append(pick)
@@ -10706,7 +10740,7 @@ Claude 鉴权二选一（`.env.example` 里有同样的注释）：
 - 中转：填 `ANTHROPIC_BASE_URL`（中转地址）和 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 留空；
 - 官方：只填 `ANTHROPIC_API_KEY`。
 
-`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `get_settings()` 里非空的这几项，所以本机 Claude Code 自己的登录状态不影响 RSIQS。注意 `get_settings()` 每个键先取非空的系统环境变量，再取 `.env`：系统环境里如果有非空的 `ANTHROPIC_API_KEY` 等变量，会覆盖 `.env`，并随子进程发给`ANTHROPIC_BASE_URL` 指向的地址。使用中转时，先确认系统环境里没有这些变量（PowerShell：`Get-ChildItem Env:ANTHROPIC_*`）。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
+`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `get_settings()` 里非空的这几项，所以本机 Claude Code 自己的登录状态不影响 RSIQS。注意 `get_settings()` 每个键先取非空的系统环境变量，再取 `.env`：系统环境里如果有非空的 `ANTHROPIC_API_KEY` 等变量，会覆盖 `.env`，并随子进程发给 `ANTHROPIC_BASE_URL` 指向的地址（官方模式下，系统里残留的 `ANTHROPIC_BASE_URL` 也会让官方 Key 发往那个地址）。无论使用中转还是官方，都先确认系统环境里没有非空的 `ANTHROPIC_*` 变量（PowerShell：`Get-ChildItem Env:ANTHROPIC_*`）。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
 
 **Step 4: Manual smoke steps（联网）**
 
