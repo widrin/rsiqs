@@ -424,8 +424,23 @@ def test_unexplained_ex_without_record_warns(env):
     dates, store = env["dates"], env["store"]
     settle.main(now=at(dates[101], 16))
     _split_from(env, "600001", dates[102], k=1.1)  # 配股之类：参考昨收变了，但没有分红记录
-    assert settle.main(now=at(dates[102], 16)) == [dates[102]]
+    assert settle.main(now=at(dates[102], 16)) == []  # 跌幅超过 3%：先等分红记录
+    assert settle.main(now=at(dates[103], 16)) == []
+    assert settle.main(now=at(dates[104], 16)) == dates[102:105]  # 等满 2 个交易日仍没有记录：按配股告警
     assert any("可能是配股" in str(m) for m in env["notifier"].sent)
+
+
+def test_late_bonus_share_record_pauses_until_it_arrives(env):
+    dates, store, client = env["dates"], env["store"], env["client"]
+    settle.main(now=at(dates[101], 16))  # h:active 于 dates[101] 买入 600001
+    qty = store.load_account("h:active").positions["600001"].qty
+    _split_from(env, "600001", dates[102])  # 10 转 10，分红记录当天还没到
+    assert settle.main(now=at(dates[102], 16)) == []
+    assert any("疑似送转" in str(m) for m in env["notifier"].sent)
+    client.dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}  # 第二天记录到了
+    assert settle.main(now=at(dates[103], 16)) == dates[102:104]
+    acc = store.load_account("h:active")
+    assert acc.positions["600001"].qty == 2 * qty and not any(f.side == "SELL" for f in acc.trades)
 
 
 def test_future_and_past_events_not_applied_again(env):

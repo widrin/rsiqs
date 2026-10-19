@@ -109,7 +109,8 @@ def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, 
     """幂等执行：已成功则跳过（返回 True）；成功标记 ok；异常标记 error 并告警（返回 False）。
 
     lock=True 时持有跨进程锁：同名任务正在别的进程里跑时直接返回 False（不标记、不告警）。
-    同一任务同一天只告警一次：计划任务当天会定时重试，重复失败只记日志。"""
+    同一任务、同一结算日在同一个自然日里只告警一次（计划任务当天会定时重试，重复失败只记日志）；
+    第二天仍失败时再告警一次。推送失败时不算已告警，下次重试再发。"""
     if not force and store.job_done(job, d):
         log.info("skip %s %s (already ok)", job, d)
         return True
@@ -126,10 +127,10 @@ def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, 
             log.error("job %s %s failed: %s\n%s", job, d, e, traceback.format_exc())
             try:
                 store.mark_job(job, d, "error")
-                key = f"job_alerted:{job}:{d.isoformat()}"
-                if not store.kv_get(key):
-                    notifier.send_text(format_alert(f"任务失败 {job} {d.isoformat()}",
-                                                    f"{type(e).__name__}: {e}\n（当天会定时重试；再次失败只记日志）"))
+                key = f"job_alerted:{job}:{d.isoformat()}:{today().isoformat()}"
+                if not store.kv_get(key) and notifier.send_text(format_alert(
+                        f"任务失败 {job} {d.isoformat()}",
+                        f"{type(e).__name__}: {e}\n（今天会定时重试，再次失败只记日志；明天仍失败时再提醒）")):
                     store.kv_set(key, True)
             except Exception as ne:  # noqa: BLE001 — 记录或告警本身失败：原始异常已写进日志
                 log.error("recording failure of %s %s failed: %s", job, d, ne)

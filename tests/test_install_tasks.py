@@ -24,14 +24,15 @@ def test_schedule_times_and_triggers():
     assert "-AtLogOn" in ps1 and "Saturday" in ps1 and "StartWhenAvailable:$Available" in ps1
 
 
-def test_settle_and_review_retry_and_catch_up_only_via_catchup():
+def test_settle_and_review_retry_and_start_when_available():
     ps1 = read("install_tasks.ps1")
-    assert '(New-RetryTrigger "15:35") (New-JobAction "settle")\n' in ps1
-    assert '(New-RetryTrigger "16:05") (New-JobAction "review")\n' in ps1
+    assert '(New-RetryTrigger "15:35") (New-JobAction "settle") $true' in ps1
+    assert '(New-RetryTrigger "16:05") (New-JobAction "review") $true' in ps1
     assert "-RepetitionInterval (New-TimeSpan -Minutes 20)" in ps1
-    for job in ("premarket_scan", "premarket_final", "monitor"):  # 只有早上的任务开机后补跑
+    assert "$r.StopAtDurationEnd = $false" in ps1  # 重复窗口结束时不终止还在跑的实例
+    for job in ("premarket_scan", "premarket_final", "monitor"):  # 唤醒或开机后补跑
         assert f'(New-JobAction "{job}") $true' in ps1, job
-    assert '(New-JobAction "research")\n' in ps1
+    assert '(New-JobAction "research")\n' in ps1  # 周六错过就跳过，不在工作日早上补跑
 
 
 def test_scripts_are_ascii_and_use_rsiqs_folder():

@@ -20,6 +20,8 @@ CORE_ACCOUNTS = (*common.LLM_ACCOUNTS, common.BENCH_ACCOUNT)
 LOOKBACK_CAL_DAYS = 550  # 约 370 个交易日，供策略计算因子
 MIN_COVERAGE = 0.9       # 当日有日线的股票占比低于此值视为数据未更新（股票池里同时停牌的很少超过几十只）
 KIND_CN = {"promote": "晋升", "demote": "降级", "retire": "淘汰"}
+BIG_EX_GAP = 0.03       # 参考昨收比上一收盘低这么多、又没有分红记录：多半是送转或大额派息的记录还没到
+MAX_EX_WAIT_DAYS = 2    # 最多为等分红记录暂停这么多个交易日，之后按配股告警、不建模
 
 
 def pending_days(store, calendar, now: datetime) -> list[date]:
@@ -153,11 +155,14 @@ def _settled(store, name: str, d: date) -> bool:
     return last is not None and last >= d
 
 
-def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()) -> list[str]:
+def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset(),
+               run_date: date | None = None) -> list[str]:
     """结算单个交易日；已记录 d 日净值的账户跳过（幂等）。返回警告列表。
 
     前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
-    不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码。"""
+    不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码；
+    run_date 是实际运行的日期（默认今天），用来判断为等分红记录已经暂停了几天。"""
+    run_date = run_date or common.today()
     codes = tracked_codes(store)
     # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
     recs = recommended_codes(store, [d])
@@ -187,7 +192,8 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
 
     def check_unexplained_ex(code: str, bar) -> None:
         """不复权日线的参考昨收与上一个收盘价不一致，说明 d 日除权除息。没有对应的分红记录时：分红接口今天失败
-        就暂停结算（下次重试），否则告警（多半是配股，不建模）。"""
+        就暂停结算（下次重试）；参考昨收低了 BIG_EX_GAP 以上（送转、大额派息，记录常常晚一天到）也暂停，
+        最多等 MAX_EX_WAIT_DAYS 个交易日，否则按未换算的止损撮合会记下假止损；其余告警（多半是配股，不建模）。"""
         prev = cache.last_raw_close(code, calendar.prev_day(d))
         if bar is None or prev is None or abs(bar.prev_close - prev[1]) <= 0.011:
             return
@@ -195,6 +201,11 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
             return
         if code in div_failed:
             raise DataError(f"{code} 于 {d.isoformat()} 疑似除权除息，但分红记录获取失败：暂停结算，下次重试")
+        waited = len(calendar.between(d, run_date)) - 1 if run_date >= d else 0
+        if bar.prev_close < prev[1] * (1 - BIG_EX_GAP) and waited < MAX_EX_WAIT_DAYS:
+            raise DataError(f"{code} 于 {d.isoformat()} 参考昨收 {bar.prev_close:.2f} 比上一收盘 {prev[1]:.2f} 低 "
+                            f"{1 - bar.prev_close / prev[1]:.1%}，疑似送转或大额派息但还没有分红记录：暂停结算，"
+                            f"等记录到了重试（最多等 {MAX_EX_WAIT_DAYS} 个交易日）")
         warnings.append(f"{code} 于 {d.isoformat()} 疑似除权除息，但没有分红记录（可能是配股，不建模），持仓未调整")
 
     def run(name: str, picks) -> None:
@@ -255,8 +266,9 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     return warnings
 
 
-def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset()) -> None:
-    warnings = settle_day(d, settings, store, cache, calendar, div_failed)
+def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset(),
+                      run_date: date | None = None) -> None:
+    warnings = settle_day(d, settings, store, cache, calendar, div_failed, run_date)
     if warnings:
         notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
     for ev in promotion.decide(store, d, calendar):
@@ -283,7 +295,7 @@ def main(now: datetime | None = None) -> list[date]:
         failed = frozenset(refresh_dividends(store, client, cache, d))  # 截至前一日的持仓与 d 日推荐
         div_failed.update(failed)
         ok = common.run_job("settle", d, lambda d=d, failed=failed: settle_and_decide(
-            d, settings, store, cache, calendar, notifier, failed), store, notifier)
+            d, settings, store, cache, calendar, notifier, failed, now.date()), store, notifier)
         if not ok:
             break
         done.append(d)

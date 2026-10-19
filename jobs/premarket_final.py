@@ -70,8 +70,9 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         budget = (until - start).total_seconds()
         scanned = common.run_job("premarket_scan", d, lambda: _within(budget, lambda: premarket_scan.scan(
             d, settings, store, client, cache, calendar)), store, notifier, lock=False)
-        if not scanned:
-            return False  # 扫描失败或超时已告警；按设计当天不出推荐
+        if not scanned:  # 按设计当天不出推荐。08:30 已告警过扫描失败时 run_job 不再告警，这里单独说明结果
+            notifier.send_text(format_alert("盘前推荐未推送", "09:25 补跑扫描失败或超时，今日不出推荐（原因见日志）"))
+            return False
         if clock().time() > STALE_AFTER:
             notifier.send_text(format_alert("盘前推荐未推送", f"补跑扫描到 {clock():%H:%M} 才完成，已过时"))
             return False

@@ -3,8 +3,9 @@
 # Re-running is safe: -Force overwrites existing task definitions.
 # PremarketFinal fires at 09:25; the job itself waits until 09:25:15 for auction data.
 # Settle and Review repeat every 20 minutes for 5 hours: a failed or not-yet-ready run is retried the same
-# evening (jobs are idempotent and exit at once when already done). Missed Settle/Review runs after boot are
-# handled by Catchup, so only the morning tasks use StartWhenAvailable; a missed Saturday Research is skipped.
+# evening (jobs are idempotent and exit at once when already done). A running instance is not stopped when
+# the repetition window ends. StartWhenAvailable covers wake-up from sleep; overlapping runs (with Catchup at
+# logon) are serialized by the per-job file lock in jobs.common.run_job. A missed Saturday Research is skipped.
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Uv = (Get-Command uv -ErrorAction Stop).Source
@@ -23,8 +24,10 @@ function New-WeekdayTrigger([string]$At) {
 
 function New-RetryTrigger([string]$At) {
     $t = New-WeekdayTrigger $At
-    $t.Repetition = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes 20) `
+    $r = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes 20) `
         -RepetitionDuration (New-TimeSpan -Hours 5)).Repetition
+    $r.StopAtDurationEnd = $false
+    $t.Repetition = $r
     $t
 }
 
@@ -40,8 +43,8 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $fa
 Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true
 Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true
 Register-Rsiqs "Monitor"        (New-WeekdayTrigger "09:30") (New-JobAction "monitor") $true
-Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle")
-Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review")
+Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle") $true
+Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review") $true
 Register-Rsiqs "Research" (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "10:00") `
     (New-JobAction "research")
 

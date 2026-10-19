@@ -104,8 +104,11 @@ def _trial_line(store: Store, t: dict) -> str:
     def f(x):
         return "?" if x is None else f"{x:.2f}"
 
-    ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     hyp = _hypothesis(store, t["strategy"])[:120]
+    if store.kv_get(f"research:voided:{t['strategy']}"):  # 作废会把门槛和 holdout 记为未通过，这里如实说明
+        return (f"- {t['ts'][:10]} {t['strategy']}：已作废（评估期间 engine/ 校验不符），结果不代表策略本身"
+                + (f"；假设：{hyp}" if hyp else ""))
+    ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     return (f"- {t['ts'][:10]} {t['strategy']}：train 夏普 {f(t['train_sharpe'])}，val 夏普 "
             f"{f(t['val_sharpe'])}，门槛{'达标' if t['gate_pass'] else '未达标'}，holdout {ho}"
             + (f"；假设：{hyp}" if hyp else ""))
@@ -510,6 +513,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             trial = store.last_trial(n)
             if trial is not None:
                 store.void_trial(trial["id"])
+                store.kv_set(f"research:voided:{n}", True)
         for n in reverted:
             store.set_status(n, "candidate", today)
         title = ("研究会话后 engine/ 校验不符，未提交 git" if bad

@@ -237,6 +237,19 @@ def test_final_not_run_when_scan_fails(env, monkeypatch):
     assert any("数据源失败" in str(m) for m in env["notifier"].sent)
 
 
+def test_final_reports_failed_inline_scan_even_after_0830_alert(env, monkeypatch):
+    d = env["dates"][10]
+
+    def boom(*a, **k):
+        raise RuntimeError("数据源失败")
+
+    monkeypatch.setattr(premarket, "scan", boom)
+    assert premarket_scan.main(now=at(d, 8, 30)) is False
+    assert len(env["notifier"].sent) == 1
+    assert premarket_final.main(now=at(d, 9, 26), sleep=env["slept"].append) is False
+    assert len(env["notifier"].sent) == 2 and "今日不出推荐" in env["notifier"].sent[-1]
+
+
 def test_review_requires_settle_and_runs_once(env):
     d = env["dates"][10]
     assert review.main(now=at(d, 16, 5)) is False  # 未结算

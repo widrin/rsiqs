@@ -135,11 +135,21 @@ def _window_return(store: Store, account: str, start: dt.date, end: dt.date) -> 
     return float(nav.iloc[-1] / nav.iloc[0] - 1.0)
 
 
+def _ran_without_playbook(store: Store, d: dt.date) -> bool:
+    """d 日盘前有一路因为 playbook 读不出来而按空规则运行（推荐 meta 里 playbook_version 记为 None）。"""
+    for kind in KINDS:
+        rec = store.load_recommendation(d, f"h:{kind}")
+        if rec and "playbook_version" in rec[1] and rec[1]["playbook_version"] is None:
+            return True
+    return False
+
+
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
-    if corrupt_kinds():
+    if corrupt_kinds() or _ran_without_playbook(store, today):
         # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
-        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始
+        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始。
+        # 看盘前实际用的版本，不只看复盘时的文件：白天修好的那天，盘前用的仍是空规则
         store.kv_set(RELEASE_KEY, today.isoformat())
         return None
     last = store.kv_get(RELEASE_KEY)

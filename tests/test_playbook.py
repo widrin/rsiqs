@@ -159,6 +159,15 @@ def test_maybe_release_after_repair_ignores_corrupt_days(pbdir, cal):
     assert playbook.load("active")["version"] == 2
 
 
+def test_maybe_release_resets_when_premarket_ran_without_playbook(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    # 盘前 playbook 读不出来（按空规则运行），复盘前已经修好：文件完好，但这一天的净值不能用来比较
+    store.save_recommendation(TODAY, "h:candidate", [], {"llm_reviewed": True, "playbook_version": None})
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+    assert playbook.load("active")["version"] == 2
+
+
 def test_load_checked_accepts_bom(pbdir):
     (pbdir / "active.json").write_text('\ufeff{"version": 3, "rules": [{"id": "r1", "text": "t", "evidence": "e"}]}',
                                        encoding="utf-8")

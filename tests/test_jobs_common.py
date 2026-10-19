@@ -64,12 +64,34 @@ def test_run_job_skips_while_another_process_holds_the_lock(tmp_path, monkeypatc
         assert got
 
 
-def test_run_job_alerts_once_per_job_and_day():
+def test_run_job_alerts_once_per_job_and_day(monkeypatch):
     store, notifier = Store(":memory:"), NullNotifier()
+    monkeypatch.setattr(common, "today", lambda: D)
     for _ in range(3):  # 计划任务当天定时重试
         assert run_job("settle", D, lambda: 1 / 0, store, notifier) is False
     assert len(notifier.sent) == 1 and "定时重试" in notifier.sent[0]
     run_job("settle", date(2026, 10, 19), lambda: 1 / 0, store, notifier)
+    assert len(notifier.sent) == 2
+    monkeypatch.setattr(common, "today", lambda: date(2026, 10, 19))  # 第二天同一个结算日仍失败：再提醒
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
+    assert len(notifier.sent) == 3
+
+
+def test_run_job_alert_not_recorded_when_push_fails():
+    class Flaky(NullNotifier):
+        def __init__(self):
+            super().__init__()
+            self.ok = False
+
+        def send_text(self, content):
+            super().send_text(content)
+            return self.ok
+
+    store, notifier = Store(":memory:"), Flaky()
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
+    notifier.ok = True
+    run_job("settle", D, lambda: 1 / 0, store, notifier)  # 上次没推出去：这次再发
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
     assert len(notifier.sent) == 2
 
 

@@ -419,6 +419,10 @@ def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
     assert e.store.get_status("a_one") == "candidate" and e.commits == []
     alert = e.notifier.sent[-1]
     assert "会话中 engine/ 校验不符" in alert and ".integrity/manifest.json" in alert
+    assert e.store.last_trial("a_one")["gate_pass"] is False             # 试验记录已作废
+    monkeypatch.setattr(research, "verify", real)
+    ctx = research.build_context(e.settings, e.store)
+    assert "a_one：已作废" in ctx and "a_one：train" not in ctx            # 下次背景里不当作真实失败
 
 
 def test_commit_failure_is_reported(env, monkeypatch):
