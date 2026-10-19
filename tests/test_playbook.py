@@ -1,0 +1,168 @@
+import datetime as dt
+import json
+import subprocess
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+from agents import playbook
+from engine.calendar import TradingCalendar
+from engine.store import Store
+
+TODAY = dt.date(2026, 10, 16)
+
+
+def L(action, text="", evidence="2026-10-15 600000 高开 6% 后回落 -4%", rule_id=""):
+    return SimpleNamespace(action=action, rule_id=rule_id, text=text, evidence=evidence)
+
+
+@pytest.fixture
+def pbdir(tmp_path, monkeypatch):
+    monkeypatch.setattr(playbook, "PLAYBOOK_DIR", tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def cal():
+    return TradingCalendar(pd.bdate_range("2026-08-03", "2026-12-31").date)
+
+
+def test_load_missing_returns_empty_and_roundtrip(pbdir):
+    pb = playbook.load("active")
+    assert pb["version"] == 1 and pb["rules"] == []
+    pb["rules"].append({"id": "r1", "text": "规则", "evidence": "证据", "created": "2026-10-01"})
+    playbook.save("candidate", pb)
+    assert json.loads((pbdir / "candidate.json").read_text(encoding="utf-8")) == pb
+    assert playbook.load("candidate") == pb
+    with pytest.raises(ValueError):
+        playbook.load("other")
+
+
+def test_render():
+    assert "暂无" in playbook.render({"version": 1, "rules": []})
+    text = playbook.render({"version": 3, "rules": [
+        {"id": "r1", "text": "高开超过 5% 否决", "evidence": "e1", "created": "x"},
+        {"id": "r2", "text": "竞价量能不足否决", "evidence": "e2", "created": "x"}]})
+    assert text.splitlines()[0].startswith("1. [r1] 高开超过 5% 否决")
+    assert text.splitlines()[1].startswith("2. [r2]")
+
+
+def test_apply_add_remove_merge_and_evidence_required():
+    pb = {"version": 1, "created": "2026-10-01", "rules": []}
+    pb = playbook.apply_lessons(pb, [L("add", "规则A"), L("add", "规则B"), L("add", "无证据", evidence="  ")], TODAY)
+    assert [r["id"] for r in pb["rules"]] == ["r1", "r2"]
+    assert pb["rules"][0]["created"] == TODAY.isoformat()
+    pb = playbook.apply_lessons(pb, [L("merge", "规则A+B 合并", rule_id="r1"), L("remove", rule_id="r2"),
+                                     L("remove", rule_id="r99"), L("remove", rule_id="r1", evidence="")], TODAY)
+    assert [(r["id"], r["text"]) for r in pb["rules"]] == [("r1", "规则A+B 合并")]
+    pb = playbook.apply_lessons(pb, [L("add", "规则C")], TODAY)
+    assert pb["rules"][-1]["id"] == "r2"  # 新 id = 现存最大编号 + 1
+
+
+def test_apply_does_not_mutate_input():
+    pb = {"version": 1, "created": "2026-10-01", "rules": []}
+    playbook.apply_lessons(pb, [L("add", "规则A")], TODAY)
+    assert pb["rules"] == []
+
+
+def test_caps_drop_oldest():
+    old = [{"id": f"r{i}", "text": f"旧规则{i}", "evidence": "e", "created": f"2026-09-{i:02d}"}
+           for i in range(1, 31)]
+    pb = playbook.apply_lessons({"version": 1, "created": "x", "rules": old}, [L("add", "新规则")], TODAY)
+    assert len(pb["rules"]) == playbook.MAX_RULES
+    assert "r1" not in [r["id"] for r in pb["rules"]]
+    assert pb["rules"][-1]["text"] == "新规则"
+
+    big = [L("add", "长" * 2500, evidence="e") for _ in range(3)]
+    pb = playbook.apply_lessons({"version": 1, "created": "x", "rules": []}, big, TODAY)
+    assert sum(len(r["text"]) + len(r["evidence"]) for r in pb["rules"]) <= playbook.MAX_CHARS
+    assert [r["id"] for r in pb["rules"]] == ["r2", "r3"]
+
+
+def _rules(*texts):
+    return [{"id": f"r{i}", "text": t, "evidence": "e", "created": "2026-09-01"} for i, t in enumerate(texts, 1)]
+
+
+def _setup_release(pbdir, cal, cand_end, act_end, start=dt.date(2026, 9, 1)):
+    store = Store(":memory:")
+    playbook.save("active", {"version": 2, "created": "2026-09-01", "rules": _rules("旧")})
+    playbook.save("candidate", {"version": 2, "created": "2026-09-01", "rules": _rules("旧", "新")})
+    store.kv_set("playbook_released", start.isoformat())
+    days = cal.between(start, TODAY)
+    for i, d in enumerate(days):
+        frac = i / (len(days) - 1)
+        store.record_nav("h:candidate", d, 500_000 * (1 + (cand_end - 1) * frac))
+        store.record_nav("h:active", d, 500_000 * (1 + (act_end - 1) * frac))
+    return store
+
+
+def test_maybe_release_first_call_starts_window(pbdir, cal):
+    store = Store(":memory:")
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def test_maybe_release_too_early(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.10, 1.00, start=dt.date(2026, 10, 12))
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert playbook.load("active")["version"] == 2
+
+
+def test_maybe_release_promotes(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    msg = playbook.maybe_release(store, TODAY, cal)
+    assert msg and "v3" in msg
+    act, cand = playbook.load("active"), playbook.load("candidate")
+    assert act["version"] == 3 and [r["text"] for r in act["rules"]] == ["旧", "新"]
+    assert cand == act
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def test_maybe_release_resets_when_worse(pbdir, cal):
+    store = _setup_release(pbdir, cal, 0.98, 1.02)
+    msg = playbook.maybe_release(store, TODAY, cal)
+    assert msg and "重置" in msg
+    act, cand = playbook.load("active"), playbook.load("candidate")
+    assert act["version"] == 2 and cand == act
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def test_maybe_release_identical_rules_only_restarts_window(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    playbook.save("candidate", playbook.load("active"))
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert playbook.load("active")["version"] == 2
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+                          encoding="utf-8").stdout
+
+
+def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
+    monkeypatch.setattr(playbook, "ROOT", tmp_path)
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "tester")
+    (tmp_path / "playbook").mkdir()
+    (tmp_path / "playbook" / "candidate.json").write_text("{}", encoding="utf-8")
+    assert playbook.git_commit(["playbook/candidate.json"], "playbook: 复盘更新") is True
+    log = _git(tmp_path, "log", "-1", "--format=%B")
+    assert log.startswith("playbook: 复盘更新")
+    assert "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" in log
+    assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
+
+
+def test_git_commit_outside_repo_returns_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(playbook, "ROOT", tmp_path)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    (tmp_path / "x.txt").write_text("x", encoding="utf-8")
+    assert playbook.git_commit(["x.txt"], "msg") is False
+
+
+def test_prompt_files_exist():
+    for name in ("premarket", "review"):
+        text = playbook.load_prompt(name)
+        assert len(text) > 500 and "证据" in text
