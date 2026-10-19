@@ -60,9 +60,15 @@ class PlannedPick(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _unit_interval(cls, v):
-        """提示词要求 0~1；模型偶尔写成百分数（85）或越界：统一换算并截断，免得排序被打乱。"""
-        v = float(v)
-        if 1.0 < v <= 100.0:
+        """提示词要求 0~1；模型偶尔写成百分数（85）或略微越界（1.2）：2~100 按百分数换算，其余截断到 0~1，
+        免得排序被打乱。NaN、无穷和非数值按格式错误处理。"""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"confidence 不是数值：{v!r}") from None
+        if not math.isfinite(v):
+            raise ValueError(f"confidence 不是有限数：{v!r}")
+        if 2.0 <= v <= 100.0:
             v /= 100.0
         return min(max(v, 0.0), 1.0)
 
@@ -455,8 +461,10 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
 
 
 def _playbook_version(kind: str) -> int | None:
+    """记录用的版本号；文件损坏时为 None（不能记成空 playbook 的 1，让人误以为跑的是 v1）。"""
     try:  # 只为记录版本号：playbook 文件出问题也不能耽误 09:28 前推送
-        return int(playbook.load(kind).get("version", 1))
+        pb, ok = playbook.load_checked(kind)
+        return int(pb.get("version", 1)) if ok else None
     except Exception:  # noqa: BLE001
         log.exception("playbook %s unreadable", kind)
         return None

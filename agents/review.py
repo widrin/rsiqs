@@ -79,11 +79,15 @@ def _bar_lines(cache: BarCache, codes: set[str], d: dt.date) -> list[str]:
     return out
 
 
-def _effective_changes(old: dict, new: dict) -> int:
-    """实际生效的改动条数（新增、删除、改写），不计指向不存在规则的 remove/merge。"""
-    a = {r["id"]: r["text"] for r in old.get("rules", [])}
-    b = {r["id"]: r["text"] for r in new.get("rules", [])}
-    return len(a.keys() ^ b.keys()) + sum(a[k] != b[k] for k in a.keys() & b.keys())
+def _effective_changes(old: dict, new: dict) -> tuple[int, int]:
+    """(实际生效的改动条数, 只补充了证据的条数)。改动指新增、删除、改写 text，
+    不计指向不存在规则的 remove/merge。"""
+    a = {r["id"]: r for r in old.get("rules", [])}
+    b = {r["id"]: r for r in new.get("rules", [])}
+    same = a.keys() & b.keys()
+    changed = len(a.keys() ^ b.keys()) + sum(a[k]["text"] != b[k]["text"] for k in same)
+    evidence = sum(a[k]["text"] == b[k]["text"] and a[k]["evidence"] != b[k]["evidence"] for k in same)
+    return changed, evidence
 
 
 def _report_rows(store: Store, d: dt.date) -> list[dict]:
@@ -122,9 +126,11 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
 
+    # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
+    bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = playbook.maybe_release(store, d, calendar)
-    changed = 0
+    release = None if bad else playbook.maybe_release(store, d, calendar)
+    parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
     else:
@@ -143,13 +149,18 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
             summary = out.summary
             lessons = [les for les in out.lessons[:MAX_LESSONS] if les.evidence.strip()]
             new = playbook.apply_lessons(cand, lessons, d)
-            if new != cand:
+            if new != cand and not bad:
                 playbook.save("candidate", new)
-                changed = _effective_changes(cand, new)
+                changed, evidence = _effective_changes(cand, new)
+                parts += [f"复盘更新 {changed} 条"] if changed else []
+                parts += [f"补充证据 {evidence} 条"] if evidence else []
+                parts += [] if changed or evidence else ["复盘整理规则"]
 
-    parts = ([f"复盘更新 {changed} 条"] if changed else []) + ([release] if release else [])
     if parts:
         playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts))
-        if release:
-            summary = f"{summary}\n{release}"
+    if release:
+        summary = f"{summary}\n{release}"
+    if bad:
+        files = "、".join(f"playbook/{k}.json" for k in bad)
+        summary = f"{summary}\n注意：{files} 损坏，今日未发布、未更新 playbook，请手工修复（可从 git 历史恢复）。"
     notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary))

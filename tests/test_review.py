@@ -70,6 +70,9 @@ class Recorder:
         return True
 
 
+REAL_RELEASE = playbook.maybe_release
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(playbook, "PLAYBOOK_DIR", tmp_path)
@@ -173,6 +176,57 @@ def test_review_release_message_is_pushed_and_committed(env, monkeypatch):
     assert "playbook v2 上线：测试" in env["notifier"].sent[0]
     assert env["commits"] == [(["playbook/active.json", "playbook/candidate.json"],
                                "playbook: 2026-10-16 playbook v2 上线：测试")]
+
+
+def test_release_message_comes_first(env, monkeypatch):
+    monkeypatch.setattr(playbook, "maybe_release", lambda store, today, calendar: "playbook v2 上线：测试")
+    run(env, FakeLLM(OUTPUT))
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 playbook v2 上线：测试；复盘更新 1 条"
+
+
+def test_lessons_apply_to_released_candidate(env, monkeypatch, tmp_path):
+    """用真的 maybe_release：发布后的候选版（v2）再写当天的 lesson，今天新写的规则不上线。"""
+    monkeypatch.setattr(playbook, "maybe_release", REAL_RELEASE)
+    store = env["store"]
+    rules = [{"id": "r1", "text": "旧规则", "evidence": "e", "created": "2026-09-01"},
+             {"id": "r2", "text": "候选规则", "evidence": "e", "created": "2026-09-20"}]
+    playbook.save("candidate", {"version": 1, "created": "x", "rules": rules})
+    start = CAL.between(dt.date(2026, 9, 1), D)[-(playbook.MIN_DAYS_BETWEEN_RELEASES + 1)]
+    store.kv_set(playbook.RELEASE_KEY, start.isoformat())
+    for name, end in (("h:candidate", 1.05), ("h:active", 1.01)):
+        store.record_nav(name, start, 500_000.0)
+        store.record_nav(name, PREV, 500_000.0 * end)
+        store.record_nav(name, D, 500_000.0 * end)
+    llm = FakeLLM(OUTPUT)
+    run(env, llm)
+    act, cand = playbook.load("active"), playbook.load("candidate")
+    assert act["version"] == 2 and [r["text"] for r in act["rules"]] == ["旧规则", "候选规则"]
+    assert cand["version"] == 2 and [r["text"] for r in cand["rules"]] == ["旧规则", "候选规则",
+                                                                          "主板竞价高开超过 5% 的候选否决"]
+    assert "playbook v2" in llm.calls[0]["user"] and "候选规则" in llm.calls[0]["user"]
+    assert env["commits"][-1][1].startswith("playbook: 2026-10-16 playbook v2 上线")
+
+
+@pytest.mark.parametrize("broken", ["active", "candidate"])
+def test_corrupt_playbook_is_not_released_or_overwritten(env, monkeypatch, tmp_path, broken):
+    monkeypatch.setattr(playbook, "maybe_release", REAL_RELEASE)
+    (tmp_path / f"{broken}.json").write_text('{"version": 1, "rules": [', encoding="utf-8")
+    other = "candidate" if broken == "active" else "active"
+    before = (tmp_path / f"{other}.json").read_text(encoding="utf-8")
+    env["store"].kv_set(playbook.RELEASE_KEY, "2026-09-01")
+    run(env, FakeLLM(OUTPUT))
+    assert (tmp_path / f"{broken}.json").read_text(encoding="utf-8") == '{"version": 1, "rules": ['
+    assert (tmp_path / f"{other}.json").read_text(encoding="utf-8") == before
+    assert env["commits"] == []
+    assert f"playbook/{broken}.json 损坏" in env["notifier"].sent[0]
+
+
+def test_evidence_only_merge_is_committed(env):
+    out = ReviewOutput(summary="s", lessons=[Lesson(action="merge", rule_id="r1", text="旧规则",
+                                                    evidence="2026-10-16 600001 再次验证")])
+    run(env, FakeLLM(out))
+    assert playbook.load("candidate")["rules"][0]["evidence"] != "e"
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 补充证据 1 条"
 
 
 def test_release_happens_before_todays_lessons(env, monkeypatch):

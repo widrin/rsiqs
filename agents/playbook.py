@@ -34,21 +34,41 @@ def _path(kind: str) -> Path:
     return PLAYBOOK_DIR / f"{kind}.json"
 
 
-def load(kind: str) -> dict:
-    """读取 playbook；文件缺失或损坏（写到一半断电、手工编辑出错）时退回空 playbook 并记日志，
-    盘前和复盘照常运行，只是不带规则。"""
+def _valid(pb) -> bool:
+    """version 是整数，rules 是列表，每条规则的 id、text、evidence 都是字符串。"""
+    if not isinstance(pb, dict) or isinstance(pb.get("version", 1), bool) or not isinstance(pb.get("version", 1), int):
+        return False
+    rules = pb.get("rules", [])
+    return isinstance(rules, list) and all(
+        isinstance(r, dict) and all(isinstance(r.get(k), str) for k in ("id", "text", "evidence")) for r in rules)
+
+
+def load_checked(kind: str) -> tuple[dict, bool]:
+    """读取 playbook，返回 (playbook, 文件是否完好)。文件缺失算完好（返回空 playbook）；
+    损坏（写到一半断电、手工编辑出错）时返回空 playbook 和 False。"""
     p = _path(kind)
     empty = {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
     if not p.exists():
-        return empty
+        return empty, True
     try:
         pb = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(pb, dict) or not isinstance(pb.get("rules", []), list):
-            raise ValueError("playbook 格式不对")
-        return pb
     except (ValueError, OSError):
-        log.exception("playbook %s 损坏，按空 playbook 处理：%s", kind, p)
-        return empty
+        pb = None
+    if not _valid(pb):
+        log.error("playbook %s 损坏：%s", kind, p)
+        return empty, False
+    return pb, True
+
+
+def load(kind: str) -> dict:
+    """读取 playbook；损坏时退回空 playbook：盘前照常运行，只是不带规则。
+    会改写 playbook 的地方（发布、复盘）先用 corrupt_kinds() 检查，不能把空规则写回去。"""
+    return load_checked(kind)[0]
+
+
+def corrupt_kinds() -> list[str]:
+    """文件存在但无法读取或格式不对的 playbook。"""
+    return [k for k in KINDS if not load_checked(k)[1]]
 
 
 def save(kind: str, pb: dict) -> None:
@@ -124,6 +144,8 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
     start = dt.date.fromisoformat(last)
     if len(calendar.between(start, today)) - 1 < MIN_DAYS_BETWEEN_RELEASES:
         return None
+    if corrupt_kinds():
+        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     active, cand = load("active"), load("candidate")
     if cand.get("rules") == active.get("rules"):
         store.kv_set(RELEASE_KEY, today.isoformat())

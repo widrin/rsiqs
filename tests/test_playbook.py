@@ -119,6 +119,35 @@ def test_save_is_atomic_and_load_survives_corruption(pbdir):
     assert pb["rules"] == []
 
 
+@pytest.mark.parametrize("text", [
+    '{"version": "v3", "rules": []}',
+    '{"version": 2, "rules": [{"id": "r1", "text": 5, "evidence": "e"}]}',
+    '{"version": 2, "rules": ["规则"]}',
+    '{"version": true, "rules": []}',
+    '[]',
+])
+def test_load_checked_flags_malformed_playbook(pbdir, text):
+    (pbdir / "active.json").write_text(text, encoding="utf-8")
+    pb, ok = playbook.load_checked("active")
+    assert not ok and pb["rules"] == []
+    assert playbook.corrupt_kinds() == ["active"]
+
+
+def test_load_checked_missing_file_is_not_corrupt(pbdir):
+    assert playbook.load_checked("candidate")[1] is True and playbook.corrupt_kinds() == []
+
+
+@pytest.mark.parametrize("broken", ["active", "candidate"])
+def test_maybe_release_skips_when_a_playbook_is_corrupt(pbdir, cal, broken):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    other = "candidate" if broken == "active" else "active"
+    before = (pbdir / f"{other}.json").read_text(encoding="utf-8")
+    (pbdir / f"{broken}.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert (pbdir / f"{other}.json").read_text(encoding="utf-8") == before  # 空规则没有写进另一份
+    assert store.kv_get("playbook_released") != TODAY.isoformat()  # 修好之后照常比较这个窗口
+
+
 def test_long_lesson_is_truncated_not_wiping_rules():
     pb = {"version": 1, "rules": [{"id": f"r{i}", "text": "旧" * 10, "evidence": "e", "created": "x"} for i in range(10)]}
     out = playbook.apply_lessons(pb, [L("add", text="长" * 6001)], TODAY)

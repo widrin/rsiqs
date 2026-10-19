@@ -11,6 +11,7 @@ import pytest
 from agents import playbook, premarket
 from agents.llm import BudgetExceeded, LLMError
 from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
+from pydantic import ValidationError
 from config import Settings
 from engine.calendar import TradingCalendar
 from engine.store import Store
@@ -284,6 +285,21 @@ def test_run_analyze_timeout_capped_by_deadline(store):
 def test_confidence_normalized_to_unit_interval():
     assert pp("600001", conf=85).confidence == pytest.approx(0.85)  # 百分数
     assert pp("600001", conf=-1).confidence == 0.0 and pp("600001", conf=1.0).confidence == 1.0
+    assert pp("600001", conf=1.2).confidence == 1.0  # 略微越界：截断，不当成 1.2%
+    assert pp("600001", conf=2).confidence == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), None, "高"])
+def test_confidence_rejects_non_numbers(bad):
+    with pytest.raises(ValidationError):
+        pp("600001", conf=bad)
+
+
+def test_playbook_version_none_when_malformed(pbdir):
+    (pbdir / "active.json").write_text('{"version": "v3", "rules": []}', encoding="utf-8")
+    assert premarket._playbook_version("active") is None
+    playbook.save("candidate", {"version": 4, "created": "x", "rules": []})
+    assert premarket._playbook_version("candidate") == 4
 
 
 def test_all_vetoed_note_differs_from_auction_failure(store):
