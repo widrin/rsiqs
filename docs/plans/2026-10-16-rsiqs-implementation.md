@@ -7478,6 +7478,35 @@ def test_save_is_atomic_and_load_survives_corruption(pbdir):
     assert pb["rules"] == []
 
 
+@pytest.mark.parametrize("text", [
+    '{"version": "v3", "rules": []}',
+    '{"version": 2, "rules": [{"id": "r1", "text": 5, "evidence": "e"}]}',
+    '{"version": 2, "rules": ["规则"]}',
+    '{"version": true, "rules": []}',
+    '[]',
+])
+def test_load_checked_flags_malformed_playbook(pbdir, text):
+    (pbdir / "active.json").write_text(text, encoding="utf-8")
+    pb, ok = playbook.load_checked("active")
+    assert not ok and pb["rules"] == []
+    assert playbook.corrupt_kinds() == ["active"]
+
+
+def test_load_checked_missing_file_is_not_corrupt(pbdir):
+    assert playbook.load_checked("candidate")[1] is True and playbook.corrupt_kinds() == []
+
+
+@pytest.mark.parametrize("broken", ["active", "candidate"])
+def test_maybe_release_skips_when_a_playbook_is_corrupt(pbdir, cal, broken):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    other = "candidate" if broken == "active" else "active"
+    before = (pbdir / f"{other}.json").read_text(encoding="utf-8")
+    (pbdir / f"{broken}.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert (pbdir / f"{other}.json").read_text(encoding="utf-8") == before  # 空规则没有写进另一份
+    assert store.kv_get("playbook_released") != TODAY.isoformat()  # 修好之后照常比较这个窗口
+
+
 def test_long_lesson_is_truncated_not_wiping_rules():
     pb = {"version": 1, "rules": [{"id": f"r{i}", "text": "旧" * 10, "evidence": "e", "created": "x"} for i in range(10)]}
     out = playbook.apply_lessons(pb, [L("add", text="长" * 6001)], TODAY)
@@ -7598,21 +7627,41 @@ def _path(kind: str) -> Path:
     return PLAYBOOK_DIR / f"{kind}.json"
 
 
-def load(kind: str) -> dict:
-    """读取 playbook；文件缺失或损坏（写到一半断电、手工编辑出错）时退回空 playbook 并记日志，
-    盘前和复盘照常运行，只是不带规则。"""
+def _valid(pb) -> bool:
+    """version 是整数，rules 是列表，每条规则的 id、text、evidence 都是字符串。"""
+    if not isinstance(pb, dict) or isinstance(pb.get("version", 1), bool) or not isinstance(pb.get("version", 1), int):
+        return False
+    rules = pb.get("rules", [])
+    return isinstance(rules, list) and all(
+        isinstance(r, dict) and all(isinstance(r.get(k), str) for k in ("id", "text", "evidence")) for r in rules)
+
+
+def load_checked(kind: str) -> tuple[dict, bool]:
+    """读取 playbook，返回 (playbook, 文件是否完好)。文件缺失算完好（返回空 playbook）；
+    损坏（写到一半断电、手工编辑出错）时返回空 playbook 和 False。"""
     p = _path(kind)
     empty = {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
     if not p.exists():
-        return empty
+        return empty, True
     try:
         pb = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(pb, dict) or not isinstance(pb.get("rules", []), list):
-            raise ValueError("playbook 格式不对")
-        return pb
     except (ValueError, OSError):
-        log.exception("playbook %s 损坏，按空 playbook 处理：%s", kind, p)
-        return empty
+        pb = None
+    if not _valid(pb):
+        log.error("playbook %s 损坏：%s", kind, p)
+        return empty, False
+    return pb, True
+
+
+def load(kind: str) -> dict:
+    """读取 playbook；损坏时退回空 playbook：盘前照常运行，只是不带规则。
+    会改写 playbook 的地方（发布、复盘）先用 corrupt_kinds() 检查，不能把空规则写回去。"""
+    return load_checked(kind)[0]
+
+
+def corrupt_kinds() -> list[str]:
+    """文件存在但无法读取或格式不对的 playbook。"""
+    return [k for k in KINDS if not load_checked(k)[1]]
 
 
 def save(kind: str, pb: dict) -> None:
@@ -7688,6 +7737,8 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
     start = dt.date.fromisoformat(last)
     if len(calendar.between(start, today)) - 1 < MIN_DAYS_BETWEEN_RELEASES:
         return None
+    if corrupt_kinds():
+        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     active, cand = load("active"), load("candidate")
     if cand.get("rules") == active.get("rules"):
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -7883,6 +7934,7 @@ import pytest
 from agents import playbook, premarket
 from agents.llm import BudgetExceeded, LLMError
 from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
+from pydantic import ValidationError
 from config import Settings
 from engine.calendar import TradingCalendar
 from engine.store import Store
@@ -8156,6 +8208,21 @@ def test_run_analyze_timeout_capped_by_deadline(store):
 def test_confidence_normalized_to_unit_interval():
     assert pp("600001", conf=85).confidence == pytest.approx(0.85)  # 百分数
     assert pp("600001", conf=-1).confidence == 0.0 and pp("600001", conf=1.0).confidence == 1.0
+    assert pp("600001", conf=1.2).confidence == 1.0  # 略微越界：截断，不当成 1.2%
+    assert pp("600001", conf=2).confidence == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), None, "高"])
+def test_confidence_rejects_non_numbers(bad):
+    with pytest.raises(ValidationError):
+        pp("600001", conf=bad)
+
+
+def test_playbook_version_none_when_malformed(pbdir):
+    (pbdir / "active.json").write_text('{"version": "v3", "rules": []}', encoding="utf-8")
+    assert premarket._playbook_version("active") is None
+    playbook.save("candidate", {"version": 4, "created": "x", "rules": []})
+    assert premarket._playbook_version("candidate") == 4
 
 
 def test_all_vetoed_note_differs_from_auction_failure(store):
@@ -8505,9 +8572,15 @@ class PlannedPick(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _unit_interval(cls, v):
-        """提示词要求 0~1；模型偶尔写成百分数（85）或越界：统一换算并截断，免得排序被打乱。"""
-        v = float(v)
-        if 1.0 < v <= 100.0:
+        """提示词要求 0~1；模型偶尔写成百分数（85）或略微越界（1.2）：2~100 按百分数换算，其余截断到 0~1，
+        免得排序被打乱。NaN、无穷和非数值按格式错误处理。"""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"confidence 不是数值：{v!r}") from None
+        if not math.isfinite(v):
+            raise ValueError(f"confidence 不是有限数：{v!r}")
+        if 2.0 <= v <= 100.0:
             v /= 100.0
         return min(max(v, 0.0), 1.0)
 
@@ -8900,8 +8973,10 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
 
 
 def _playbook_version(kind: str) -> int | None:
+    """记录用的版本号；文件损坏时为 None（不能记成空 playbook 的 1，让人误以为跑的是 v1）。"""
     try:  # 只为记录版本号：playbook 文件出问题也不能耽误 09:28 前推送
-        return int(playbook.load(kind).get("version", 1))
+        pb, ok = playbook.load_checked(kind)
+        return int(pb.get("version", 1)) if ok else None
     except Exception:  # noqa: BLE001
         log.exception("playbook %s unreadable", kind)
         return None
@@ -9144,6 +9219,9 @@ class Recorder:
         return True
 
 
+REAL_RELEASE = playbook.maybe_release
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(playbook, "PLAYBOOK_DIR", tmp_path)
@@ -9247,6 +9325,57 @@ def test_review_release_message_is_pushed_and_committed(env, monkeypatch):
     assert "playbook v2 上线：测试" in env["notifier"].sent[0]
     assert env["commits"] == [(["playbook/active.json", "playbook/candidate.json"],
                                "playbook: 2026-10-16 playbook v2 上线：测试")]
+
+
+def test_release_message_comes_first(env, monkeypatch):
+    monkeypatch.setattr(playbook, "maybe_release", lambda store, today, calendar: "playbook v2 上线：测试")
+    run(env, FakeLLM(OUTPUT))
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 playbook v2 上线：测试；复盘更新 1 条"
+
+
+def test_lessons_apply_to_released_candidate(env, monkeypatch, tmp_path):
+    """用真的 maybe_release：发布后的候选版（v2）再写当天的 lesson，今天新写的规则不上线。"""
+    monkeypatch.setattr(playbook, "maybe_release", REAL_RELEASE)
+    store = env["store"]
+    rules = [{"id": "r1", "text": "旧规则", "evidence": "e", "created": "2026-09-01"},
+             {"id": "r2", "text": "候选规则", "evidence": "e", "created": "2026-09-20"}]
+    playbook.save("candidate", {"version": 1, "created": "x", "rules": rules})
+    start = CAL.between(dt.date(2026, 9, 1), D)[-(playbook.MIN_DAYS_BETWEEN_RELEASES + 1)]
+    store.kv_set(playbook.RELEASE_KEY, start.isoformat())
+    for name, end in (("h:candidate", 1.05), ("h:active", 1.01)):
+        store.record_nav(name, start, 500_000.0)
+        store.record_nav(name, PREV, 500_000.0 * end)
+        store.record_nav(name, D, 500_000.0 * end)
+    llm = FakeLLM(OUTPUT)
+    run(env, llm)
+    act, cand = playbook.load("active"), playbook.load("candidate")
+    assert act["version"] == 2 and [r["text"] for r in act["rules"]] == ["旧规则", "候选规则"]
+    assert cand["version"] == 2 and [r["text"] for r in cand["rules"]] == ["旧规则", "候选规则",
+                                                                          "主板竞价高开超过 5% 的候选否决"]
+    assert "playbook v2" in llm.calls[0]["user"] and "候选规则" in llm.calls[0]["user"]
+    assert env["commits"][-1][1].startswith("playbook: 2026-10-16 playbook v2 上线")
+
+
+@pytest.mark.parametrize("broken", ["active", "candidate"])
+def test_corrupt_playbook_is_not_released_or_overwritten(env, monkeypatch, tmp_path, broken):
+    monkeypatch.setattr(playbook, "maybe_release", REAL_RELEASE)
+    (tmp_path / f"{broken}.json").write_text('{"version": 1, "rules": [', encoding="utf-8")
+    other = "candidate" if broken == "active" else "active"
+    before = (tmp_path / f"{other}.json").read_text(encoding="utf-8")
+    env["store"].kv_set(playbook.RELEASE_KEY, "2026-09-01")
+    run(env, FakeLLM(OUTPUT))
+    assert (tmp_path / f"{broken}.json").read_text(encoding="utf-8") == '{"version": 1, "rules": ['
+    assert (tmp_path / f"{other}.json").read_text(encoding="utf-8") == before
+    assert env["commits"] == []
+    assert f"playbook/{broken}.json 损坏" in env["notifier"].sent[0]
+
+
+def test_evidence_only_merge_is_committed(env):
+    out = ReviewOutput(summary="s", lessons=[Lesson(action="merge", rule_id="r1", text="旧规则",
+                                                    evidence="2026-10-16 600001 再次验证")])
+    run(env, FakeLLM(out))
+    assert playbook.load("candidate")["rules"][0]["evidence"] != "e"
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 补充证据 1 条"
 
 
 def test_release_happens_before_todays_lessons(env, monkeypatch):
@@ -9404,11 +9533,15 @@ def _bar_lines(cache: BarCache, codes: set[str], d: dt.date) -> list[str]:
     return out
 
 
-def _effective_changes(old: dict, new: dict) -> int:
-    """实际生效的改动条数（新增、删除、改写），不计指向不存在规则的 remove/merge。"""
-    a = {r["id"]: r["text"] for r in old.get("rules", [])}
-    b = {r["id"]: r["text"] for r in new.get("rules", [])}
-    return len(a.keys() ^ b.keys()) + sum(a[k] != b[k] for k in a.keys() & b.keys())
+def _effective_changes(old: dict, new: dict) -> tuple[int, int]:
+    """(实际生效的改动条数, 只补充了证据的条数)。改动指新增、删除、改写 text，
+    不计指向不存在规则的 remove/merge。"""
+    a = {r["id"]: r for r in old.get("rules", [])}
+    b = {r["id"]: r for r in new.get("rules", [])}
+    same = a.keys() & b.keys()
+    changed = len(a.keys() ^ b.keys()) + sum(a[k]["text"] != b[k]["text"] for k in same)
+    evidence = sum(a[k]["text"] == b[k]["text"] and a[k]["evidence"] != b[k]["evidence"] for k in same)
+    return changed, evidence
 
 
 def _report_rows(store: Store, d: dt.date) -> list[dict]:
@@ -9447,9 +9580,11 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
 
+    # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
+    bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = playbook.maybe_release(store, d, calendar)
-    changed = 0
+    release = None if bad else playbook.maybe_release(store, d, calendar)
+    parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
     else:
@@ -9468,15 +9603,20 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
             summary = out.summary
             lessons = [les for les in out.lessons[:MAX_LESSONS] if les.evidence.strip()]
             new = playbook.apply_lessons(cand, lessons, d)
-            if new != cand:
+            if new != cand and not bad:
                 playbook.save("candidate", new)
-                changed = _effective_changes(cand, new)
+                changed, evidence = _effective_changes(cand, new)
+                parts += [f"复盘更新 {changed} 条"] if changed else []
+                parts += [f"补充证据 {evidence} 条"] if evidence else []
+                parts += [] if changed or evidence else ["复盘整理规则"]
 
-    parts = ([f"复盘更新 {changed} 条"] if changed else []) + ([release] if release else [])
     if parts:
         playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts))
-        if release:
-            summary = f"{summary}\n{release}"
+    if release:
+        summary = f"{summary}\n{release}"
+    if bad:
+        files = "、".join(f"playbook/{k}.json" for k in bad)
+        summary = f"{summary}\n注意：{files} 损坏，今日未发布、未更新 playbook，请手工修复（可从 git 历史恢复）。"
     notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary))
 ```
 
@@ -12463,6 +12603,21 @@ def test_scan_passes_analysis_deadline(env):
     assert kw["deadline"] == at(d, 9, 22) and at(d, 9, 15) <= kw["now"] < at(d, 9, 16)
 
 
+def test_scan_counts_context_time_toward_analysis_start(env, monkeypatch):
+    d = env["dates"][10]
+    clock = [1000.0]
+    real = common.context
+
+    def slow_context():
+        clock[0] += 90  # 初始化依赖（连库、取交易日历）花了 90 秒
+        return real()
+
+    monkeypatch.setattr(common, "context", slow_context)
+    monkeypatch.setattr(premarket_scan._time, "monotonic", lambda: clock[0])
+    premarket_scan.main(now=at(d, 9, 15))
+    assert env["analysis_kw"]["now"] == at(d, 9, 16, 30)
+
+
 def test_final_does_not_rescan_while_analysis_runs(env):
     d = env["dates"][10]
     env["store"].save_candidates(d, [], {})  # 扫描已完成，深度分析还在跑：premarket_scan 尚未记 ok
@@ -12601,13 +12756,13 @@ def analyze_all(d: date, settings, store, now: datetime) -> dict[str, bool]:
 
 def main(now: datetime | None = None) -> bool:
     now = now or datetime.now()
+    t0 = _time.monotonic()  # 在 context() 之前取：开机补跑时初始化依赖也要花时间
     settings, store, client, cache, calendar, notifier = common.context()
     d = now.date()
     if not calendar.is_trading_day(d):
         common.log.info("premarket_scan %s: not a trading day", d)
         return False
     status: dict[str, bool] = {}
-    t0 = _time.monotonic()
 
     def job() -> None:
         scan(d, settings, store, client, cache, calendar)
