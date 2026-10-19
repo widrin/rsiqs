@@ -24,7 +24,7 @@
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，597 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，613 个测试全部通过（Part 1 共 152 个、Part 2 共 105 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -4022,9 +4022,9 @@ uv run pytest tests/test_store.py tests/test_metrics.py tests/test_dataview.py t
 > - `load_panel` 先在全部历史上算 `prev_close = close.shift(1)`，再按 `[start, end]` 截取；每只股票第一根 K 线缺失的 `prev_close` 用当日 `open` 填充。
 > - `BarCache` 额外提供 `codes()`（缓存中全部代码）和 `last_date(code)`。表名加前缀（`bar_daily`/`bar_names`/`index_daily`），和 `Store` 共用同一个 sqlite 文件时不会冲突。约定 bootstrap 用 `save_index("sh000300", ...)` 保存基准。
 > - `index_daily` / `load_index` 返回的 Series 使用归一化 `DatetimeIndex`（和 panel 一致），`name` 为指数代码。`daily_bars` 的 `date` 列是归一化的 `datetime64`。
-> - `spot()` 新浪备用源的 `成交量` 单位为股，统一除以 100 换算成手（和东财一致），需在冒烟步骤中核实。
-> - `NullNotifier.sent` 是 `list[str]`（消息原文）。`notify/wecom.py` 额外导出常量 `TEXT_LIMIT`/`MARKDOWN_LIMIT`/`FAIL_PREFIX` 和函数 `split_utf8`；失败日志会把 webhook 的 `key=` 脱敏。
-> - `baseline_momo` 额外排除最后一根 K 线不在 `view.asof` 的股票（asof 当日停牌）。同分时按代码升序。策略文件不写 `from __future__ import annotations`（`__future__` 不在沙箱白名单）。
+> - `spot()` 不给代码时取全市场（东财分页翻取、每页之间 sleep，要将近一分钟；失败切新浪，新浪 `成交量` 单位为股，统一除以 100 换算成手）；`spot(codes)` 逐只取东财个股报价（`stock_bid_ask_em`），盘前定稿和盘中监控只取候选或持仓，取不到的代码不出现。`names()` 取交易所的 A 股简称列表（含 ST 前缀），bootstrap 和每天的结算都会刷新。`index_daily` 新浪失败时切东财。`stock_zh_a_hist` 传 `timeout=HTTP_TIMEOUT`；`AkClient` 构造时设置进程级的 socket 默认超时 `SOCKET_TIMEOUT`，其余不支持超时参数的接口连接卡住时也会报错并进入重试。`news_global` 最新的在前，财联社接口只返回最近 20 条。`notices`、`stock_news` 遇到 akshare 对空结果抛的 KeyError 时返回空结果。
+> - `NullNotifier.sent` 是 `list[str]`（消息原文）。`notify/wecom.py` 额外导出常量 `TEXT_LIMIT`/`MARKDOWN_LIMIT`/`FAIL_PREFIX` 和函数 `split_utf8`；失败日志会把 webhook 的 `key=` 脱敏。"下一条补报"的标记落盘在 `logs/notify_pending`：每个计划任务是独立进程，09:25 推荐失败后，之后任何任务的第一条消息都会带上提示。45009（频率限制）等到下一个分钟窗口再发一次；webhook 无效等错误不重试；读超时不重发（服务端可能已经转发）。日报不用 markdown 表格（群机器人 markdown v1 不渲染），推荐理由和市场观点里的换行合并成一行。
+> - `baseline_momo` 返回前 15 名（盘前流程最多取前 15 个复核，回测和结算只取前 5 个）；额外排除最后一根 K 线不在 `view.asof` 的股票（asof 当日停牌），以及收盘价、昨收、成交额、20 日或 5 日涨幅不是有限值的股票。同分时按代码升序。策略文件不写 `from __future__ import annotations`（`__future__` 不在沙箱白名单）。
 > - `check_source` 采用更严格的口径：`getattr/setattr/delattr` 一律禁止（不只针对 dunder），另禁 `locals/vars/breakpoint/input`、任何含 `__` 的名字、属性和字符串（docstring 除外）、按字符串求值或取属性的写法（含 `str.format`）、pandas 扩展接口与全局选项、除方法内真正的 `self.xxx` 以外的任何属性赋值和删除，以及经 `import engine.types` 绑定的包名访问白名单之外的模块；`strategies.base` 不在导入白名单里，以及 pandas/numpy 的文件读写属性（`read_*`、`to_csv` 等）。允许导入白名单模块及其子模块（`numpy.linalg` 可以，`engine.store` 不行）。沙箱是尽力而为的静态检查，不是安全边界；真正的防线是 `engine/` 哈希校验和 git 审计。
 > - `engine/run_eval.py` 全程不触网：交易日历取自缓存基准指数 `sh000300` 的日期，股票池为 `cache.codes()`，基准净值为指数归一化到 1。出错时也输出一行 `{"error": ...}` JSON，退出码非 0。它在 `engine/` 内，会被纳入完整性清单。
 > - 依赖前面 Part 的 `config.py`、`engine/types.py`、`engine/rules.py`、`engine/dataview.py`、`engine/calendar.py`、`engine/store.py`、`engine/evaluator.py`，以及 `data/`、`notify/`、`strategies/` 各包的 `__init__.py`（若缺失，先创建空文件）。
@@ -4111,7 +4111,7 @@ def test_daily_bars_normalizes_chinese_columns(monkeypatch):
     fake_ak(monkeypatch, stock_zh_a_hist=hist)
     df = AkClient().daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
     assert seen == {"symbol": "600000", "period": "daily", "start_date": "20260105",
-                    "end_date": "20260106", "adjust": "qfq"}
+                    "end_date": "20260106", "adjust": "qfq", "timeout": akc.HTTP_TIMEOUT}
     assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
     assert df["date"].tolist() == [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]
     assert df["close"].tolist() == [10.2, 10.3]
@@ -4242,14 +4242,14 @@ def test_news_global(monkeypatch):
     raw = pd.DataFrame({"标题": ["a", "b", "c"], "内容": ["ca", "cb", "cc"],
                         "发布日期": ["2026-10-15"] * 3, "发布时间": ["09:00:00", "09:01:00", "09:02:00"]})
     fake_ak(monkeypatch, stock_info_global_cls=lambda symbol: raw)
-    items = AkClient().news_global(limit=2)
-    assert items == [{"title": "a", "content": "ca", "time": "2026-10-15 09:00:00"},
+    items = AkClient().news_global(limit=2)  # 接口按时间升序返回：取最新的两条，最新的在前
+    assert items == [{"title": "c", "content": "cc", "time": "2026-10-15 09:02:00"},
                      {"title": "b", "content": "cb", "time": "2026-10-15 09:01:00"}]
 
 
 def test_stock_news(monkeypatch):
-    raw = pd.DataFrame({"关键词": ["600000"] * 2, "新闻标题": ["t1", "t2"], "新闻内容": ["c1", "c2"],
-                        "发布时间": ["2026-10-15 08:00:00", "2026-10-14 08:00:00"],
+    raw = pd.DataFrame({"关键词": ["600000"] * 2, "新闻标题": ["t2", "t1"], "新闻内容": ["c2", "c1"],
+                        "发布时间": ["2026-10-14 08:00:00", "2026-10-15 08:00:00"],
                         "文章来源": ["x", "y"], "新闻链接": ["u1", "u2"]})
     fake_ak(monkeypatch, stock_news_em=lambda symbol: raw)
     assert AkClient().stock_news("600000", limit=1) == [
@@ -4258,7 +4258,7 @@ def test_stock_news(monkeypatch):
 
 def test_notices(monkeypatch):
     seen = {}
-    raw = pd.DataFrame({"代码": ["600000"], "名称": ["浦发银行"], "公告标题": ["年报"],
+    raw = pd.DataFrame({"代码": [600], "名称": ["浦发银行"], "公告标题": ["年报"],
                         "公告类型": ["定期报告"], "公告日期": ["2026-10-15"], "网址": ["u"]})
 
     def report(symbol, date):
@@ -4269,7 +4269,87 @@ def test_notices(monkeypatch):
     df = AkClient().notices(date(2026, 10, 15))
     assert seen == {"symbol": "全部", "date": "20261015"}
     assert list(df.columns) == ["code", "name", "title", "type"]
-    assert df.iloc[0].tolist() == ["600000", "浦发银行", "年报", "定期报告"]
+    assert df.iloc[0].tolist() == ["000600", "浦发银行", "年报", "定期报告"]
+
+
+def test_empty_results_raising_key_error_are_empty(monkeypatch):
+    def no_rows(**kw):  # akshare 在没有结果时对空表取列，抛 KeyError
+        raise KeyError("代码")
+
+    fake_ak(monkeypatch, stock_notice_report=no_rows, stock_news_em=no_rows)
+    assert AkClient().notices(date(2026, 10, 1)).empty
+    assert AkClient().stock_news("600000") == []
+
+
+def test_spot_em_retries_before_falling_back(monkeypatch, no_sleep):
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("em blip")
+        return EM_SPOT
+
+    fake_ak(monkeypatch, stock_zh_a_spot_em=flaky, stock_zh_a_spot=lambda: pytest.fail("no fallback"))
+    assert len(AkClient().spot()) == 2 and len(calls) == 2
+
+
+BID_ASK = {"今开": 10.2, "昨收": 10.0, "最新": 10.3, "最高": 10.4, "总手": 1200.0, "金额": 1.2e6, "涨幅": 3.0}
+
+
+def _bid_ask(values):
+    return pd.DataFrame({"item": list(values), "value": list(values.values())})
+
+
+def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
+    seen = []
+
+    def quote(symbol):
+        seen.append(symbol)
+        if symbol == "000002":
+            raise ConnectionError("down")
+        return _bid_ask({**BID_ASK, "今开": "-"} if symbol == "000003" else BID_ASK)
+
+    fake_ak(monkeypatch, stock_bid_ask_em=quote, stock_zh_a_spot_em=lambda: pytest.fail("no full-market spot"))
+    df = AkClient(wait=0).spot(["600000", "000002", "000003"])
+    assert list(df.columns) == SPOT_COLS
+    assert df["code"].tolist() == ["600000", "000003"]  # 取不到的代码不出现（按竞价数据缺失处理）
+    r = df.set_index("code").loc["600000"]
+    assert (r["open"], r["prev_close"], r["last"], r["high"], r["volume"], r["pct"]) == (10.2, 10.0, 10.3, 10.4, 1200.0, 3.0)
+    assert pd.isna(df.set_index("code").loc["000003", "open"])  # 停牌时报价为 "-"
+    assert AkClient().spot([]).empty and list(AkClient().spot([]).columns) == SPOT_COLS
+
+
+def test_names_from_exchange_lists(monkeypatch):
+    fake_ak(monkeypatch, stock_info_a_code_name=lambda: pd.DataFrame({"code": ["600000", 1], "name": ["浦发银行", "*ST平安"]}))
+    assert AkClient().names() == {"600000": "浦发银行", "000001": "*ST平安"}
+
+
+def test_index_daily_falls_back_to_eastmoney(monkeypatch):
+    def sina(symbol):
+        raise ConnectionError("sina down")
+
+    seen = {}
+
+    def em(symbol, start_date="19900101", end_date="20500101"):
+        seen["symbol"] = symbol
+        return pd.DataFrame({"date": ["2026-01-05", "2026-01-06"], "open": [1, 1], "close": [4000.0, 4010.5],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    fake_ak(monkeypatch, stock_zh_index_daily=sina, stock_zh_index_daily_em=em)
+    s = AkClient(wait=0).index_daily("sh000300")
+    assert seen == {"symbol": "sh000300"} and s.tolist() == [4000.0, 4010.5] and s.name == "sh000300"
+
+
+def test_client_sets_a_default_socket_timeout():
+    import socket
+    old = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(None)
+        AkClient()
+        assert socket.getdefaulttimeout() == akc.SOCKET_TIMEOUT
+    finally:
+        socket.setdefaulttimeout(old)
 ```
 
 **Step 2: 运行，确认失败**
@@ -4291,6 +4371,7 @@ uv run pytest tests/test_akshare_client.py -v
 列名映射是模块级字典，AKShare 升级改列名时只改一行；用 scripts/smoke_akshare.py 实网核实。
 """
 import logging
+import socket
 import time
 from datetime import date
 
@@ -4313,6 +4394,11 @@ STOCK_NEWS_COLS = {"新闻标题": "title", "新闻内容": "content", "发布�
 NOTICE_COLS = {"代码": "code", "名称": "name", "公告标题": "title", "公告类型": "type"}
 SPOT_COLS = ["code", "name", "open", "prev_close", "last", "pct", "volume", "amount", "high"]
 NUMERIC = ["open", "high", "low", "close", "volume", "amount", "prev_close", "last", "pct", "change"]
+# 东财个股报价（stock_bid_ask_em，item/value 两列）：盘前定稿和盘中监控只需要少数代码，不必翻全市场
+BID_ASK_COLS = {"今开": "open", "昨收": "prev_close", "最新": "last", "涨幅": "pct", "总手": "volume",
+                "金额": "amount", "最高": "high"}
+HTTP_TIMEOUT = 15.0  # 支持 timeout 参数的接口（stock_zh_a_hist）单次请求的超时，秒
+SOCKET_TIMEOUT = 30.0  # 兜底：akshare 多数接口内部用不带 timeout 的 requests.get，连接卡住时会无限阻塞
 
 
 class DataError(Exception):
@@ -4354,12 +4440,25 @@ def _records(df: pd.DataFrame, limit: int) -> list[dict]:
             for r in df.head(limit).itertuples(index=False)]
 
 
+def _empty_on_key_error(fn, *args, **kwargs):
+    """akshare 在没有结果时对空表取列，抛 KeyError（如 stock_notice_report 遇到没有公告的日子）：视为空结果。"""
+    try:
+        return fn(*args, **kwargs)
+    except KeyError:
+        return pd.DataFrame()
+
+
 class AkClient:
-    """所有方法都经 with_retry；spot() 东财失败时切新浪。"""
+    """所有方法都经 with_retry；快照与指数日线有备用源。
+
+    构造时设置进程级的 socket 默认超时（SOCKET_TIMEOUT）：akshare 多数接口不设超时，连接卡住时重试和告警都
+    不会触发，任务会一直挂住。"""
 
     def __init__(self, attempts: int = 3, wait: float = 2.0):
         self.attempts = attempts
         self.wait = wait
+        if socket.getdefaulttimeout() is None:
+            socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
     def _call(self, fn, *args, **kwargs):
         return with_retry(fn, *args, attempts=self.attempts, wait=self.wait, **kwargs)
@@ -4370,7 +4469,7 @@ class AkClient:
 
     def daily_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
         df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
+                        start_date=_fmt(start), end_date=_fmt(end), adjust="qfq", timeout=HTTP_TIMEOUT)
         cols = ["date", "open", "high", "low", "close", "volume", "amount"]
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
@@ -4386,7 +4485,7 @@ class AkClient:
         的误差可达几角。"""
         cols = ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
         df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="")
+                        start_date=_fmt(start), end_date=_fmt(end), adjust="", timeout=HTTP_TIMEOUT)
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
         out = _pick(df, RAW_COLS, f"stock_zh_a_hist({code}, 不复权)")
@@ -4395,7 +4494,15 @@ class AkClient:
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
-        df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+        """新浪指数日线，失败时切东财（stock_zh_index_daily_em，symbol 同样带 sh/sz 前缀）。"""
+        try:
+            df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+        except Exception as e:  # noqa: BLE001
+            log.warning("新浪指数日线失败，切换东财: %s", e)
+            try:
+                df = self._call(ak.stock_zh_index_daily_em, symbol=symbol)
+            except Exception as e2:  # noqa: BLE001
+                raise DataError(f"指数日线新浪/东财均失败: {e2}") from e2
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
         s = pd.Series(pd.to_numeric(df["close"]).astype(float).to_numpy(), index=idx, name=symbol)
         return s.sort_index()
@@ -4428,7 +4535,19 @@ class AkClient:
             codes.update(str(c).zfill(6) for c in df[CONS_CODE_COL])
         return sorted(codes)
 
-    def spot(self) -> pd.DataFrame:
+    def names(self) -> dict[str, str]:
+        """沪深京全部 A 股的当前简称（交易所列表，含 ST/*ST 前缀）。每天刷新：新纳入的成分股和新戴帽的股票都靠它。"""
+        df = self._call(ak.stock_info_a_code_name)
+        return {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
+
+    def spot(self, codes: list[str] | None = None) -> pd.DataFrame:
+        """实时快照（竞价时段的"今开"即竞价价）。
+
+        给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
+        和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空。
+        不给 codes 时取全市场：东财失败切新浪。"""
+        if codes is not None:
+            return self._spot_codes(codes)
         try:
             out = _pick(self._call(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
         except Exception as e:  # noqa: BLE001
@@ -4443,17 +4562,38 @@ class AkClient:
         out["name"] = out["name"].astype(str)
         return out[SPOT_COLS].reset_index(drop=True)
 
+    def _spot_codes(self, codes: list[str]) -> pd.DataFrame:
+        rows = []
+        for code in codes:
+            try:
+                df = self._call(ak.stock_bid_ask_em, symbol=code)
+            except Exception as e:  # noqa: BLE001 - 单只失败不影响其他代码
+                log.warning("个股报价 %s 失败: %s", code, e)
+                continue
+            kv = dict(zip(df["item"], df["value"]))
+            row = {"code": str(code).zfill(6), "name": ""}
+            row.update({v: kv.get(k) for k, v in BID_ASK_COLS.items()})
+            rows.append(row)
+        out = pd.DataFrame(rows, columns=SPOT_COLS)
+        for c in SPOT_COLS[2:]:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)  # 停牌时报价为 "-"
+        return out
+
     def news_global(self, limit: int = 50) -> list[dict]:
+        """财联社电报，最新的在前。接口只返回最近 20 条（按时间升序），limit 超过 20 也只有 20 条。"""
         df = _pick(self._call(ak.stock_info_global_cls, symbol="全部"), CLS_COLS, "stock_info_global_cls")
         df["time"] = df["date"].astype(str) + " " + df["time"].astype(str)
-        return _records(df, limit)
+        return _records(df.sort_values("time", ascending=False), limit)
 
     def stock_news(self, code: str, limit: int = 5) -> list[dict]:
-        df = _pick(self._call(ak.stock_news_em, symbol=code), STOCK_NEWS_COLS, f"stock_news_em({code})")
+        df = self._call(_empty_on_key_error, ak.stock_news_em, symbol=code)
+        if df is None or df.empty:
+            return []
+        df = _pick(df, STOCK_NEWS_COLS, f"stock_news_em({code})")
         return _records(df.sort_values("time", ascending=False), limit)
 
     def notices(self, d: date) -> pd.DataFrame:
-        df = self._call(ak.stock_notice_report, symbol="全部", date=_fmt(d))
+        df = self._call(_empty_on_key_error, ak.stock_notice_report, symbol="全部", date=_fmt(d))
         if df is None or df.empty:
             return pd.DataFrame(columns=list(NOTICE_COLS.values()))
         out = _pick(df, NOTICE_COLS, "stock_notice_report")
@@ -4467,7 +4607,7 @@ class AkClient:
 uv run pytest tests/test_akshare_client.py -v
 ```
 
-预期：16 passed。
+预期：22 passed。
 
 **Step 5: 手工冒烟脚本（Manual smoke step，需联网）**
 
@@ -5086,15 +5226,37 @@ def test_send_markdown_payload_and_4000_limit(tmp_path):
 
 
 def test_retry_then_success(tmp_path):
-    w, s = make(tmp_path, [ConnectionError("x"), Resp(body={"errcode": 45009, "errmsg": "freq"})])
+    w, s = make(tmp_path, [ConnectionError("x"), Resp(500)])
     assert w.send_text("hi") is True
     assert len(s.posts) == 3
     assert not (tmp_path / "logs" / "notify_failed.jsonl").exists()
 
 
-def test_final_failure_logs_and_prefixes_next_message_once(tmp_path):
+def test_rate_limit_waits_for_next_minute(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(wc.time, "sleep", lambda t: sleeps.append(t))
+    w, s = make(tmp_path, [Resp(body={"errcode": 45009, "errmsg": "freq"})])
+    assert w.send_text("hi") is True and len(s.posts) == 2
+    assert sleeps == [wc.RATE_LIMIT_WAIT]
+
+
+def test_fatal_errcode_not_retried(tmp_path):
+    w, s = make(tmp_path, [Resp(body={"errcode": 93000, "errmsg": "invalid webhook url"})])
+    assert w.send_text("hi") is False and len(s.posts) == 1
+
+
+def test_read_timeout_not_resent(tmp_path):
+    import requests
+    w, s = make(tmp_path, [requests.ReadTimeout("read timed out")])
+    assert w.send_text("止损告警") is False and len(s.posts) == 1  # 服务端可能已转发：重发会在群里出现两条
+    rec = (tmp_path / "logs" / "notify_failed.jsonl").read_text(encoding="utf-8")
+    assert "可能已送达" in rec
+
+
+def test_final_failure_logs_and_prefixes_next_message_once(tmp_path, caplog):
     w, s = make(tmp_path, [Resp(500), Resp(500), ConnectionError(f"bad {URL}")])
     assert w.send_text("第一条") is False
+    assert caplog.records and all("SECRET123" not in r.getMessage() for r in caplog.records)
     log = tmp_path / "logs" / "notify_failed.jsonl"
     rec = json.loads(log.read_text(encoding="utf-8").strip())
     assert rec["msgtype"] == "text" and rec["content"] == "第一条"
@@ -5111,6 +5273,23 @@ def test_null_notifier_records():
     assert n.send_text("a") is True
     assert n.send_markdown("**b**") is True
     assert n.sent == ["a", "**b**"]
+
+
+def test_failure_flag_survives_process_restart(tmp_path):
+    w1, _ = make(tmp_path, [Resp(500), Resp(500), Resp(500)])
+    assert w1.send_markdown("09:25 推荐") is False
+    w2, s2 = make(tmp_path)  # 下一个计划任务是新进程，新建实例
+    assert w2.send_text("盘中告警") is True
+    assert s2.posts[-1]["text"]["content"] == FAIL_PREFIX + "盘中告警"
+    w3, s3 = make(tmp_path)
+    assert w3.send_text("再下一条") is True and s3.posts[-1]["text"]["content"] == "再下一条"
+
+
+def test_split_utf8_does_not_split_emoji_sequences():
+    chunks = split_utf8("⚠️" * 1000, 4000)
+    assert "".join(chunks) == "⚠️" * 1000
+    assert all(not c.startswith("\ufe0f") for c in chunks)
+    assert all(len(c.encode("utf-8")) <= 4000 for c in chunks)
 ```
 
 **Step 2: 运行，确认失败**
@@ -5127,7 +5306,7 @@ uv run pytest tests/test_wecom.py -v
 
 ```python
 # notify/wecom.py
-"""企业微信群机器人推送：按 UTF-8 字节分段、重试、失败落盘并在下一条补报。"""
+"""企业微信群机器人推送：按 UTF-8 字节分段、重试、失败落盘并在下一条补报（跨进程）。"""
 import json
 import logging
 import re
@@ -5144,6 +5323,11 @@ MARKDOWN_LIMIT = 4000
 ATTEMPTS = 3
 WAIT = 2.0
 FAIL_PREFIX = "⚠️ 上条推送失败，详见本地日志\n"
+RATE_LIMIT_WAIT = 61.0  # 45009：每分钟 20 条的额度用完，等到下一个分钟窗口再发（只等一次）
+FATAL_ERRCODES = {93000, 40008, 44004, 40058}  # webhook 无效、消息类型或内容非法：重试没有用
+PENDING_FILE = "notify_pending"  # 有未补报的失败；每个计划任务是独立进程，状态必须落盘
+# 不能在这些码点之前切：变体选择符、零宽连接符、组合字符（硬切时拆开 emoji 序列会显示成乱码）
+_NO_CUT_BEFORE = {"\ufe0f", "\ufe0e", "\u200d", "\u20e3"}
 
 
 def _nbytes(s: str) -> int:
@@ -5159,6 +5343,8 @@ def split_utf8(text: str, limit: int) -> list[str]:
             while size + _nbytes(line[cut]) <= limit:
                 size += _nbytes(line[cut])
                 cut += 1
+            while cut > 1 and line[cut] in _NO_CUT_BEFORE:
+                cut -= 1
             pieces.append(line[:cut])
             line = line[cut:]
         if line:
@@ -5183,7 +5369,11 @@ class WeCom:
         self.url = url
         self.session = session or requests.Session()
         self.log_dir = Path(log_dir)
-        self.failed = False  # 上一条是否最终失败
+
+    @property
+    def failed(self) -> bool:
+        """上一条推送（可能在另一个任务进程里）是否最终失败、还没补报。"""
+        return (self.log_dir / PENDING_FILE).exists()
 
     def send_text(self, content: str) -> bool:
         return self._send("text", content, TEXT_LIMIT)
@@ -5198,28 +5388,43 @@ class WeCom:
             if err is not None:
                 self._log_failure(msgtype, content, err)
                 return False
-        self.failed = False
+        (self.log_dir / PENDING_FILE).unlink(missing_ok=True)
         return True
 
     def _post(self, payload: dict) -> str | None:
-        """成功返回 None，否则返回最后一次的错误描述。"""
-        err = "unknown"
+        """成功返回 None，否则返回最后一次的错误描述。
+
+        45009（频率限制）等到下一个分钟窗口再发一次；webhook 无效等错误不重试；读超时不重发：服务端可能已经
+        收到并转发，重发会在群里出现两条。"""
+        err, rate_limited = "unknown", False
         for i in range(ATTEMPTS):
+            wait = WAIT
             try:
                 r = self.session.post(self.url, json=payload, timeout=10)
-                if r.status_code == 200 and r.json().get("errcode") == 0:
+                body = r.json() if r.status_code == 200 else {}
+                code = body.get("errcode")
+                if r.status_code == 200 and code == 0:
                     return None
-                err = f"HTTP {r.status_code}: {r.json() if r.status_code == 200 else ''}"
+                err = f"HTTP {r.status_code}: {body}"
+                if code in FATAL_ERRCODES:
+                    log.warning("推送失败且不可重试: %s", _redact(err))
+                    return err
+                if code == 45009 and not rate_limited:
+                    rate_limited, wait = True, RATE_LIMIT_WAIT
+            except requests.ReadTimeout as e:
+                err = f"ReadTimeout（可能已送达，不重发）: {e}"
+                log.warning("推送读超时，可能已送达，不重发: %s", _redact(str(e)))
+                return err
             except Exception as e:  # noqa: BLE001
                 err = f"{type(e).__name__}: {e}"
             log.warning("推送第 %d/%d 次失败: %s", i + 1, ATTEMPTS, _redact(err))
             if i < ATTEMPTS - 1:
-                time.sleep(WAIT)
+                time.sleep(wait)
         return err
 
     def _log_failure(self, msgtype: str, content: str, err: str) -> None:
-        self.failed = True
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        (self.log_dir / PENDING_FILE).touch()
         rec = {"time": datetime.now().isoformat(timespec="seconds"), "msgtype": msgtype,
                "content": content, "error": _redact(err)}
         with open(self.log_dir / "notify_failed.jsonl", "a", encoding="utf-8") as f:
@@ -5247,7 +5452,7 @@ class NullNotifier:
 uv run pytest tests/test_wecom.py -v
 ```
 
-预期：8 passed。
+预期：13 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需联网和真实 webhook）**
 
@@ -5319,6 +5524,21 @@ def test_alert():
     s = format_alert("触发止损", "600000 浦发银行 现价 9.30")
     assert s.startswith("【RSIQS 告警】触发止损")
     assert "600000 浦发银行 现价 9.30" in s
+
+
+def test_multiline_reason_and_view_stay_in_place():
+    p = Pick(code="600000", name="浦发银行", score=1.0, entry_max=10.3, stop=9.3, target=11.0, hold_days=5,
+             reason="结论：看多\n# 证据：放量\n> 引用")
+    s = format_recommendation(date(2026, 10, 16), [p], llm_reviewed=True, market_view="偏强\n## 竞价确认")
+    lines = s.split("\n")
+    assert not any(line.startswith(("# ", "## 竞价")) for line in lines[1:])  # 不会被渲染成标题
+    assert any("结论：看多" in line and "证据：放量" in line for line in lines)
+
+
+def test_daily_report_has_no_markdown_table():
+    rows = [{"account": "h:active", "equity": 512345.678, "day_ret": 0.0123, "total_ret": 0.0247}]
+    s = format_daily_report(date(2026, 10, 16), rows, "")
+    assert "|" not in s  # 企业微信群机器人 markdown（v1）不渲染表格
 ```
 
 **Step 2: 运行，确认失败**
@@ -5343,28 +5563,34 @@ from engine.types import Pick
 DISCLAIMER = "> 模拟盘信号，仅供研究，不构成投资建议。"
 
 
+def _one_line(text: str) -> str:
+    """LLM 写的理由和市场观点可能含换行：合并成一行，免得后面的行跳出引用、被渲染成标题或列表。"""
+    return "；".join(part.strip() for part in str(text).splitlines() if part.strip())
+
+
 def format_recommendation(d: date, picks: list[Pick], llm_reviewed: bool, market_view: str = "") -> str:
     lines = [f"## RSIQS 盘前推荐 {d.isoformat()}"]
     if not llm_reviewed:
         lines.append("<font color=\"warning\">未经 LLM 审核（已退回纯量化推荐）</font>")
     if market_view:
-        lines.append(f"**市场观点**：{market_view}")
+        lines.append(f"**市场观点**：{_one_line(market_view)}")
     if not picks:
         lines.append("今日无推荐。")
     for i, p in enumerate(picks, 1):
         lines.append(f"**{i}. {p.code} {p.name}**  买入 ≤{p.entry_max:.2f} | 止损 {p.stop:.2f} | "
                      f"止盈 {p.target:.2f} | 持有 {p.hold_days} 日")
         if p.reason:
-            lines.append(f"> {p.reason}")
+            lines.append(f"> {_one_line(p.reason)}")
     lines.append(DISCLAIMER)
     return "\n".join(lines)
 
 
 def format_daily_report(d: date, rows: list[dict], review_summary: str) -> str:
-    lines = [f"## RSIQS 日报 {d.isoformat()}", "| 账户 | 净值 | 当日 | 累计 |", "|---|---|---|---|"]
+    # 企业微信群机器人的 markdown（v1）不渲染表格：每个账户一行
+    lines = [f"## RSIQS 日报 {d.isoformat()}"]
     for r in rows:
-        lines.append(f"| {r['account']} | {r['equity']:,.2f} | {r['day_ret']:+.2%} | {r['total_ret']:+.2%} |")
-    lines.append("**复盘**：" + (review_summary or "（本日无 LLM 复盘）"))
+        lines.append(f"**{r['account']}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}")
+    lines.append("**复盘**：" + (_one_line(review_summary) or "（本日无 LLM 复盘）"))
     return "\n".join(lines)
 
 
@@ -5378,7 +5604,7 @@ def format_alert(title: str, body: str) -> str:
 uv run pytest tests/test_format.py -v
 ```
 
-预期：4 passed。
+预期：6 passed。
 
 **Step 5: 提交**
 
@@ -5482,12 +5708,13 @@ def test_pick_price_fields(view):
     assert "20日涨幅20.0%" in p.reason and "5日涨幅-2.0%" in p.reason
 
 
-def test_top5_cap():
-    panel = {f"60010{i}": series(path(0.01 * (i + 1), 0.0)) for i in range(8)}
+def test_returns_up_to_15_ordered_candidates():
+    # 盘前流程最多取前 15 个复核，回测和结算只取前 5 个：策略返回完整的前 15 名
+    panel = {f"6001{i:02d}": series(path(0.01 * (i + 1), 0.0)) for i in range(20)}
     v = DataView(panel, {c: "甲" for c in panel}, asof=ASOF)
     picks = BaselineMomo().select(v)
-    assert len(picks) == 5
-    assert picks[0].code == "600107"
+    assert len(picks) == 15
+    assert picks[0].code == "600119" and [p.score for p in picks] == sorted((p.score for p in picks), reverse=True)
 
 
 def test_empty_view():
@@ -5515,6 +5742,18 @@ def test_load_and_list_strategies():
     for bad in ["../evil", "Base", "ab", "base", "sandbox", "x" * 50]:
         with pytest.raises(ValueError):
             load_strategy(bad)
+
+
+def test_non_finite_values_are_skipped():
+    good = series(path(0.20, -0.02))
+    nan_close = good.copy()
+    nan_close.iloc[-1, nan_close.columns.get_loc("close")] = float("nan")  # asof 当天收盘价缺失
+    nan_amount = series(path(0.15, 0.0), amount=float("nan"))           # 成交额缺失：不能当作足够
+    nan_hist = series(path(0.10, 0.10))
+    nan_hist.iloc[-21, nan_hist.columns.get_loc("close")] = float("nan")  # 20 日前收盘价缺失
+    panel = {"600001": good, "600002": nan_close, "600003": nan_amount, "600004": nan_hist}
+    picks = STRATEGY.select(DataView(panel, {c: "股" for c in panel}, asof=ASOF))
+    assert [p.code for p in picks] == ["600001"]
 ```
 
 **Step 2: 运行，确认失败**
@@ -5570,6 +5809,8 @@ def list_strategies() -> list[str]:
 ```python
 # strategies/baseline_momo.py
 """基线：中期动量 + 短期反转。分数 = rank(20日涨幅) - rank(5日涨幅)。"""
+import math
+
 import pandas as pd
 
 from engine.dataview import DataView
@@ -5579,7 +5820,7 @@ from engine.types import Pick
 
 class BaselineMomo:
     name = "baseline_momo"
-    top_n = 5
+    top_n = 15  # 盘前流程最多取前 15 个复核；回测和结算只取前 5 个
     min_rows = 60
     min_amount = 1e8
 
@@ -5592,16 +5833,20 @@ class BaselineMomo:
             h = view.history(code, self.min_rows)  # 只取需要的行：回测每天对约 800 只股票调用
             if len(h) < self.min_rows or h.index[-1].date() != view.asof:
                 continue
-            if h["amount"].iloc[-20:].mean() < self.min_amount:
+            if not h["amount"].iloc[-20:].mean() >= self.min_amount:  # NaN 也排除
                 continue
             last = h.iloc[-1]
-            up, _ = limit_prices(code, name, float(last["prev_close"]), view.asof)
-            if at_limit_up(float(last["close"]), up):
+            close, prev = float(last["close"]), float(last["prev_close"])
+            if not (math.isfinite(close) and math.isfinite(prev) and close > 0 and prev > 0):
+                continue  # 数据缺失
+            up, _ = limit_prices(code, name, prev, view.asof)
+            if at_limit_up(close, up):
                 continue  # asof 收于涨停（按当天的规则，容忍一分钱的复权舍入）
             c = h["close"]
-            rows.append({"code": code, "name": name, "close": float(c.iloc[-1]),
-                         "r20": float(c.iloc[-1] / c.iloc[-21] - 1),
-                         "r5": float(c.iloc[-1] / c.iloc[-6] - 1)})
+            r20, r5 = float(c.iloc[-1] / c.iloc[-21] - 1), float(c.iloc[-1] / c.iloc[-6] - 1)
+            if not (math.isfinite(r20) and math.isfinite(r5)):
+                continue
+            rows.append({"code": code, "name": name, "close": close, "r20": r20, "r5": r5})
         if not rows:
             return []
         df = pd.DataFrame(rows)
@@ -5625,7 +5870,7 @@ STRATEGY = BaselineMomo()
 uv run pytest tests/test_strategies.py -v
 ```
 
-预期：7 passed。
+预期：8 passed。
 
 **Step 5: 提交**
 
@@ -5771,6 +6016,11 @@ def test_attribute_stores_only_on_self():
 @pytest.mark.parametrize("attr", sorted(IO_ATTRS))
 def test_every_file_attribute_rejected(attr):
     assert bad(f"p = None\np.{attr}()"), attr
+
+
+def test_open_price_attribute_allowed_but_open_call_rejected():
+    assert bad("b = None\nx = b.open\nfor r in []:\n    y = r.open > r.close") == []
+    assert any("open" in m for m in bad("p = None\nf = p.open('x')"))
 
 
 def test_file_access_through_pathlike_and_pandas_rejected():
@@ -5977,6 +6227,32 @@ def test_missing_benchmark(tmp_path, monkeypatch):
     out = io.StringIO()
     assert run_eval.main(["baseline_momo"], out=out) == 1
     assert "sh000300" in json.loads(out.getvalue())["error"]
+
+
+def test_real_evaluation_is_not_voided(tmp_path, monkeypatch):
+    """不替换 evaluate：真实回测、pandas 运算、惰性导入都不应让规则快照误报。"""
+    import engine.evaluator as ev
+    days = pd.bdate_range("2026-01-05", periods=90)
+
+    class Client:
+        def daily_bars(self, code, start, end):
+            close = [10.0 * (1.002 + 0.001 * int(code[-1])) ** i for i in range(len(days))]
+            return pd.DataFrame({"date": days, "open": close, "high": [c * 1.01 for c in close],
+                                 "low": [c * 0.99 for c in close], "close": close,
+                                 "volume": [1e5] * len(days), "amount": [2e8] * len(days)})
+
+    db = tmp_path / "data" / "t.sqlite"
+    cache = BarCache(db, Client())
+    cache.update(["600001", "600002", "600003"], days[-1].date())
+    cache.save_index("sh000300", pd.Series(range(4000, 4000 + len(days)), index=days, dtype=float))
+    monkeypatch.setattr(run_eval, "get_settings", lambda: SimpleNamespace(db_path="data/t.sqlite", root=tmp_path))
+    monkeypatch.setattr(ev, "SPLITS", {"train": (days[62].date(), days[74].date()),
+                                       "val": (days[75].date(), days[84].date()),
+                                       "holdout": (days[85].date(), None)})
+    out = io.StringIO()
+    assert run_eval.main(["baseline_momo"], out=out) == 0, out.getvalue()
+    rep = json.loads(out.getvalue())
+    assert "gate_pass" in rep and Store(db).trial_count() == 1
 ```
 
 **Step 2: 运行，确认失败**
@@ -6017,7 +6293,7 @@ DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins"
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
             "to_feather", "to_html", "to_clipboard", "to_string", "to_latex", "to_xml", "to_stata",
             "to_markdown", "load", "loadtxt", "save", "savez", "savetxt", "fromfile", "tofile",
-            "genfromtxt", "fromregex", "memmap", "DataSource", "open", "write_text", "write_bytes",
+            "genfromtxt", "fromregex", "memmap", "DataSource", "write_text", "write_bytes",
             "read_text", "read_bytes", "unlink", "mkdir", "touch", "rmdir", "iterdir", "glob", "rglob"}
 
 
@@ -6128,6 +6404,9 @@ def check_source(src: str) -> list[str]:
                 out.append(f"第 {line} 行: 禁止访问含双下划线的属性 {node.attr}")
             elif node.attr.startswith("read_") or node.attr in IO_ATTRS:
                 out.append(f"第 {line} 行: 禁止文件读写 {node.attr}")
+            elif node.attr == "open" and isinstance(parent.get(node), ast.Call) and parent[node].func is node:
+                # 只拦调用（path.open(...)）；r.open、bar.open 是开盘价
+                out.append(f"第 {line} 行: 禁止文件读写 open()（读开盘价用 h[\"open\"] 或 bar.open 不受影响）")
             elif node.attr in DYNAMIC_ATTRS:
                 hint = {"format": "，拼字符串用 f-string", "format_map": "，拼字符串用 f-string",
                         "api": "，判断类型用 isinstance", "seterr": "，忽略数值警告用 np.errstate",
@@ -6246,7 +6525,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：82 passed（sandbox 62 + run_eval 20；读写文件属性逐项的参数化测试含 37 个用例，self 绑定的参数化测试含 9 个用例）。
+预期：83 passed（sandbox 62 + run_eval 21；读写文件属性逐项的参数化测试含 36 个用例，self 绑定的参数化测试含 9 个用例）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -6254,7 +6533,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：132 passed。
+预期：147 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -7473,11 +7752,12 @@ class FakeAk:
         return pd.DataFrame({"code": ["600000", "999999"], "name": ["股600000", "某股"],
                              "title": ["关于股东减持计划的公告", "无关公告"], "type": ["减持", "其他"]})
 
-    def spot(self):
+    def spot(self, codes=None):
         self.calls.append(("spot",))
+        self.spot_codes = None if codes is None else list(codes)
         if self.spot_fail:
             raise RuntimeError("spot down")
-        codes = [c for c in CODES if c not in self.missing]
+        codes = [c for c in (CODES if codes is None else codes) if c not in self.missing]
         opens = [self.opens.get(c, 10.2) for c in codes]
         return pd.DataFrame({"code": codes, "name": [f"股{c}" for c in codes], "open": opens,
                              "prev_close": [self.prevs.get(c, 10.0) for c in codes],
@@ -7747,7 +8027,7 @@ def test_finalize_confirm_vetoes_but_never_adds(store):
     assert call["effort"] == "low" and call["essential"] is True and call["max_budget_usd"] == 0.3
     assert call["timeout"] == premarket.AUCTION_TIMEOUT == 90.0
     for s in ("600001", "600003", "竞价 10.20（+2.00%）", "500.00万", "占20日均额 2.50%", "涨停 11.00",
-              "计划理由600002", "偏强", "高开 20"):
+              "计划理由600002", "偏强", "有竞价 6 只：高开 6"):  # 竞价概况只统计候选（只取候选的报价）
         assert s in call["user"], s
     assert "600004" not in call["user"] and "600000" not in call["user"]  # 只列出通过过滤且在 max_picks 内的
 
@@ -7791,7 +8071,7 @@ def test_run_final_fetches_spot_once_saves_both_and_pushes_only_active(store):
                    "auction:candidate": check({}, note="")})
     ak, notifier = FakeAk(), Recorder()
     premarket.run_final(D, settings(), store, llm, ak, notifier, CAL)
-    assert ak.spot_calls() == 1
+    assert ak.spot_calls() == 1 and ak.spot_codes == [p.code for p in store.load_candidates(D)[0]]  # 只取候选
     act, act_meta = store.load_recommendation(D, "h:active")
     cand, cand_meta = store.load_recommendation(D, "h:candidate")
     assert [p.code for p in act] == ["600001"] and [p.code for p in cand] == ["600003"]
@@ -7975,7 +8255,7 @@ AUCTION_SYSTEM = """你是 A 股集合竞价复核员。08:30 的盘前深度分
 1. 竞价成交额占 20 日均额的比例明显低于同批其他股票，说明资金不认可。
 2. 竞价价距涨停价不足 2%，开盘可能直接封板，上行空间也有限。
 3. 竞价表现与盘前理由的前提明显矛盾，例如盘前预期温和高开，实际却放量低开。
-4. 全市场竞价明显偏弱（低开家数远多于高开家数，中位竞价涨幅低于 -1%），且该股缺乏独立的支撑理由。
+4. 候选整体竞价明显偏弱（低开家数远多于高开家数，中位竞价涨幅低于 -1%），且该股缺乏独立的支撑理由。
 
 没有明确负面证据时一律 keep。只依据输入中的数字和文字判断，不要编造新闻或数据。如果输入注明竞价数据缺失，就只依据盘前分析判断，并在 note 中说明。
 
@@ -8164,7 +8444,7 @@ def _auction_prompt(d: dt.date, plan: PremarketPlan, prelim: list[Pick], ctx: di
     planned = {pp.code.strip(): pp for pp in plan.picks}
     lines = [f"# 交易日 {d.isoformat()}（09:25 集合竞价已结束）", "",
              "## 盘前市场观点", plan.market_view or "（无）", "",
-             "## 全市场竞价", _breadth(spot), "",
+             "## 候选整体竞价", _breadth(spot), "",
              f"## 通过竞价条件的股票（{len(prelim)} 只，按盘前信心排序）"]
     for p in prelim:
         pp, row, s = planned[p.code], rows.get(p.code), stats.get(p.code, {})
@@ -8302,7 +8582,7 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
     cands, ctx = _load_candidates(d, store)
     plan = load_plan(store, d, playbook_kind)
     if plan is not None and spot is None:
-        spot = _safe(client.spot, None)
+        spot = _safe(lambda: client.spot([p.code for p in cands]), None)
     cands, plan = _ex_adjust(cands, plan, ctx, spot)
     base = _rule_result(settings, plan, cands, spot)
     if plan is None or not base[0]:
@@ -8323,11 +8603,12 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
     return picks, True, plan.market_view + (f"（竞价确认：{note}）" if note else "")
 
 
-def _fetch_spot(client: AkClient, timeout: float) -> pd.DataFrame:
-    """在守护线程里拉一次竞价快照，最多等 timeout 秒；失败或超时返回空表（按竞价数据缺失处理）。"""
+def _fetch_spot(client: AkClient, timeout: float, codes: list[str]) -> pd.DataFrame:
+    """在守护线程里拉一次候选的竞价快照（逐只取个股报价，几秒内完成；全市场快照要将近一分钟），
+    最多等 timeout 秒；失败或超时返回空表（按竞价数据缺失处理）。"""
     box: list[pd.DataFrame | None] = []
-    worker = threading.Thread(target=lambda: box.append(_safe(client.spot, None)), name="premarket-spot",
-                              daemon=True)
+    worker = threading.Thread(target=lambda: box.append(_safe(lambda: client.spot(codes), None)),
+                              name="premarket-spot", daemon=True)
     worker.start()
     worker.join(timeout)
     if not box or box[0] is None:
@@ -8344,7 +8625,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
     plans = {k: load_plan(store, d, k) for k in KINDS}
     spot = pd.DataFrame()  # 两路都没有计划时用不到快照
     if any(p is not None for p in plans.values()):
-        spot = _fetch_spot(client, min(SPOT_TIMEOUT, max(0.0, deadline - time.monotonic())))
+        spot = _fetch_spot(client, min(SPOT_TIMEOUT, max(0.0, deadline - time.monotonic())), [p.code for p in cands])
     fallback = {k: _rule_result(settings, *reversed(_ex_adjust(cands, plans[k], ctx, spot)), spot) for k in KINDS}
     timeout = min(AUCTION_TIMEOUT, max(1.0, deadline - time.monotonic()))
     pool = cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="premarket")
@@ -10273,7 +10554,7 @@ class FakeClient:
     """AkClient 替身。current 指定"今天"，spot() 按该日开盘价返回竞价/盘中快照。"""
 
     def __init__(self, dates, panel, names, index):
-        self.dates, self.panel, self.names, self.index = list(dates), panel, names, index
+        self.dates, self.panel, self.name_map, self.index = list(dates), panel, names, index
         self.current: date | None = None
         self.calls: dict[str, int] = {}
         self.spot_df: pd.DataFrame | None = None  # 若设置则 spot() 直接返回它
@@ -10291,16 +10572,21 @@ class FakeClient:
     def index_daily(self, symbol="sh000300"):
         return self.index.copy()
 
-    def spot(self):
+    def names(self):
+        self._hit("names")
+        return dict(self.name_map)
+
+    def spot(self, codes=None):
         self._hit("spot")
         if self.spot_df is not None:
-            return self.spot_df.copy()
+            df = self.spot_df.copy()
+            return df if codes is None else df[df["code"].isin(list(codes))].reset_index(drop=True)
         ts = pd.Timestamp(self.current)
         rows = []
         for c, df in self.panel.items():
-            if ts in df.index:
+            if (codes is None or c in codes) and ts in df.index:
                 r = df.loc[ts]
-                rows.append({"code": c, "name": self.names[c], "open": r["open"],
+                rows.append({"code": c, "name": self.name_map[c], "open": r["open"],
                              "prev_close": r["prev_close"], "last": r["open"],
                              "pct": (r["open"] / r["prev_close"] - 1) * 100,
                              "volume": r["volume"] / 50, "amount": r["amount"] / 50,
@@ -10876,8 +11162,7 @@ def main(now: datetime | None = None) -> dict:
 
     codes = sorted(client.universe())
     store.kv_set("universe", codes)
-    spot = client.spot()
-    cache.set_names({str(c): str(n) for c, n in zip(spot["code"], spot["name"])})
+    cache.set_names(client.names())  # 交易所列表：一次请求，含 ST 前缀；全市场快照要将近一分钟
     cache.update(codes, end=now.date(), start_default=HISTORY_START)
     cache.save_index(common.INDEX_SYMBOL, client.index_daily(common.INDEX_SYMBOL))
 
@@ -11376,6 +11661,13 @@ def test_new_positions_get_dividend_records_for_tomorrow(env):
     assert held and held <= set(cache.divs)  # 结算完再刷新一次：供次日盘中监控换算
 
 
+def test_names_refreshed_daily(env):
+    dates, cache = env["dates"], env["cache"]
+    env["client"].names = lambda: {**NAMES, "600001": "ST测试"}  # 收盘后戴帽
+    settle.main(now=at(dates[101], 16))
+    assert cache.names["600001"] == "ST测试"
+
+
 def test_promotion_events_are_notified(env, monkeypatch):
     dates = env["dates"]
     monkeypatch.setattr(promotion, "decide",
@@ -11441,6 +11733,10 @@ def tracked_codes(store) -> list[str]:
 def refresh_data(codes: list[str], end: date, client, cache) -> None:
     cache.update(codes, end=end)
     cache.save_index(common.INDEX_SYMBOL, client.index_daily(common.INDEX_SYMBOL))
+    try:  # 每天刷新简称：新纳入的成分股、新戴帽的股票（基线策略按名称排除 ST）
+        cache.set_names(client.names())
+    except Exception:  # noqa: BLE001 - 名称取不到不影响结算，沿用旧名称
+        common.log.exception("refresh names failed")
 
 
 def refresh_dividends(store, client, cache, d: date | None = None) -> list[str]:
@@ -11672,7 +11968,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：31 passed。
+预期：32 passed。
 
 **Step 5: 提交**
 
@@ -12099,8 +12395,9 @@ class SpotClient:
     def __init__(self, rows):
         self.df, self.n = pd.DataFrame(rows), 0
 
-    def spot(self):
+    def spot(self, codes=None):
         self.n += 1
+        self.codes = codes
         return self.df.copy()
 
 
@@ -12138,6 +12435,7 @@ def test_stop_target_zhaban_alerts_deduped_per_day():
     assert "触发止盈" in text and "600002" in text
     assert "炸板" in text and "600003" in text
     assert "600004" not in text
+    assert client.codes == ["600001", "600002", "600003", "600004"]  # 只取持仓的报价
     assert check_once(D, store, client, n) == []          # 同日同事件不重复
     assert len(n.sent) == 3
     assert len(check_once(date(2026, 10, 19), store, client, n)) == 3  # 新的一天重新计
@@ -12253,7 +12551,7 @@ def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
     acc = store.load_account(ACCOUNT)
     if acc is None or not acc.positions:
         return []
-    rows = {str(r["code"]): r for r in client.spot().to_dict("records")}
+    rows = {str(r["code"]): r for r in client.spot(list(acc.positions)).to_dict("records")}  # 只取持仓
     key = f"monitor_sent:{d.isoformat()}"
     sent = set(store.kv_get(key) or [])
     out = []
@@ -12678,7 +12976,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 74 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 31、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 75 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 32、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
