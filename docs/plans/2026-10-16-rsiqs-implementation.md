@@ -6358,8 +6358,9 @@ def test_missing_benchmark(tmp_path, monkeypatch):
     monkeypatch.setattr(run_eval, "get_settings",
                         lambda: SimpleNamespace(db_path=str(tmp_path / "empty.sqlite"), root=tmp_path))
     out = io.StringIO()
-    assert run_eval.main(["baseline_momo"], out=out) == 1
-    assert "sh000300" in json.loads(out.getvalue())["error"]
+    assert run_eval.main(["baseline_momo"], out=out) == run_eval.SETUP_EXIT  # 环境错误，与策略无关
+    msg = json.loads(out.getvalue())
+    assert "sh000300" in msg["error"] and msg["stage"] == "setup"
 
 
 def test_real_evaluation_is_not_voided(tmp_path, monkeypatch):
@@ -6607,7 +6608,14 @@ def _rules_state() -> tuple:
             pd.concat, pd.DataFrame.__init__)
 
 
-def run(name: str) -> dict:
+SETUP_EXIT = 3  # 评估环境本身出错（配置、缓存、数据库），与策略无关：调用方不计入试验
+
+
+class SetupError(RuntimeError):
+    """加载策略之前的准备步骤失败。"""
+
+
+def _setup():
     settings = get_settings()
     db = Path(settings.root) / settings.db_path
     store = Store(db)
@@ -6617,7 +6625,14 @@ def run(name: str) -> dict:
         raise RuntimeError(f"缓存中没有基准指数 {BENCHMARK}，请先运行 python -m jobs.bootstrap")
     calendar = TradingCalendar(ts.date() for ts in bench.index)
     panel, names = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
-    benchmark_nav = bench / bench.iloc[0]
+    return store, calendar, panel, names, bench / bench.iloc[0]
+
+
+def run(name: str) -> dict:
+    try:
+        store, calendar, panel, names, benchmark_nav = _setup()
+    except Exception as e:  # noqa: BLE001 — 统一标成环境错误
+        raise SetupError(f"{type(e).__name__}: {e}") from e
     before = _rules_state()  # 先取快照再加载策略：策略模块的顶层代码也可能改动评估规则
     strategy = load_strategy(name)
     report = evaluate(strategy, name, panel, names, calendar, benchmark_nav, store)
@@ -6639,6 +6654,10 @@ def main(argv: list[str] | None = None, out=None) -> int:
         result = run(argv[0])
     except KeyboardInterrupt:
         raise
+    except SetupError as e:
+        logging.exception("评估 %s 的准备步骤失败", argv[0])
+        print(json.dumps({"error": f"评估环境出错：{e}", "stage": "setup"}, ensure_ascii=False), file=out)
+        return SETUP_EXIT
     except BaseException as e:  # noqa: BLE001 - 含策略抛出的 SystemExit：任何失败都要以 JSON 回传给 agent
         logging.exception("评估 %s 失败", argv[0])
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), file=out)
@@ -7604,17 +7623,38 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
 
 
-def test_git_commit_has_timeout_and_skips_signing(tmp_path, monkeypatch):
-    calls = []
+def test_git_commit_timeout_kills_process_tree_and_skips_hooks(monkeypatch):
+    started, killed = [], []
 
-    def fake_run(args, **kw):
-        calls.append((args, kw))
-        raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+    class HangingGit:
+        pid = 4242
 
-    monkeypatch.setattr(playbook.subprocess, "run", fake_run)
+        def __init__(self, args, **kw):
+            started.append((args, kw))
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("git", timeout)
+            return -9
+
+    monkeypatch.setattr(playbook.subprocess, "Popen", HangingGit)
+    monkeypatch.setattr(playbook, "_kill_tree", lambda proc: killed.append(proc.pid))
     assert playbook.git_commit(["playbook/active.json"], "m") is False  # 超时不抛异常
-    args, kw = calls[0]
-    assert kw["timeout"] == playbook.GIT_TIMEOUT and "commit.gpgsign=false" in args
+    args, kw = started[0]
+    assert "commit.gpgsign=false" in args and any(a.startswith("core.hooksPath=") for a in args)
+    assert kw["stdout"] is not subprocess.PIPE and killed == [4242]  # 输出不走管道；超时后结束整个进程树
+
+
+def test_git_commit_skips_hooks_in_real_repo(tmp_path, monkeypatch):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "t")
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")  # 会让提交失败的钩子
+    monkeypatch.setattr(playbook, "ROOT", tmp_path)
+    monkeypatch.setattr(playbook, "NO_HOOKS", tmp_path / ".no-hooks")
+    (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+    assert playbook.git_commit(["a.json"], "playbook: 测试") is True
 
 
 def test_git_commit_outside_repo_returns_false(tmp_path, monkeypatch):
@@ -7653,6 +7693,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -7789,14 +7830,20 @@ def _ran_without_playbook(store: Store, d: dt.date) -> bool:
     return False
 
 
+def reset_window_if_degraded(store: Store, d: dt.date) -> bool:
+    """任一份 playbook 损坏，或 d 日盘前有一路按空规则运行时，把发布窗口起点移到 d，返回 True。
+    损坏期间盘前按空规则交易，这段净值不能用来比较两版规则；看盘前实际用的版本，不只看复盘时的文件：
+    白天修好的那天，盘前用的仍是空规则。复盘回补较早的日子时也要逐日调用。"""
+    if corrupt_kinds() or _ran_without_playbook(store, d):
+        store.kv_set(RELEASE_KEY, d.isoformat())
+        return True
+    return False
+
+
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
-    if corrupt_kinds() or _ran_without_playbook(store, today):
-        # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
-        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始。
-        # 看盘前实际用的版本，不只看复盘时的文件：白天修好的那天，盘前用的仍是空规则
-        store.kv_set(RELEASE_KEY, today.isoformat())
-        return None
+    if reset_window_if_degraded(store, today):
+        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     last = store.kv_get(RELEASE_KEY)
     if last is None:
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -7825,24 +7872,47 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
 
 
 GIT_TIMEOUT = 60  # 秒：计划任务里没有人能输入口令，钩子或签名卡住时不能挡住日报
+NO_HOOKS = ROOT / ".git-no-hooks"  # 不存在的目录：core.hooksPath 指向它，所有钩子都不跑
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":  # git.exe 可能已经起了子进程：连同子进程一起结束
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
+    proc.wait()
+
+
+def _git(*args) -> tuple[int, str]:
+    """运行一次 git：不签名、不跑任何钩子；输出写临时文件而不是管道（残留的子进程不会挡住等待），
+    超时就结束整个进程树并抛 TimeoutExpired。"""
+    cmd = ["git", "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={NO_HOOKS}", *args]
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=out, stdin=subprocess.DEVNULL)
+        try:
+            code = proc.wait(timeout=GIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            raise
+        out.seek(0)
+        return code, out.read().decode("utf-8", "replace")
 
 
 def git_commit(paths: list[str], message: str) -> bool:
-    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。
-    计划任务里不签名、不跑钩子（-c commit.gpgsign=false、--no-verify），每次调用都有超时。"""
-    def git(*args, check=True):
-        return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=ROOT, check=check,
-                              capture_output=True, timeout=GIT_TIMEOUT)
-
+    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。"""
     try:
-        git("add", "--", *paths)
-        if git("diff", "--cached", "--quiet", "--", *paths, check=False).returncode == 0:
+        code, text = _git("add", "--", *paths)
+        if code == 0:
+            code, text = _git("diff", "--cached", "--quiet", "--", *paths)
+            if code == 0:
+                return False  # 没有变化
+            code, text = _git("commit", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
+        if code != 0:
+            log.warning("git commit failed (exit %s): %s", code, text[-500:])
             return False
-        git("commit", "--no-verify", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
         return True
     except (OSError, subprocess.SubprocessError) as e:
-        err = getattr(e, "stderr", None) or b""
-        log.warning("git commit failed: %s %s", e, err.decode("utf-8", "replace")[-500:])
+        log.warning("git commit failed: %s（如果留下了 .git/index.lock，确认没有 git 在运行后手动删除）", e)
         return False
 ```
 
@@ -7966,7 +8036,7 @@ def git_commit(paths: list[str], message: str) -> bool:
 uv run pytest tests/test_playbook.py -v
 ```
 
-预期：29 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
+预期：30 passed（`test_git_commit_*` 需要本机 PATH 中有 git）。
 
 **Step 5: 提交**
 
@@ -9477,6 +9547,15 @@ def test_commit_counts_only_effective_changes(env):
     assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
 
 
+def test_backfilled_day_shows_holdings_at_that_close(env):
+    llm = FakeLLM(ReviewOutput(summary="s", lessons=[]))
+    review.run_review(PREV, settings(), env["store"], llm, env["cache"], env["notifier"], CAL, latest=False,
+                      release=None)
+    user = llm.calls[0]["user"]
+    assert "600009 100 股（按成交回放" in user  # PREV 收盘时持有 600009
+    assert "600001 1000 股" not in user          # D 才买入
+
+
 def test_git_failure_is_noted_in_report(env, monkeypatch):
     monkeypatch.setattr(playbook, "git_commit", lambda paths, message: False)
     run(env, FakeLLM(OUTPUT))
@@ -9586,13 +9665,24 @@ class ReviewOutput(BaseModel):
     lessons: list[Lesson]
 
 
-def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], set[str]]:
+def _holdings_at(acc, d: dt.date) -> dict[str, int]:
+    """按成交回放 d 日收盘时的持股（回补较早的日子时用；不计之后的送转）。"""
+    qty: dict[str, int] = {}
+    for t in acc.trades:
+        if t.date <= d:
+            qty[t.code] = qty.get(t.code, 0) + (t.qty if t.side == "BUY" else -t.qty)
+    return {c: q for c, q in qty.items() if q > 0}
+
+
+def _account_section(store: Store, d: dt.date, name: str, latest: bool = True) -> tuple[list[str], set[str]]:
+    """latest=False 表示回补较早的日子：账户已经结算到更晚的日子，收盘持仓按成交回放到 d。"""
     rec = store.load_recommendation(d, name)
     acc = store.load_account(name)
     fills = [t for t in acc.trades if t.date == d] if acc else []
-    positions = list(acc.positions.values()) if acc else []
+    positions = list(acc.positions.values()) if acc and latest else []
+    held = {} if acc is None or latest else _holdings_at(acc, d)
     codes = {p.code for p in rec[0]} if rec else set()
-    codes |= {t.code for t in fills} | {p.code for p in positions}
+    codes |= {t.code for t in fills} | {p.code for p in positions} | set(held)
     lines = [f"## 账户 {name}"]
     if rec is None:
         lines.append("推荐：（当日无推荐）")
@@ -9606,8 +9696,11 @@ def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], se
     lines += [f"- {t.side} {t.code} {t.qty} 股 @ {t.price:.2f}，费用 {t.fee:.2f}，{t.reason or '开盘成交'}"
               for t in fills] or ["（无）"]
     lines.append("### 收盘持仓")
-    lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
-              f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
+    if latest:
+        lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
+                  f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
+    else:
+        lines += [f"- {c} {q} 股（按成交回放，未计之后的送转）" for c, q in sorted(held.items())] or ["（空仓）"]
     return lines, codes
 
 
@@ -9666,12 +9759,14 @@ def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) ->
 
 
 def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: BarCache, notifier,
-               calendar: TradingCalendar) -> None:
+               calendar: TradingCalendar, latest: bool = True, release: str | None | bool = True) -> None:
+    """latest=False：回补较早的日子，持仓按成交回放到 d。release=True 时按 d 判断是否发布；
+    传入字符串或 None 时表示调用方已经判断过（回补时先判断发布、再写各天的 lesson），这里直接沿用。"""
     sections: list[str] = []
     codes: set[str] = set()
     has_rec = False
     for name in LLM_ACCOUNTS:
-        lines, c = _account_section(store, d, name)
+        lines, c = _account_section(store, d, name, latest)
         sections += lines
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
@@ -9679,7 +9774,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
     bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
+    if release is True:
+        release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
     parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
@@ -9724,7 +9820,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
 uv run pytest tests/test_review.py -v
 ```
 
-预期：20 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
+预期：21 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
 
 ```
 uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py tests/test_review.py -v
@@ -10008,6 +10104,20 @@ def test_evaluate_timeout(written):
     assert store.trial_count() == 1 and trial["gate_pass"] is False and trial["holdout_pass"] is None
 
 
+def test_evaluate_setup_error_is_not_counted(written):
+    settings, store = written
+    stdout = '{"error": "评估环境出错：RuntimeError: 缓存中没有基准指数", "stage": "setup"}\n'
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(stdout, returncode=3))
+    assert out["ok"] is False and "评估环境出错" in out["error"] and store.trial_count() == 0
+
+
+def test_incomplete_trial_is_labelled_in_context(env):
+    settings, store = env
+    store.add_trial("slow_one", {"incomplete": "评估超时（1800 秒）"}, None, None, False, None)
+    ctx = build_context(settings, store)
+    assert "slow_one：评估未完成" in ctx and "slow_one：train" not in ctx
+
+
 def test_evaluate_cannot_start_is_not_counted(written):
     settings, store = written
 
@@ -10188,6 +10298,7 @@ from pydantic import BaseModel
 from config import Settings
 from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.store import Store
+from engine.run_eval import SETUP_EXIT
 from strategies.base import NAME_RE, RESERVED
 from strategies.sandbox import ALLOWED_IMPORTS, check_source
 
@@ -10267,6 +10378,9 @@ def _trial_line(store: Store, t: dict) -> str:
     hyp = _hypothesis(store, t["strategy"])[:120]
     if store.kv_get(f"research:voided:{t['strategy']}"):  # 作废会把门槛和 holdout 记为未通过，这里如实说明
         return (f"- {t['ts'][:10]} {t['strategy']}：已作废（评估期间 engine/ 校验不符），结果不代表策略本身"
+                + (f"；假设：{hyp}" if hyp else ""))
+    if (t.get("params") or {}).get("incomplete"):  # 超时或出错时补记的试验
+        return (f"- {t['ts'][:10]} {t['strategy']}：评估未完成（超时或出错），不代表假设本身"
                 + (f"；假设：{hyp}" if hyp else ""))
     ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     return (f"- {t['ts'][:10]} {t['strategy']}：train 夏普 {f(t['train_sharpe'])}，val 夏普 "
@@ -10414,6 +10528,9 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
     except OSError as e:
         return {"ok": False, "report": None, "error": f"无法启动评估进程：{e}", "count": False}
     report = _last_json_line(proc.stdout)
+    if proc.returncode == SETUP_EXIT and report and report.get("stage") == "setup":
+        return {"ok": False, "report": None, "error": str(report.get("error", "评估环境出错"))[:EVAL_ERROR_CHARS],
+                "count": False}  # 与策略无关的环境错误不计入试验
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
             detail = str(report["error"])[:EVAL_ERROR_CHARS]
@@ -10444,7 +10561,7 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
 uv run pytest tests/test_research_tools.py -v
 ```
 
-预期：41 passed。
+预期：43 passed。
 
 **Step 5: 提交**
 
@@ -10946,6 +11063,7 @@ from agents.premarket import HISTORY_DAYS
 from config import Settings
 from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
+from engine.run_eval import SETUP_EXIT
 from engine.store import Store
 from notify.format import format_alert
 from strategies.base import NAME_RE, RESERVED
@@ -11245,7 +11363,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
 uv run pytest tests/test_research_tools.py tests/test_research_loop.py -v
 ```
 
-预期：68 passed（tools 34 + loop 17）。
+预期：70 passed（tools 34 + loop 17）。
 
 **Step 5: 提交**
 
@@ -11284,7 +11402,7 @@ uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research
 > - 行情缓存 `BarCache` 与 `Store` 共用 `settings.db_path` 同一个 sqlite 文件（不同表），其他部分（如 `engine.run_eval`）按同一路径构造即可读到缓存。
 > - `bootstrap` 若 `kv "playbook_released"` 不存在，则写入锚定日 ISO 字符串（视为 v1 的发布日），保证 `maybe_release` 的 10 个交易日间隔从启动日起算。
 > - `monitor` 去重键持久化在 `kv "monitor_sent:<ISO日期>"`（进程重启不重复告警）；`check_once(d, store, client, notifier, cache=None) -> list[str]`（cache 提供分红送转记录，除权除息日按换算后的价位判断）。
-> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟），唤醒或开机后两者同时补跑时不会因为结算还没完成而跳过。最近一天之前已结算、还没复盘的连续交易日一起回补（最多 3 天，按日期顺序），例如结算为等分红记录暂停后一次补完多天。
+> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟）；两者同时启动、Settle 还没拿到锁时，再轮询最多 2 分钟，唤醒或开机后同时补跑时不会因为结算还没完成而跳过。最近 3 个交易日里已结算、还没复盘的日子一起回补（按日期顺序，某天失败就停，下次从这一天接着补），例如结算为等分红记录暂停后一次补完多天。回补时先逐日检查发布窗口，再按最近一天决定是否发布，都在写任何一天的 lesson 之前（回补期间新写的规则没有前向模拟过）；较早日子的收盘持仓按成交回放。
 > - 盘前扫描和结算给策略同样长的历史（`agents.premarket.HISTORY_DAYS` = 550 个自然日，约 370 个交易日），同一现任策略两处选出的股票一致；研究提示词写明上线后可用的历史长度。现任策略一只都没选出来时，`premarket_scan` 推一条"盘前没有候选"。
 > - 盘前分两段。`jobs.premarket_scan`（08:30）在同一个 `run_job("premarket_scan")` 里先跑 `premarket.scan`，再跑 `premarket.run_analyze`（active/candidate 两路深度分析并行，计划存 `kv "plan:<ISO日期>:<kind>"`）。分析失败（包括 `run_analyze` 本身抛异常）不算任务失败：任务照样记 ok，只推一条"盘前分析未完成"告警。启动时已过 09:25（开机补跑）则只扫描、不分析，因为定稿已经开始，计划用不上，不必白花钱。
 > - `jobs.premarket_final` 的计划任务 09:25 触发。入口先判断交易日和是否过时（晚于 09:35 跳过），再等到 09:25:15（竞价快照落定）后定稿；非交易日、过时都不等待。若当日 `premarket_scan` 未完成（开机晚或 08:30 扫描失败），先内联补跑扫描：只扫描不分析，同样记为 `premarket_scan` 完成。此时两路都没有计划，`run_final` 退回量化推荐。补跑扫描在守护线程里跑，最晚到 09:27（09:27 之后才开始时至少给 90 秒，但不晚于 09:33），超时按扫描失败告警；扫描完已过 09:35 时只推"已过时"告警。等到 09:25:15 的秒数扣掉装配依赖花的时间。
@@ -12712,6 +12830,32 @@ def test_warnings_before_a_pause_are_not_lost(env, monkeypatch):
     monkeypatch.setattr(settle, "settle_day", real_run)
 
 
+def test_paused_day_warnings_pushed_once_per_day(env, monkeypatch):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    store.set_status("broken_one", "shadow", dates[100])
+    real = settle.load_strategy
+    monkeypatch.setattr(settle, "load_strategy",
+                        lambda name: (_ for _ in ()).throw(ImportError("坏策略")) if name == "broken_one" else real(name))
+    out_pick = Pick(code="600010", name=NAMES["600010"], score=1.0, entry_max=999.0, stop=0.01, target=999.0,
+                    hold_days=5, reason="测试")
+    store.save_recommendation(dates[101], "h:candidate", [out_pick], {"llm_reviewed": True})
+    cache.raw_fail = {"600010"}  # h:candidate 取不到不复权日线：每次重试都在这里暂停
+    for hh in (16, 17, 18):
+        assert settle.main(now=at(dates[101], hh)) == []
+    assert sum("broken_one" in str(m) for m in env["notifier"].sent) == 1
+
+
+def test_settle_history_window_starts_from_asof(env, monkeypatch):
+    dates, cache = env["dates"], env["cache"]
+    starts = []
+    real = cache.load_panel
+    monkeypatch.setattr(cache, "load_panel", lambda codes, a, b: starts.append(a) or real(codes, a, b))
+    settle.main(now=at(dates[101], 16))
+    from agents.premarket import HISTORY_DAYS
+    from datetime import timedelta
+    assert starts[0] == dates[100] - timedelta(days=HISTORY_DAYS)  # 与盘前扫描相同（asof - HISTORY_DAYS）
+
+
 def test_retired_account_not_tracked(env):
     dates, store = env["dates"], env["store"]
     settle.main(now=at(dates[101], 16))
@@ -13018,7 +13162,9 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     codes = tracked_codes(store)
     # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
     recs = recommended_codes(store, [d])
-    panel, names = cache.load_panel(sorted(set(codes) | recs), d - timedelta(days=LOOKBACK_CAL_DAYS), d)
+    asof = calendar.prev_day(d)
+    # 与盘前扫描一样从 asof 往前取 LOOKBACK_CAL_DAYS 个自然日：同一策略两处看到的历史行数相同
+    panel, names = cache.load_panel(sorted(set(codes) | recs), asof - timedelta(days=LOOKBACK_CAL_DAYS), d)
     qfq_bars = bars_for_day(panel, names, d)
     if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
         raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(qfq_bars)}/{len(codes)}，数据可能未更新")
@@ -13026,7 +13172,6 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     index = cache.load_index(common.INDEX_SYMBOL)
     bench_equity = settings.capital * _index_close(index, d) / _index_close(index, bench_start)
 
-    asof = calendar.prev_day(d)
     # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合。选股范围是股票池加持仓，不含当天 LLM 推荐的代码
     tracked = set(codes)
     view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
@@ -13118,14 +13263,22 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     return warnings
 
 
+def _send_warnings(d: date, warnings: list[str], store, notifier, today: date) -> None:
+    """推送结算警告；同一结算日的同一条警告每个自然日只推一次（暂停期间每 20 分钟重试会重新生成）。"""
+    key = f"settle_warned:{d.isoformat()}:{today.isoformat()}"
+    sent = set(store.kv_get(key) or [])
+    new = [w for w in dict.fromkeys(warnings) if w not in sent]
+    if new and notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(new))):
+        store.kv_set(key, sorted(sent | set(new)))
+
+
 def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset(),
                       run_date: date | None = None) -> None:
     warnings: list[str] = []
     try:
         settle_day(d, settings, store, cache, calendar, div_failed, run_date, warnings=warnings)
     finally:  # 暂停时已结算账户的警告（除权调整等）也要推出去：重跑时这些账户会跳过，不再生成
-        if warnings:
-            notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
+        _send_warnings(d, warnings, store, notifier, run_date or common.today())
     for ev in promotion.decide(store, d, calendar):
         notifier.send_text(format_alert(f"策略{KIND_CN.get(ev.kind, ev.kind)}",
                                         f"{ev.strategy}：{ev.detail}"))
@@ -13179,7 +13332,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：41 passed。
+预期：43 passed。
 
 **Step 5: 提交**
 
@@ -13235,6 +13388,7 @@ def env(tmp_path, monkeypatch):
     install_context(monkeypatch, make_settings(tmp_path), store, client, cache, cal(dates),
                     notifier)
     calls, analysis, analysis_kw = [], {"active": True, "candidate": True}, {}
+    review_kw, review_fail = [], set()
     scan_picks = [Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=10.5, stop=9.5,
                        target=11.5, hold_days=5, reason="候选")]
 
@@ -13251,8 +13405,12 @@ def env(tmp_path, monkeypatch):
     def fake_final(d, settings, store, llm, client, notifier, calendar):
         calls.append(("final", d, llm))
 
-    def fake_review(d, settings, store, llm, cache, notifier, calendar):
+    def fake_review(d, settings, store, llm, cache, notifier, calendar, latest=True, release=True):
+        if d in review_fail:
+            review_fail.discard(d)
+            raise RuntimeError("复盘失败")
         calls.append(("review", d, llm))
+        review_kw.append((d, latest, release))
 
     def fake_research(settings, store, notifier, llm=None):
         calls.append(("research", llm))
@@ -13265,7 +13423,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(research_agent, "run_research", fake_research)
     monkeypatch.setattr(common, "make_llm", lambda settings, store: "LLM")
     return dict(dates=dates, store=store, notifier=notifier, calls=calls, analysis=analysis,
-                slept=[], analysis_kw=analysis_kw, scan_picks=scan_picks)
+                slept=[], analysis_kw=analysis_kw, scan_picks=scan_picks, review_kw=review_kw,
+                review_fail=review_fail)
 
 
 def at(d, hh, mm=0, ss=0):
@@ -13484,6 +13643,43 @@ def test_review_backfills_settled_days_without_review(env):
     assert [c[1] for c in env["calls"]] == dates[8:11]  # 最多 3 天，按日期顺序
 
 
+def test_review_backfill_decides_release_before_any_lesson(env, monkeypatch):
+    import agents.playbook as pb
+
+    dates, order = env["dates"], []
+    for d in dates[8:11]:
+        env["store"].mark_job("settle", d, "ok")
+    monkeypatch.setattr(pb, "reset_window_if_degraded", lambda store, d: order.append(("check", d)) or False)
+    monkeypatch.setattr(pb, "maybe_release", lambda store, d, cal: order.append(("release", d)) or "发布消息")
+    assert review.main(now=at(dates[10], 16, 5)) is True
+    assert order == [("check", dates[8]), ("check", dates[9]), ("release", dates[10])]
+    assert env["review_kw"] == [(dates[8], False, None), (dates[9], False, None), (dates[10], True, "发布消息")]
+
+
+def test_review_backfill_stops_at_failure_and_resumes(env):
+    dates = env["dates"]
+    for d in dates[8:11]:
+        env["store"].mark_job("settle", d, "ok")
+    env["review_fail"].add(dates[9])
+    assert review.main(now=at(dates[10], 16, 5)) is False
+    assert [c[1] for c in env["calls"]] == [dates[8]]  # 按日期顺序：失败就停
+    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试接着补
+    assert [c[1] for c in env["calls"]] == dates[8:11]
+
+
+def test_review_waits_when_started_together_with_settle(env, monkeypatch, tmp_path):
+    d = env["dates"][10]
+    monkeypatch.setattr(common, "LOCK_DIR", tmp_path / "locks")
+    naps = []
+
+    def nap(sec):  # 等待期间 Settle 进程完成了结算
+        naps.append(sec)
+        env["store"].mark_job("settle", d, "ok")
+
+    assert review.main(now=at(d, 16, 5), sleep=nap) is True
+    assert naps and [c[1] for c in env["calls"]] == [d]
+
+
 def test_review_before_close_targets_previous_day(env):
     d = env["dates"][10]
     env["store"].mark_job("settle", env["dates"][9], "ok")
@@ -13503,6 +13699,16 @@ def test_research_runs_once_per_day_with_factory_llm(env):
     assert research.main(now=at(sat, 10)) == {"status": "ok"}
     assert research.main(now=at(sat, 11)) is None  # 当天已跑过
     assert env["calls"] == [("research", "LLM")]
+
+
+def test_review_retries_earlier_day_even_if_latest_done(env):
+    dates = env["dates"]
+    for d in dates[8:11]:
+        env["store"].mark_job("settle", d, "ok")
+    env["store"].mark_job("review", dates[8], "ok")
+    env["store"].mark_job("review", dates[10], "ok")  # 最近一天已复盘，dates[9] 之前失败过
+    assert review.main(now=at(dates[10], 16, 45)) is True
+    assert [c[1] for c in env["calls"]] == [dates[9]]
 ```
 
 **Step 2: 运行，确认失败**
@@ -13688,42 +13894,71 @@ if __name__ == "__main__":
 python -m jobs.review"""
 from __future__ import annotations
 
+import time as _time
 from datetime import datetime
 
+from agents import playbook
 from agents import review as review_agent
 from jobs import common
 
 SETTLE_WAIT_SEC = 1800  # 结算正在别的进程里跑（唤醒或开机后与 Settle 同时补跑）时最多等这么久
+START_GRACE_SEC = 120   # 两个任务同时启动时，Settle 可能还没拿到锁：这段时间内结算没完成就继续等
+POLL_SEC = 5
 MAX_BACKFILL = 3        # 最多复盘这么多个交易日（含当天）：结算暂停或开机晚时回补漏掉的日子
 
 
 def pending_reviews(store, calendar, last) -> list:
-    """从 last 往前：已结算、还没复盘的连续交易日（遇到已复盘或未结算的日子就停），按日期升序。"""
+    """last 及之前共 MAX_BACKFILL 个交易日里已结算、还没复盘的日子（遇到未结算的日子就停），按日期升序。"""
     days, d = [], last
-    while len(days) < MAX_BACKFILL and store.job_done("settle", d) and not store.job_done("review", d):
-        days.append(d)
+    for _ in range(MAX_BACKFILL):
+        if not store.job_done("settle", d):
+            break
+        if not store.job_done("review", d):
+            days.append(d)
         d = calendar.prev_day(d)
     return days[::-1]
 
 
-def main(now: datetime | None = None) -> bool:
+def _wait_for_settle(store, last, sleep) -> None:
+    """等正在跑的结算结束。只在有跨进程锁（真实运行）时等：测试里 LOCK_DIR 为 None，直接返回。"""
+    if common.LOCK_DIR is None:
+        return
+    grace_end = _time.monotonic() + START_GRACE_SEC
+    while not store.job_done("settle", last):
+        with common.job_lock("settle_main", wait=SETTLE_WAIT_SEC):
+            pass
+        if store.job_done("settle", last) or _time.monotonic() >= grace_end:
+            return
+        sleep(POLL_SEC)
+
+
+def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
     now = now or datetime.now()
     settings, store, client, cache, calendar, notifier = common.context()
     last = common.last_closed_day(now, calendar)
-    with common.job_lock("settle_main", wait=SETTLE_WAIT_SEC):
-        pass  # 等正在跑的结算结束，再看最近一天是否已结算
+    _wait_for_settle(store, last, sleep)
     if not store.job_done("settle", last):
         common.log.info("review %s: settle not done yet, skipped", last)
         return False
-    if store.job_done("review", last):
+    days = pending_reviews(store, calendar, last)
+    if not days:
         common.log.info("skip review %s (already ok)", last)
         return True
     llm = common.make_llm(settings, store)
-    ok = True
-    for d in pending_reviews(store, calendar, last):
-        ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
-            d, settings, store, llm, cache, notifier, calendar), store, notifier) and ok
-    return ok
+    release: str | None | bool = True
+    if len(days) > 1 or days[-1] != last:
+        # 回补：先逐日检查发布窗口、再按最近一天决定是否发布，都在写任何一天的 lesson 之前：
+        # 回补期间新写的规则没有前向模拟过，不能随这次发布上线
+        for d in days[:-1]:
+            playbook.reset_window_if_degraded(store, d)
+        release = playbook.maybe_release(store, days[-1], calendar)
+    for d in days:
+        msg = release if d == days[-1] else None
+        if not common.run_job("review", d, lambda d=d, msg=msg: review_agent.run_review(
+                d, settings, store, llm, cache, notifier, calendar, latest=(d == last), release=msg),
+                store, notifier):
+            return False  # 按日期顺序：这一天失败就停下，下次重试从这一天接着补
+    return True
 
 
 if __name__ == "__main__":
@@ -13765,7 +14000,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_entrypoints.py -v
 ```
-预期：26 passed（参数化的 4 个等待场景各算 1 个）。
+预期：30 passed（参数化的 4 个等待场景各算 1 个）。
 
 **Step 5: 提交**
 
@@ -13792,6 +14027,7 @@ from datetime import date, time
 
 import pandas as pd
 
+from engine.calendar import TradingCalendar
 from engine.ledger import Account, Position
 from engine.store import Store
 from jobs.monitor import check_once, in_session
@@ -13916,14 +14152,24 @@ class RawDivCache(DivCache):
         return self.last_close
 
 
+CAL = TradingCalendar(pd.bdate_range("2026-09-01", "2026-12-31").date)
+
+
 def test_unexplained_ex_gap_does_not_alert_stop():
     store = make_store(("600001", 9.3, 11.0))
     cache = RawDivCache({}, (date(2026, 10, 15), 10.0))  # 昨收 10.0，今天参考昨收 5.0：疑似 10 转 10，没有记录
-    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), cache)
+    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), cache, CAL)
     assert len(out) == 1 and "疑似除权" in out[0] and "触发止损" not in out[0]
     explained = RawDivCache({"600001": [(D, 0.0, 1.0)]}, (date(2026, 10, 15), 10.0))  # 有记录：按换算后的价位
     out = check_once(D, make_store(("600001", 9.3, 11.0)), SpotClient([row("600001", 4.5, 5.0, prev_close=5.0)]),
-                     NullNotifier(), explained)
+                     NullNotifier(), explained, CAL)
+    assert len(out) == 1 and "触发止损" in out[0]
+
+
+def test_stale_raw_close_is_not_taken_for_ex_rights():
+    store = make_store(("600001", 9.0, 11.0))
+    stale = RawDivCache({}, (date(2026, 10, 14), 10.0))  # 缓存停在前天：昨天正常跌 5% 不能当成除权
+    out = check_once(D, store, SpotClient([row("600001", 8.9, 9.6, prev_close=9.5)]), NullNotifier(), stale, CAL)
     assert len(out) == 1 and "触发止损" in out[0]
 
 
@@ -14010,12 +14256,13 @@ def _levels(pos, acc, cache, d: date) -> tuple[float, float]:
     return stop, target
 
 
-def _unexplained_ex(code: str, prev: float, cache, d: date) -> str:
-    """报价的参考昨收比缓存里最近的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。"""
-    if cache is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
+def _unexplained_ex(code: str, prev: float, cache, d: date, calendar) -> str:
+    """报价的参考昨收比上一交易日的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
+    缓存里最近的不复权收盘不是上一交易日的（前一天没结算到这只）时不判断：正常的大跌不能当成除权。"""
+    if cache is None or calendar is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
         return ""
     last = cache.last_raw_close(code, d - timedelta(days=1))
-    if last is None or prev >= last[1] * (1 - BIG_EX_GAP):
+    if last is None or last[0] != calendar.prev_day(d) or prev >= last[1] * (1 - BIG_EX_GAP):
         return ""
     if any(last[0] < ex <= d for ex, _, _ in cache.dividends(code)):
         return ""
@@ -14023,7 +14270,7 @@ def _unexplained_ex(code: str, prev: float, cache, d: date) -> str:
             "止损止盈未换算，今天暂不按它们提醒")
 
 
-def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
+def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> list[str]:
     """检查一次持仓，返回本次新发出的告警；(code, 事件) 去重键按日持久化在 kv。
     cache 提供分红送转记录：建仓后除权除息、结算还没调整的持仓按换算后的止损、止盈价判断。
     报价源没有返回的持仓每天记一次警告日志。"""
@@ -14049,7 +14296,7 @@ def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
             continue
         events = []
         stop, target = _levels(pos, acc, cache, d)
-        unexplained = _unexplained_ex(code, prev, cache, d)
+        unexplained = _unexplained_ex(code, prev, cache, d, calendar)
         if unexplained:  # 结算在等分红记录（疑似送转）：止损止盈没有换算，按旧价位判断会误报
             events.append(("疑似除权", unexplained))
         elif last <= stop:
@@ -14087,7 +14334,7 @@ def main(now: datetime | None = None, interval: float = INTERVAL_SEC) -> None:
             break
         if in_session(t.time()):
             try:
-                check_once(d, store, client, notifier, cache)
+                check_once(d, store, client, notifier, cache, calendar)
                 fails = 0
             except Exception as e:  # noqa: BLE001 — 单次失败不退出循环
                 fails += 1
@@ -14106,7 +14353,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_monitor.py -v
 ```
-预期：10 passed。
+预期：11 passed。
 
 **Manual smoke step（交易时段，联网）：** `uv run python -c "from jobs import common, monitor; s, st, c, _, _, n = common.context(); print(monitor.check_once(common.today(), st, c, n))"`，预期打印列表（无持仓时为 `[]`），且无异常；可再执行 `uv run python -c "from data.akshare_client import AkClient; print(AkClient().spot().columns.tolist())"` 确认 `high` 列存在（缺失时炸板判断自动跳过）。
 
@@ -14493,7 +14740,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 105 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 41、`test_jobs_entrypoints.py` 26、`test_jobs_monitor.py` 10、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 709 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 112 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 43、`test_jobs_entrypoints.py` 30、`test_jobs_monitor.py` 11、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 720 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
