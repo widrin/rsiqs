@@ -30,13 +30,14 @@ def main(now: datetime | None = None) -> dict:
         common.log.exception("names() failed, falling back to spot()")
         spot = client.spot()
         cache.set_names({str(c): str(n) for c, n in zip(spot["code"], spot["name"])})
-    cache.update(codes, end=now.date(), start_default=HISTORY_START)
+    # 只取到已收盘的锚定日：盘中运行时，当天未收盘的 K 线会留在缓存里，之后的增量更新不再覆盖它
+    anchor = common.last_closed_day(now, calendar)
+    failed = cache.update(codes, end=anchor, start_default=HISTORY_START) or []
     cache.save_index(common.INDEX_SYMBOL, client.index_daily(common.INDEX_SYMBOL))
 
     if not store.strategies_with_status("incumbent"):
         store.set_status(common.DEFAULT_INCUMBENT, "incumbent", now.date())
 
-    anchor = common.last_closed_day(now, calendar)
     for key in ("bench_start", "playbook_released"):
         if store.kv_get(key) is None:
             store.kv_set(key, anchor.isoformat())
@@ -58,12 +59,15 @@ def main(now: datetime | None = None) -> dict:
         changed = []
     msg = (f"RSIQS 初始化完成：股票池 {len(codes)} 只，起始日 {anchor.isoformat()}，"
            f"新建账户 {', '.join(created) or '无'}")
+    if failed:
+        msg += (f"\n警告：{len(failed)} 只股票日线下载失败（{', '.join(failed[:20])}"
+                f"{' 等' if len(failed) > 20 else ''}），重新运行 bootstrap 会增量补齐。")
     if changed:
         msg += (f"\n警告：engine/ 与哈希清单不符：{', '.join(changed)}。"
                 "确认改动无误后按 Task 2.8 的命令人工重写清单并提交。")
     notifier.send_text(msg)
     print(msg)
-    return {"universe": len(codes), "anchor": anchor.isoformat(), "created": created}
+    return {"universe": len(codes), "anchor": anchor.isoformat(), "created": created, "failed": failed}
 
 
 if __name__ == "__main__":

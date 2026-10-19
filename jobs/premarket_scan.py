@@ -53,7 +53,8 @@ def main(now: datetime | None = None) -> bool:
 
     ok = common.run_job("premarket_scan", d, job, store, notifier)
     failed = sorted(k for k, done in status.items() if not done)
-    if failed:
+    cands = store.load_candidates(d)
+    if failed and cands is not None and cands[0]:  # 策略当天没选出候选时不做分析，这不算未完成
         notifier.send_text(format_alert(
             "盘前分析未完成", f"9:25 将按量化/规则推荐（未完成：{'、'.join(failed)}）"))
     return ok

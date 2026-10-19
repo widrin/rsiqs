@@ -28,27 +28,37 @@ def _num(x) -> float:
 
 
 def _levels(pos, acc, cache, d: date) -> tuple[float, float]:
-    """止损、止盈价；d 是除权除息日且结算还没调整这笔持仓时，换算到除权后。"""
-    if cache is not None and not any(a["code"] == pos.code and a["date"] == d.isoformat()
-                                     for a in acc.corporate_actions):
-        for ex, cash, ratio in cache.dividends(pos.code):
-            if ex == d:
-                return ex_rights_price(pos.stop, cash, ratio), ex_rights_price(pos.target, cash, ratio)
-    return pos.stop, pos.target
+    """止损、止盈价：建仓之后到 d 日（含）之间除权除息、结算还没调整这笔持仓的（包括前一天除权、当天结算
+    失败或还没补跑的），按日期顺序换算到除权后。"""
+    stop, target = pos.stop, pos.target
+    if cache is None:
+        return stop, target
+    done = {a["date"] for a in acc.corporate_actions if a["code"] == pos.code}
+    for ex, cash, ratio in sorted(cache.dividends(pos.code)):
+        if pos.entry_date < ex <= d and ex.isoformat() not in done:
+            stop, target = ex_rights_price(stop, cash, ratio), ex_rights_price(target, cash, ratio)
+    return stop, target
 
 
 def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
     """检查一次持仓，返回本次新发出的告警；(code, 事件) 去重键按日持久化在 kv。
-    cache 提供分红送转记录：除权除息日当天按换算后的止损、止盈价判断。"""
+    cache 提供分红送转记录：建仓后除权除息、结算还没调整的持仓按换算后的止损、止盈价判断。
+    报价源没有返回的持仓每天记一次警告日志。"""
     acc = store.load_account(ACCOUNT)
     if acc is None or not acc.positions:
         return []
     rows = {str(r["code"]): r for r in client.spot(list(acc.positions)).to_dict("records")}  # 只取持仓
     key = f"monitor_sent:{d.isoformat()}"
     sent = set(store.kv_get(key) or [])
-    out = []
+    out, dirty = [], False
     for code, pos in acc.positions.items():
-        r = rows.get(code, {})
+        r = rows.get(code)
+        if r is None:  # 报价源没有返回这只：记一次日志（每天一次），不推送
+            if f"{code}:无报价" not in sent:
+                common.log.warning("monitor %s: no quote for %s, not monitored", d, code)
+                sent.add(f"{code}:无报价")
+                dirty = True
+            continue
         last, high, prev = _num(r.get("last")), _num(r.get("high")), _num(r.get("prev_close"))
         if not last > 0:  # 停牌或无报价
             continue
@@ -70,7 +80,7 @@ def check_once(d: date, store, client, notifier, cache=None) -> list[str]:
                                f"{detail}；持仓 {pos.qty} 股，成本 {pos.cost:.2f}")
             notifier.send_text(msg)
             out.append(msg)
-    if out:
+    if out or dirty:
         store.kv_set(key, sorted(sent))
     return out
 

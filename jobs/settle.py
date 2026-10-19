@@ -18,7 +18,7 @@ from strategies.base import load_strategy
 
 CORE_ACCOUNTS = (*common.LLM_ACCOUNTS, common.BENCH_ACCOUNT)
 LOOKBACK_CAL_DAYS = 550  # 约 370 个交易日，供策略计算因子
-MIN_COVERAGE = 0.5       # 当日有日线的股票占比低于此值视为数据未更新
+MIN_COVERAGE = 0.9       # 当日有日线的股票占比低于此值视为数据未更新（股票池里同时停牌的很少超过几十只）
 KIND_CN = {"promote": "晋升", "demote": "降级", "retire": "淘汰"}
 
 
@@ -38,6 +38,27 @@ def tracked_codes(store) -> list[str]:
         if acc is not None:
             codes.update(acc.positions)
     return sorted(codes)
+
+
+def refresh_universe(store, client) -> None:
+    """每天刷新 kv universe（沪深300 + 中证500 当前成分），与盘前扫描用同一份名单；取不到时沿用旧名单。"""
+    try:
+        codes = sorted(client.universe())
+    except Exception:  # noqa: BLE001 - 成分股取不到不影响结算
+        common.log.exception("refresh universe failed, keeping the old one")
+        return
+    if codes:
+        store.kv_set("universe", codes)
+
+
+def recommended_codes(store, days) -> set[str]:
+    """这些日子盘前推荐给两个 LLM 账户的代码（可能不在 kv universe 里）。"""
+    out = set()
+    for d in days:
+        for name in common.LLM_ACCOUNTS:
+            rec = store.load_recommendation(d, name)
+            out.update(p.code for p in (rec[0] if rec else []))
+    return out
 
 
 def refresh_data(codes: list[str], end: date, client, cache) -> None:
@@ -138,11 +159,8 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
     不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码。"""
     codes = tracked_codes(store)
-    # 当天盘前推荐的代码也载入：盘前扫描用实时股票池，可能有 kv universe 之外的新成分股
-    recs = set()
-    for name in common.LLM_ACCOUNTS:
-        rec = store.load_recommendation(d, name)
-        recs.update(p.code for p in (rec[0] if rec else []))
+    # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
+    recs = recommended_codes(store, [d])
     panel, names = cache.load_panel(sorted(set(codes) | recs), d - timedelta(days=LOOKBACK_CAL_DAYS), d)
     qfq_bars = bars_for_day(panel, names, d)
     if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
@@ -152,8 +170,9 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     bench_equity = settings.capital * _index_close(index, d) / _index_close(index, bench_start)
 
     asof = calendar.prev_day(d)
-    # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合
-    view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items()}, names, asof=asof)
+    # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合。选股范围是股票池加持仓，不含当天 LLM 推荐的代码
+    tracked = set(codes)
+    view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
     broker, per_pick, warnings = SimBroker(), settings.capital / settings.max_picks, []
 
     def raw_bars(codes) -> dict:
@@ -185,15 +204,20 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
             store.record_nav(name, calendar.prev_day(d), settings.capital)
         bars = raw_bars([*acc.positions, *(p.code for p in picks)])
         if acc.last_trade_day is None or acc.last_trade_day < d:  # d 日尚未撮合：重跑时不重复调整
-            # 除权除息：上次结算之后到 d 日（含）之间除权的持仓，先换算股数、成本和价位，现金分红入账
+            # 除权除息：建仓之后到 d 日（含）之间除权、还没调整过的持仓，先换算股数、成本和价位，现金分红入账。
+            # 不只看上次结算之后：除权日当天分红记录还没到、第二天才到时，这次补记（apply_dividend 按代码和日期去重）
             for code in list(acc.positions):
                 check_unexplained_ex(code, bars.get(code))
                 for ex, cash, ratio in cache.dividends(code):
-                    if (acc.last_trade_day is None or ex > acc.last_trade_day) and ex <= d:
+                    pos = acc.positions.get(code)
+                    if pos is not None and pos.entry_date < ex <= d:
                         act = acc.apply_dividend(ex, code, cash, ratio)
                         if act:
+                            late = "（补记：除权日当天还没有分红记录）" if ex < d and (
+                                acc.last_trade_day is not None and ex <= acc.last_trade_day) else ""
                             warnings.append(f"{name} 持仓 {code} 于 {ex.isoformat()} 除权除息：股数 "
-                                            f"{act['qty_before']} → {act['qty_after']}，税后分红 {act['cash']:.2f} 元")
+                                            f"{act['qty_before']} → {act['qty_after']}，税后分红 {act['cash']:.2f} 元"
+                                            + late)
         broker.execute_day(acc, d, bars, picks, calendar, per_pick)
         # 先存账户再记净值：中途中断时，重跑看到 last_trade_day == d，execute_day 不会重复成交，只补记净值
         store.save_account(acc)
@@ -247,7 +271,9 @@ def main(now: datetime | None = None) -> list[date]:
     days = pending_days(store, calendar, now)
     if not days:
         return []
-    codes = tracked_codes(store)
+    refresh_universe(store, client)
+    # 待结算日的推荐代码也刷新：股票池外的推荐缺 d 日 K 线时，结算要能发现并暂停，而不是当作停牌
+    codes = sorted(set(tracked_codes(store)) | recommended_codes(store, days))
     if not common.run_job("settle_data", days[-1],
                           lambda: refresh_data(codes, days[-1], client, cache),
                           store, notifier, force=True):

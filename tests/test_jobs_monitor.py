@@ -86,11 +86,35 @@ def test_ex_date_uses_adjusted_levels():
     out = check_once(D, store, SpotClient([row("600001", 6.1, 6.6, prev_close=6.6)]), NullNotifier(), cache)
     assert len(out) == 1 and "触发止损" in out[0] and "6.20" in out[0]
     assert len(check_once(D, make_store(("600001", 9.3, 11.0)), client, NullNotifier())) == 1  # 不换算会误报
-    # 前一天除权、结算已经调整过的持仓，今天不再换算
+    # 前一天除权、结算已经调整过的持仓（有除权记录），今天不再换算
     yesterday = DivCache({"600001": [(date(2026, 10, 15), 0.0, 0.5)]})
-    out = check_once(D, make_store(("600001", 6.2, 7.3)), SpotClient([row("600001", 6.1, 6.6, prev_close=6.6)]),
-                     NullNotifier(), yesterday)
+    adjusted = make_store(("600001", 6.2, 7.3))
+    acc = adjusted.load_account("h:active")
+    acc.corporate_actions.append({"date": "2026-10-15", "code": "600001", "cash_per_share": 0.0,
+                                  "share_ratio": 0.5})
+    adjusted.save_account(acc)
+    out = check_once(D, adjusted, SpotClient([row("600001", 6.1, 6.6, prev_close=6.6)]), NullNotifier(), yesterday)
     assert len(out) == 1 and "6.20" in out[0]
+
+
+def test_previous_day_ex_not_yet_settled_uses_adjusted_levels():
+    store = make_store(("600001", 9.3, 11.0))  # 前一天除权，结算失败还没调整这笔持仓
+    cache = DivCache({"600001": [(date(2026, 10, 15), 0.0, 0.5)]})
+    assert check_once(D, store, SpotClient([row("600001", 6.6, 6.7, prev_close=6.6)]), NullNotifier(), cache) == []
+    out = check_once(D, store, SpotClient([row("600001", 6.1, 6.7, prev_close=6.6)]), NullNotifier(), cache)
+    assert len(out) == 1 and "6.20" in out[0]
+    # 建仓之前的除权不换算
+    old = DivCache({"600001": [(date(2026, 10, 9), 0.0, 0.5)]})
+    assert check_once(D, make_store(("600001", 9.3, 11.0)), SpotClient([row("600001", 9.5, 9.6)]),
+                      NullNotifier(), old) == []
+
+
+def test_missing_quote_is_logged_once(caplog):
+    store = make_store(("600001", 9.3, 11.0))
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            assert check_once(D, store, SpotClient([row("600002", 9.0, 9.0)]), NullNotifier()) == []
+    assert caplog.text.count("no quote for 600001") == 1
 
 
 def test_no_positions_skips_spot_call():

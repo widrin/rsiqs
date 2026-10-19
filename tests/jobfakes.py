@@ -148,6 +148,7 @@ class FakeCache:
     def __init__(self, panel, names, index):
         self.panel, self.names, self.index = panel, dict(names), index
         self.updates: list[date] = []
+        self.update_codes: list[list[str]] = []
         self.saved_index: dict[str, pd.Series] = {}
         self.divs: dict[str, dict] = {}
         # 不复权日线：构造时复制一份；测试改 panel 模拟前复权重拉，改 raw 模拟真实成交价
@@ -186,6 +187,8 @@ class FakeCache:
 
     def update(self, codes, end, start_default=date(2015, 6, 1)):
         self.updates.append(end)
+        self.update_codes.append(sorted(codes))
+        return []
 
     def set_names(self, names):
         self.names.update(names)

@@ -89,6 +89,85 @@ def test_weekend_settles_up_to_friday(env):
     assert store.last_nav_date("bench:csi300") == max(d for d in dates if d < sat)
 
 
+def test_partial_data_below_coverage_pauses(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    for c in CODES[:2]:  # 10 只里 2 只还没有当天 K 线：80% 低于覆盖率门槛
+        cache.panel[c] = cache.panel[c].drop(pd.Timestamp(dates[101]))
+    assert settle.main(now=at(dates[101], 16)) == []
+    assert any("覆盖不足" in str(m) for m in env["notifier"].sent)
+
+
+def test_catch_up_stops_at_first_failed_day(env, monkeypatch):
+    dates, store = env["dates"], env["store"]
+    real = settle.settle_and_decide
+
+    def flaky(d, *a, **k):
+        if d == dates[102]:
+            raise RuntimeError("指数缺数据")
+        return real(d, *a, **k)
+
+    monkeypatch.setattr(settle, "settle_and_decide", flaky)
+    assert settle.main(now=at(dates[104], 16)) == [dates[101]]
+    assert store.last_nav_date("h:active") == dates[101]  # 次日依赖前日持仓：后面的日子不结算
+    assert not store.job_done("settle", dates[103])
+
+
+def test_universe_refreshed_and_recommendations_refreshed(env, monkeypatch):
+    dates, store, cache, client = env["dates"], env["store"], env["cache"], env["client"]
+    monkeypatch.setattr(client, "universe", lambda: CODES[:5])
+    out_pick = Pick(code="600010", name=NAMES["600010"], score=1.0, entry_max=999.0, stop=0.01,
+                    target=999.0, hold_days=5, reason="股票池外的推荐")
+    store.save_recommendation(dates[101], "h:candidate", [out_pick], {"llm_reviewed": True})
+    settle.main(now=at(dates[101], 16))
+    assert store.kv_get("universe") == CODES[:5]
+    assert "600010" in cache.update_codes[-1]  # 待结算日的推荐代码也刷新日线
+
+
+def test_universe_kept_when_refresh_fails(env, monkeypatch):
+    dates, store, client = env["dates"], env["store"], env["client"]
+    before = store.kv_get("universe")
+
+    def boom():
+        raise ConnectionError("中证官网不可用")
+
+    monkeypatch.setattr(client, "universe", boom)
+    assert settle.main(now=at(dates[101], 16)) == [dates[101]]
+    assert store.kv_get("universe") == before
+
+
+def test_strategy_view_excludes_llm_recommended_codes(env, monkeypatch):
+    dates, store, client = env["dates"], env["store"], env["client"]
+    monkeypatch.setattr(client, "universe", lambda: CODES[:5])
+    store.kv_set("universe", CODES[:5])
+    out_pick = Pick(code="600010", name=NAMES["600010"], score=1.0, entry_max=999.0, stop=0.01,
+                    target=999.0, hold_days=5, reason="股票池外的推荐")
+    store.save_recommendation(dates[101], "h:candidate", [out_pick], {"llm_reviewed": True})
+    seen = []
+
+    class Probe:
+        name = "baseline_momo"
+
+        def select(self, view):
+            seen.append(sorted(view.codes()))
+            return []
+
+    monkeypatch.setattr(settle, "load_strategy", lambda name: Probe())
+    settle.main(now=at(dates[101], 16))
+    assert seen and "600010" not in seen[0] and "600001" in seen[0]
+    assert any(f.code == "600010" for f in store.load_account("h:candidate").trades)  # 推荐照常撮合
+
+
+def test_late_dividend_record_is_applied_next_day(env):
+    dates, store, client = env["dates"], env["store"], env["client"]
+    settle.main(now=at(dates[103], 16))  # 600001 于 dates[101] 买入；dates[103] 除息当天还没有分红记录
+    assert store.load_account("h:active").corporate_actions == []
+    client.dividend_data = {"600001": [(dates[103], 1.0, 0.0)]}
+    settle.main(now=at(dates[104], 16))
+    acts = store.load_account("h:active").corporate_actions
+    assert [a["date"] for a in acts] == [dates[103].isoformat()]
+    assert any("补记" in str(m) for m in env["notifier"].sent)
+
+
 def test_stale_data_aborts_with_alert(env, monkeypatch):
     dates, store, cache = env["dates"], env["store"], env["cache"]
     real = cache.load_panel

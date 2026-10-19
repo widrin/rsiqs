@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import traceback
+from contextlib import contextmanager
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -16,6 +17,47 @@ from notify.format import format_alert
 from notify.wecom import NullNotifier, WeCom
 
 log = logging.getLogger("rsiqs.jobs")
+
+LOCK_DIR: Path | None = None  # context() 设为 <root>/logs/locks；为 None（测试）时不加锁
+
+if os.name == "nt":
+    import msvcrt
+
+    def _lock(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+
+    def _unlock(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock(f) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(f) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def job_lock(job: str):
+    """跨进程互斥：同名任务同一时刻只有一个进程在跑（例如开机补跑与定时任务重叠）。拿到锁时 yield True，
+    别的进程正持有时 yield False。锁由操作系统随进程退出释放，进程被杀也不会留下残锁。"""
+    if LOCK_DIR is None:
+        yield True
+        return
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_DIR / f"{job}.lock", "a+b") as f:
+        try:
+            _lock(f)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _unlock(f)
 
 
 def setup_logging(root: Path) -> None:
@@ -63,24 +105,43 @@ def make_llm(settings, store: Store):
     return LLM(settings, store)
 
 
-def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False) -> bool:
-    """幂等执行：已成功则跳过（返回 True）；成功标记 ok；异常标记 error 并告警（返回 False）。"""
+def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, lock: bool = True) -> bool:
+    """幂等执行：已成功则跳过（返回 True）；成功标记 ok；异常标记 error 并告警（返回 False）。
+
+    lock=True 时持有跨进程锁：同名任务正在别的进程里跑时直接返回 False（不标记、不告警）。
+    同一任务同一天只告警一次：计划任务当天会定时重试，重复失败只记日志。"""
     if not force and store.job_done(job, d):
         log.info("skip %s %s (already ok)", job, d)
         return True
-    try:
-        fn()
-    except Exception as e:  # noqa: BLE001 — 任务边界统一兜底
-        store.mark_job(job, d, "error")
-        log.error("job %s %s failed: %s\n%s", job, d, e, traceback.format_exc())
+    with job_lock(job) if lock else _no_lock() as got:
+        if not got:
+            log.info("skip %s %s (running in another process)", job, d)
+            return False
+        if not force and store.job_done(job, d):  # 等锁期间别的进程已经完成
+            log.info("skip %s %s (already ok)", job, d)
+            return True
         try:
-            notifier.send_text(format_alert(f"任务失败 {job} {d.isoformat()}", f"{type(e).__name__}: {e}"))
-        except Exception as ne:  # noqa: BLE001
-            log.error("alert failed: %s", ne)
-        return False
-    store.mark_job(job, d, "ok")
+            fn()
+        except Exception as e:  # noqa: BLE001 — 任务边界统一兜底
+            log.error("job %s %s failed: %s\n%s", job, d, e, traceback.format_exc())
+            try:
+                store.mark_job(job, d, "error")
+                key = f"job_alerted:{job}:{d.isoformat()}"
+                if not store.kv_get(key):
+                    notifier.send_text(format_alert(f"任务失败 {job} {d.isoformat()}",
+                                                    f"{type(e).__name__}: {e}\n（当天会定时重试；再次失败只记日志）"))
+                    store.kv_set(key, True)
+            except Exception as ne:  # noqa: BLE001 — 记录或告警本身失败：原始异常已写进日志
+                log.error("recording failure of %s %s failed: %s", job, d, ne)
+            return False
+        store.mark_job(job, d, "ok")
     log.info("job %s %s ok", job, d)
     return True
+
+
+@contextmanager
+def _no_lock():
+    yield True
 
 
 def load_calendar(store: Store, client: AkClient, now: date | None = None) -> TradingCalendar:
@@ -102,8 +163,10 @@ def load_calendar(store: Store, client: AkClient, now: date | None = None) -> Tr
 
 def context():
     """装配依赖：(settings, store, client, cache, calendar, notifier)。"""
+    global LOCK_DIR
     settings = get_settings()
     setup_logging(settings.root)
+    LOCK_DIR = settings.root / "logs" / "locks"
     db_path = Path(settings.db_path)
     if not db_path.is_absolute():
         db_path = settings.root / db_path

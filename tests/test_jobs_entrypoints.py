@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, time
 
 import pytest
@@ -6,6 +7,7 @@ import agents.premarket as premarket
 import agents.research as research_agent
 import agents.review as review_agent
 from jobs import common, premarket_final, premarket_scan, research, review
+from engine.types import Pick
 from notify.wecom import NullNotifier
 from tests.jobfakes import (CODES, NAMES, FakeCache, FakeClient, cal, install_context,
                             make_dates, make_index, make_panel, make_settings, new_store,
@@ -21,11 +23,13 @@ def env(tmp_path, monkeypatch):
     install_context(monkeypatch, make_settings(tmp_path), store, client, cache, cal(dates),
                     notifier)
     calls, analysis, analysis_kw = [], {"active": True, "candidate": True}, {}
+    scan_picks = [Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=10.5, stop=9.5,
+                       target=11.5, hold_days=5, reason="候选")]
 
     def fake_scan(d, settings, store, cache, client, strategy, calendar):
         calls.append(("scan", d, strategy.name))
-        store.save_candidates(d, [], {})
-        return []
+        store.save_candidates(d, list(scan_picks), {})
+        return list(scan_picks)
 
     def fake_analyze(d, settings, store, llm, deadline=None, now=None):
         calls.append(("analyze", d, llm))
@@ -49,7 +53,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(research_agent, "run_research", fake_research)
     monkeypatch.setattr(common, "make_llm", lambda settings, store: "LLM")
     return dict(dates=dates, store=store, notifier=notifier, calls=calls, analysis=analysis,
-                slept=[], analysis_kw=analysis_kw)
+                slept=[], analysis_kw=analysis_kw, scan_picks=scan_picks)
 
 
 def at(d, hh, mm=0, ss=0):
@@ -72,6 +76,14 @@ def test_scan_alerts_when_analysis_incomplete_but_job_ok(env):
     [msg] = env["notifier"].sent
     assert "盘前分析未完成" in msg and "9:25 将按量化/规则推荐" in msg
     assert "candidate" in msg and "active" not in msg
+
+
+def test_scan_without_candidates_does_not_alert(env):
+    d = env["dates"][10]
+    env["scan_picks"].clear()
+    env["analysis"].update(active=False, candidate=False)  # 没有候选时 run_analyze 不做分析
+    assert premarket_scan.main(now=at(d, 8, 30)) is True
+    assert env["notifier"].sent == []
 
 
 def test_scan_analyze_crash_counts_as_incomplete(env, monkeypatch):
@@ -135,7 +147,7 @@ def test_final_waits_until_092515_then_runs(env, hh, mm, ss, waited):
     d = env["dates"][10]
     premarket_scan.main(now=at(d, 8, 30))
     assert premarket_final.main(now=at(d, hh, mm, ss), sleep=env["slept"].append) is True
-    assert env["slept"] == waited
+    assert env["slept"] == pytest.approx(waited, abs=1.0)
     assert env["calls"] == [("scan", d, "baseline_momo"), ("analyze", d, "LLM"),
                             ("final", d, "LLM")]
     assert env["store"].job_done("premarket_final", d)
@@ -148,6 +160,56 @@ def test_final_runs_missing_scan_inline_without_analyze(env):
     assert env["store"].job_done("premarket_scan", d)
     assert premarket_scan.main(now=at(d, 9, 31)) is True  # 已补跑 -> 跳过，不再分析
     assert [c[0] for c in env["calls"]] == ["scan", "final"]
+
+
+def test_final_wait_subtracts_context_time(env, monkeypatch):
+    d = env["dates"][10]
+    env["store"].save_candidates(d, [], {})
+    clock = [1000.0]
+    real = common.context
+
+    def slow_context():
+        clock[0] += 10  # 装配依赖花了 10 秒
+        return real()
+
+    monkeypatch.setattr(common, "context", slow_context)
+    monkeypatch.setattr(premarket_final._time, "monotonic", lambda: clock[0])
+    assert premarket_final.main(now=at(d, 9, 25), sleep=env["slept"].append) is True
+    assert env["slept"] == [5.0]
+
+
+def test_final_inline_scan_has_a_deadline(env, monkeypatch):
+    d = env["dates"][10]
+    release = threading.Event()
+
+    def slow_scan(*a, **k):
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr(premarket, "scan", slow_scan)
+    monkeypatch.setattr(premarket_final, "SCAN_MIN_SECONDS", 0.2)
+    try:
+        assert premarket_final.main(now=at(d, 9, 27), sleep=env["slept"].append) is False
+    finally:
+        release.set()
+    assert env["calls"] == [] and not env["store"].job_done("premarket_scan", d)
+    assert any("没有完成" in str(m) for m in env["notifier"].sent)
+
+
+def test_final_stale_after_slow_inline_scan(env, monkeypatch):
+    d = env["dates"][10]
+    clock = [1000.0]
+    monkeypatch.setattr(premarket_final._time, "monotonic", lambda: clock[0])
+
+    def slow_scan(d, settings, store, cache, client, strategy, calendar):
+        clock[0] += 600  # 扫描用了 10 分钟
+        store.save_candidates(d, [], {})
+        return []
+
+    monkeypatch.setattr(premarket, "scan", slow_scan)
+    monkeypatch.setattr(premarket_final, "SCAN_HARD_DEADLINE", time(9, 59))
+    assert premarket_final.main(now=at(d, 9, 26), sleep=env["slept"].append) is False
+    assert env["calls"] == [] and any("已过时" in str(m) for m in env["notifier"].sent)
 
 
 def test_final_stale_after_0935(env):

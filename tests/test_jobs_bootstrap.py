@@ -95,6 +95,15 @@ def test_bootstrap_on_weekend_starts_from_last_trading_day(tmp_path, monkeypatch
 
 
 def test_bootstrap_before_close_anchors_previous_day(tmp_path, monkeypatch):
-    dates, _, store, _, _, _ = setup(tmp_path, monkeypatch)
+    dates, _, store, cache, _, _ = setup(tmp_path, monkeypatch)
     bootstrap.main(now=datetime.combine(dates[100], time(9, 0)))
     assert store.last_nav_date("h:active") == dates[99]
+    assert cache.updates == [dates[99]]  # 不取当天未收盘的 K 线
+
+
+def test_bootstrap_reports_failed_downloads(tmp_path, monkeypatch):
+    dates, _, _, cache, notifier, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cache, "update", lambda codes, end, start_default=None: ["600003"])
+    out = bootstrap.main(now=datetime.combine(dates[100], time(20, 0)))
+    assert out["failed"] == ["600003"]
+    assert "1 只股票日线下载失败（600003）" in notifier.sent[-1]

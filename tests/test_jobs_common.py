@@ -10,6 +10,7 @@ from agents.review import ReviewOutput
 from engine.calendar import TradingCalendar
 from engine.store import Store
 from engine.types import Pick
+import jobs.common as common
 from jobs.common import (incumbent_strategy, last_closed_day, load_calendar, run_job,
                          setup_logging)
 from notify.wecom import NullNotifier
@@ -47,6 +48,41 @@ def test_run_job_error_marks_error_and_alerts():
     # 失败后可重试
     assert run_job("premarket_scan", D, lambda: None, store, notifier) is True
     assert store.job_done("premarket_scan", D)
+
+
+def test_run_job_skips_while_another_process_holds_the_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "LOCK_DIR", tmp_path / "locks")
+    store, notifier, ran = Store(":memory:"), NullNotifier(), []
+    with common.job_lock("settle") as got:
+        assert got
+        assert run_job("settle", D, lambda: ran.append(1), store, notifier) is False
+        assert ran == [] and not store.job_done("settle", D) and notifier.sent == []
+        assert run_job("settle", D, lambda: ran.append(2), store, notifier, lock=False) is True
+    assert run_job("other", D, lambda: ran.append(3), store, notifier) is True
+    assert ran == [2, 3]
+    with common.job_lock("settle") as got:  # 释放后可以再拿到
+        assert got
+
+
+def test_run_job_alerts_once_per_job_and_day():
+    store, notifier = Store(":memory:"), NullNotifier()
+    for _ in range(3):  # 计划任务当天定时重试
+        assert run_job("settle", D, lambda: 1 / 0, store, notifier) is False
+    assert len(notifier.sent) == 1 and "定时重试" in notifier.sent[0]
+    run_job("settle", date(2026, 10, 19), lambda: 1 / 0, store, notifier)
+    assert len(notifier.sent) == 2
+
+
+def test_run_job_survives_failure_while_recording_failure(caplog):
+    class BrokenStore(Store):
+        def mark_job(self, job, d, status):
+            if status == "error":
+                raise OSError("database is locked")
+            super().mark_job(job, d, status)
+
+    with caplog.at_level(logging.ERROR):
+        assert run_job("x", D, lambda: 1 / 0, BrokenStore(":memory:"), NullNotifier()) is False
+    assert "ZeroDivisionError" in caplog.text  # 原始异常已写进日志
 
 
 def test_run_job_alert_failure_does_not_raise():
