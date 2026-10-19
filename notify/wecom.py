@@ -1,5 +1,5 @@
 # notify/wecom.py
-"""企业微信群机器人推送：按 UTF-8 字节分段、重试、失败落盘并在下一条补报。"""
+"""企业微信群机器人推送：按 UTF-8 字节分段、重试、失败落盘并在下一条补报（跨进程）。"""
 import json
 import logging
 import re
@@ -16,6 +16,11 @@ MARKDOWN_LIMIT = 4000
 ATTEMPTS = 3
 WAIT = 2.0
 FAIL_PREFIX = "⚠️ 上条推送失败，详见本地日志\n"
+RATE_LIMIT_WAIT = 61.0  # 45009：每分钟 20 条的额度用完，等到下一个分钟窗口再发（只等一次）
+FATAL_ERRCODES = {93000, 40008, 44004, 40058}  # webhook 无效、消息类型或内容非法：重试没有用
+PENDING_FILE = "notify_pending"  # 有未补报的失败；每个计划任务是独立进程，状态必须落盘
+# 不能在这些码点之前切：变体选择符、零宽连接符、组合字符（硬切时拆开 emoji 序列会显示成乱码）
+_NO_CUT_BEFORE = {"\ufe0f", "\ufe0e", "\u200d", "\u20e3"}
 
 
 def _nbytes(s: str) -> int:
@@ -31,6 +36,8 @@ def split_utf8(text: str, limit: int) -> list[str]:
             while size + _nbytes(line[cut]) <= limit:
                 size += _nbytes(line[cut])
                 cut += 1
+            while cut > 1 and line[cut] in _NO_CUT_BEFORE:
+                cut -= 1
             pieces.append(line[:cut])
             line = line[cut:]
         if line:
@@ -55,7 +62,11 @@ class WeCom:
         self.url = url
         self.session = session or requests.Session()
         self.log_dir = Path(log_dir)
-        self.failed = False  # 上一条是否最终失败
+
+    @property
+    def failed(self) -> bool:
+        """上一条推送（可能在另一个任务进程里）是否最终失败、还没补报。"""
+        return (self.log_dir / PENDING_FILE).exists()
 
     def send_text(self, content: str) -> bool:
         return self._send("text", content, TEXT_LIMIT)
@@ -70,28 +81,43 @@ class WeCom:
             if err is not None:
                 self._log_failure(msgtype, content, err)
                 return False
-        self.failed = False
+        (self.log_dir / PENDING_FILE).unlink(missing_ok=True)
         return True
 
     def _post(self, payload: dict) -> str | None:
-        """成功返回 None，否则返回最后一次的错误描述。"""
-        err = "unknown"
+        """成功返回 None，否则返回最后一次的错误描述。
+
+        45009（频率限制）等到下一个分钟窗口再发一次；webhook 无效等错误不重试；读超时不重发：服务端可能已经
+        收到并转发，重发会在群里出现两条。"""
+        err, rate_limited = "unknown", False
         for i in range(ATTEMPTS):
+            wait = WAIT
             try:
                 r = self.session.post(self.url, json=payload, timeout=10)
-                if r.status_code == 200 and r.json().get("errcode") == 0:
+                body = r.json() if r.status_code == 200 else {}
+                code = body.get("errcode")
+                if r.status_code == 200 and code == 0:
                     return None
-                err = f"HTTP {r.status_code}: {r.json() if r.status_code == 200 else ''}"
+                err = f"HTTP {r.status_code}: {body}"
+                if code in FATAL_ERRCODES:
+                    log.warning("推送失败且不可重试: %s", _redact(err))
+                    return err
+                if code == 45009 and not rate_limited:
+                    rate_limited, wait = True, RATE_LIMIT_WAIT
+            except requests.ReadTimeout as e:
+                err = f"ReadTimeout（可能已送达，不重发）: {e}"
+                log.warning("推送读超时，可能已送达，不重发: %s", _redact(str(e)))
+                return err
             except Exception as e:  # noqa: BLE001
                 err = f"{type(e).__name__}: {e}"
             log.warning("推送第 %d/%d 次失败: %s", i + 1, ATTEMPTS, _redact(err))
             if i < ATTEMPTS - 1:
-                time.sleep(WAIT)
+                time.sleep(wait)
         return err
 
     def _log_failure(self, msgtype: str, content: str, err: str) -> None:
-        self.failed = True
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        (self.log_dir / PENDING_FILE).touch()
         rec = {"time": datetime.now().isoformat(timespec="seconds"), "msgtype": msgtype,
                "content": content, "error": _redact(err)}
         with open(self.log_dir / "notify_failed.jsonl", "a", encoding="utf-8") as f:

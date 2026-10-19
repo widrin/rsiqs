@@ -80,15 +80,37 @@ def test_send_markdown_payload_and_4000_limit(tmp_path):
 
 
 def test_retry_then_success(tmp_path):
-    w, s = make(tmp_path, [ConnectionError("x"), Resp(body={"errcode": 45009, "errmsg": "freq"})])
+    w, s = make(tmp_path, [ConnectionError("x"), Resp(500)])
     assert w.send_text("hi") is True
     assert len(s.posts) == 3
     assert not (tmp_path / "logs" / "notify_failed.jsonl").exists()
 
 
-def test_final_failure_logs_and_prefixes_next_message_once(tmp_path):
+def test_rate_limit_waits_for_next_minute(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(wc.time, "sleep", lambda t: sleeps.append(t))
+    w, s = make(tmp_path, [Resp(body={"errcode": 45009, "errmsg": "freq"})])
+    assert w.send_text("hi") is True and len(s.posts) == 2
+    assert sleeps == [wc.RATE_LIMIT_WAIT]
+
+
+def test_fatal_errcode_not_retried(tmp_path):
+    w, s = make(tmp_path, [Resp(body={"errcode": 93000, "errmsg": "invalid webhook url"})])
+    assert w.send_text("hi") is False and len(s.posts) == 1
+
+
+def test_read_timeout_not_resent(tmp_path):
+    import requests
+    w, s = make(tmp_path, [requests.ReadTimeout("read timed out")])
+    assert w.send_text("止损告警") is False and len(s.posts) == 1  # 服务端可能已转发：重发会在群里出现两条
+    rec = (tmp_path / "logs" / "notify_failed.jsonl").read_text(encoding="utf-8")
+    assert "可能已送达" in rec
+
+
+def test_final_failure_logs_and_prefixes_next_message_once(tmp_path, caplog):
     w, s = make(tmp_path, [Resp(500), Resp(500), ConnectionError(f"bad {URL}")])
     assert w.send_text("第一条") is False
+    assert caplog.records and all("SECRET123" not in r.getMessage() for r in caplog.records)
     log = tmp_path / "logs" / "notify_failed.jsonl"
     rec = json.loads(log.read_text(encoding="utf-8").strip())
     assert rec["msgtype"] == "text" and rec["content"] == "第一条"
@@ -105,3 +127,20 @@ def test_null_notifier_records():
     assert n.send_text("a") is True
     assert n.send_markdown("**b**") is True
     assert n.sent == ["a", "**b**"]
+
+
+def test_failure_flag_survives_process_restart(tmp_path):
+    w1, _ = make(tmp_path, [Resp(500), Resp(500), Resp(500)])
+    assert w1.send_markdown("09:25 推荐") is False
+    w2, s2 = make(tmp_path)  # 下一个计划任务是新进程，新建实例
+    assert w2.send_text("盘中告警") is True
+    assert s2.posts[-1]["text"]["content"] == FAIL_PREFIX + "盘中告警"
+    w3, s3 = make(tmp_path)
+    assert w3.send_text("再下一条") is True and s3.posts[-1]["text"]["content"] == "再下一条"
+
+
+def test_split_utf8_does_not_split_emoji_sequences():
+    chunks = split_utf8("⚠️" * 1000, 4000)
+    assert "".join(chunks) == "⚠️" * 1000
+    assert all(not c.startswith("\ufe0f") for c in chunks)
+    assert all(len(c.encode("utf-8")) <= 4000 for c in chunks)

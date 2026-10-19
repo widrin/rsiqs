@@ -40,3 +40,18 @@ def test_alert():
     s = format_alert("触发止损", "600000 浦发银行 现价 9.30")
     assert s.startswith("【RSIQS 告警】触发止损")
     assert "600000 浦发银行 现价 9.30" in s
+
+
+def test_multiline_reason_and_view_stay_in_place():
+    p = Pick(code="600000", name="浦发银行", score=1.0, entry_max=10.3, stop=9.3, target=11.0, hold_days=5,
+             reason="结论：看多\n# 证据：放量\n> 引用")
+    s = format_recommendation(date(2026, 10, 16), [p], llm_reviewed=True, market_view="偏强\n## 竞价确认")
+    lines = s.split("\n")
+    assert not any(line.startswith(("# ", "## 竞价")) for line in lines[1:])  # 不会被渲染成标题
+    assert any("结论：看多" in line and "证据：放量" in line for line in lines)
+
+
+def test_daily_report_has_no_markdown_table():
+    rows = [{"account": "h:active", "equity": 512345.678, "day_ret": 0.0123, "total_ret": 0.0247}]
+    s = format_daily_report(date(2026, 10, 16), rows, "")
+    assert "|" not in s  # 企业微信群机器人 markdown（v1）不渲染表格
