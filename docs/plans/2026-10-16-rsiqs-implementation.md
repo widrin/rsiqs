@@ -496,19 +496,31 @@ git commit -m "feat(engine): add Bar, Pick, Fill value types"
 - Create: `engine/rules.py`
 - Test: `tests/test_rules.py`
 
-要点：涨跌停价用 `Decimal(str(prev_close))` + `ROUND_HALF_UP`。例：10.05×1.1=11.055→**11.06**，10.05×0.9=9.045→**9.05**；直接用 float 会得到 11.05/9.04（错误）。ST 只对主板生效（创业板/科创板 ST 仍为 20%）。整手统一按 100 股向下取整（科创板 200 股起买未建模，已在 docstring 注明）。
+要点：
+- 涨跌停价用 `Decimal(str(prev_close))` + `ROUND_HALF_UP`。例：10.05×1.1=11.055→**11.06**，10.05×0.9=9.045→**9.05**；直接用 float 会得到 11.05/9.04（错误）。
+- 板块：代码以 "30" 开头的都算创业板（300/301/302，302132 中航成飞自 2025-02-17 起属创业板）。
+- 涨跌幅和费用按日期生效：`limit_pct`、`limit_prices`、`calc_fee` 末尾有可选参数 `d`，`None` 表示当前规则。北交所 30%、科创板 20%；创业板 2020-08-24 起 20%，此前 10%（ST 5%）；主板 10%，主板 ST 在 2026-07-06 前为 5%、之后为 10%。过户费 2022-04-29 前 0.002%、之后 0.001%；印花税（仅卖出）2023-08-28 前 0.1%、之后 0.05%；佣金万 2.5、最低 5 元。各生效日期是模块级常量，各附一行来源注释。`d` 传 `datetime`/`pandas.Timestamp` 时按其日期处理。
+- `calc_fee` 的 side 只能是 "BUY" 或 "SELL"，否则抛 ValueError。
+- `at_limit_up(price, up)` / `at_limit_down(price, down)` 容忍一档价差（0.01 元）：前复权价格是原始价格缩放后再舍入到分，封板股的复权价可能与按复权昨收算出的涨跌停价差一分钱。对原始价格的影响是离涨停（跌停）差一分钱也按涨停（跌停）处理，结果略偏保守。
+- 整手统一按 100 股向下取整（科创板 200 股起买未建模，已在 docstring 注明）。
 
 **Step 1: 写失败测试** `tests/test_rules.py`
 
 ```python
+from datetime import date, datetime, timedelta
+
 import pytest
 
-from engine.rules import Board, board, calc_fee, is_st, limit_pct, limit_prices, round_lot
+from engine import rules
+from engine.rules import (Board, at_limit_down, at_limit_up, board, calc_fee, is_st, limit_pct,
+                          limit_prices, round_lot)
+
+DAY = timedelta(days=1)
 
 
 @pytest.mark.parametrize("code,expected", [
     ("600000", Board.MAIN), ("000001", Board.MAIN), ("002594", Board.MAIN),
-    ("300750", Board.CHINEXT), ("301269", Board.CHINEXT),
+    ("300750", Board.CHINEXT), ("301269", Board.CHINEXT), ("302132", Board.CHINEXT),
     ("688981", Board.STAR), ("689009", Board.STAR),
     ("830799", Board.BSE), ("430047", Board.BSE), ("920001", Board.BSE),
 ])
@@ -522,7 +534,7 @@ def test_is_st():
 
 
 @pytest.mark.parametrize("code,name,pct", [
-    ("600000", "浦发银行", 0.10), ("600000", "*ST浦发", 0.05),
+    ("600000", "浦发银行", 0.10), ("600000", "*ST浦发", 0.10),
     ("300750", "宁德时代", 0.20), ("300750", "ST宁德", 0.20),
     ("688981", "中芯国际", 0.20), ("830799", "艾融软件", 0.30),
 ])
@@ -537,7 +549,9 @@ def test_limit_prices_half_up():
 
 def test_limit_prices_boards():
     assert limit_prices("300750", "宁德时代", 10.0) == (12.0, 8.0)
-    assert limit_prices("600000", "ST浦发", 3.33) == (3.50, 3.16)  # 3.4965->3.50, 3.1635->3.16
+    # 3.4965->3.50, 3.1635->3.16
+    assert limit_prices("600000", "ST浦发", 3.33, date(2026, 7, 3)) == (3.50, 3.16)
+    assert limit_prices("600000", "ST浦发", 3.33) == (3.66, 3.00)  # 主板 ST 自 2026-07-06 起 ±10%
     assert limit_prices("830799", "", 10.0) == (13.0, 7.0)
 
 
@@ -562,6 +576,71 @@ def test_fee_sell_has_stamp():
     # 100000: 25 + 1 + 50
     assert calc_fee("SELL", 100_000) == 76.0
     assert calc_fee("SELL", 10_000) == 10.10
+
+
+def test_fee_rejects_unknown_side():
+    for side in ("buy", "sell", "HOLD", ""):
+        with pytest.raises(ValueError):
+            calc_fee(side, 10_000)
+
+
+def test_chinext_limit_switch_date():
+    d = rules.CHINEXT_20PCT_FROM
+    assert d == date(2020, 8, 24)
+    assert limit_pct("300750", "宁德时代", d - DAY) == 0.10
+    assert limit_pct("300750", "ST宁德", d - DAY) == 0.05
+    assert limit_pct("300750", "宁德时代", d) == 0.20
+    assert limit_pct("300750", "ST宁德", d) == 0.20
+    assert limit_prices("300750", "宁德时代", 10.0, d - DAY) == (11.0, 9.0)
+    assert limit_pct("300750", "宁德时代", datetime(2020, 8, 21, 15, 0)) == 0.10  # datetime/Timestamp ok
+
+
+def test_main_board_st_limit_switch_date():
+    d = rules.MAIN_ST_10PCT_FROM
+    assert d == date(2026, 7, 6)
+    assert limit_pct("600000", "*ST浦发", d - DAY) == 0.05
+    assert limit_pct("600000", "*ST浦发", d) == 0.10
+    assert limit_pct("600000", "浦发银行", d - DAY) == 0.10
+    assert limit_prices("000001", "ST平安", 10.0, d - DAY) == (10.5, 9.5)
+    assert limit_prices("000001", "ST平安", 10.0, d) == (11.0, 9.0)
+
+
+def test_star_and_bse_limits_ignore_date_and_st():
+    for d in (date(2019, 7, 22), None):
+        assert limit_pct("688981", "ST中芯", d) == 0.20
+        assert limit_pct("830799", "ST艾融", d) == 0.30
+
+
+def test_302132_is_chinext():
+    assert limit_pct("302132", "中航成飞", date(2025, 2, 17)) == 0.20
+    assert limit_prices("302132", "中航成飞", 50.0) == (60.0, 40.0)
+
+
+def test_transfer_fee_switch_date():
+    d = rules.TRANSFER_CUT_FROM
+    assert d == date(2022, 4, 29)
+    # 100000: commission 25 + transfer 2 (0.002%) / 1 (0.001%)
+    assert calc_fee("BUY", 100_000, d - DAY) == 27.0
+    assert calc_fee("BUY", 100_000, d) == 26.0
+
+
+def test_stamp_duty_switch_date():
+    d = rules.STAMP_CUT_FROM
+    assert d == date(2023, 8, 28)
+    # 100000: commission 25 + transfer 1 + stamp 100 (0.1%) / 50 (0.05%)
+    assert calc_fee("SELL", 100_000, d - DAY) == 126.0
+    assert calc_fee("SELL", 100_000, d) == 76.0
+    assert calc_fee("BUY", 100_000, d - DAY) == 26.0  # stamp duty is sell-only
+    # before both cuts: 25 + 2 + 100
+    assert calc_fee("SELL", 100_000, date(2020, 1, 2)) == 127.0
+
+
+def test_limit_tolerance_one_tick():
+    # forward-adjusted prices can sit one cent off the computed limit
+    assert at_limit_up(11.06, 11.06) and at_limit_up(11.05, 11.06) and at_limit_up(11.2, 11.06)
+    assert not at_limit_up(11.04, 11.06)
+    assert at_limit_down(9.05, 9.05) and at_limit_down(9.06, 9.05) and at_limit_down(9.0, 9.05)
+    assert not at_limit_down(9.07, 9.05)
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -575,9 +654,30 @@ uv run pytest tests/test_rules.py -v
 **Step 3: 最小实现** `engine/rules.py`
 
 ```python
-"""A-share trading rules: boards, price limits, lots, fees."""
+"""A-share trading rules: boards, price limits, lots, fees.
+
+Rules that changed over time take an optional trailing ``d``; ``d=None`` means the current rules.
+"""
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
+
+# 创业板注册制首批股票上市日起涨跌幅 10% -> 20%（深交所《创业板交易特别规定》）
+CHINEXT_20PCT_FROM = date(2020, 8, 24)
+# 中国结算下调过户费：成交额的 0.002% -> 0.001%，2022-04-29 起执行
+TRANSFER_CUT_FROM = date(2022, 4, 29)
+# 财政部、税务总局减半征收证券交易印花税：0.1% -> 0.05%，2023-08-28 起执行
+STAMP_CUT_FROM = date(2023, 8, 28)
+# 沪深交易所 2026-04-24 发布修订后的交易规则：主板 ST 5% -> 10%，2026-07-06 起执行
+MAIN_ST_10PCT_FROM = date(2026, 7, 6)
+
+
+def _in_force(since: date, d: date | None) -> bool:
+    if d is None:
+        return True
+    if isinstance(d, datetime):  # also covers pandas.Timestamp
+        d = d.date()
+    return d >= since
 
 
 class Board(Enum):
@@ -588,7 +688,7 @@ class Board(Enum):
 
 
 def board(code: str) -> Board:
-    if code.startswith(("300", "301")):
+    if code.startswith("30"):  # 300/301/302
         return Board.CHINEXT
     if code.startswith(("688", "689")):
         return Board.STAR
@@ -601,23 +701,51 @@ def is_st(name: str) -> bool:
     return "ST" in name.upper()
 
 
-def limit_pct(code: str, name: str = "") -> float:
+def limit_pct(code: str, name: str = "", d: date | None = None) -> float:
     b = board(code)
     if b is Board.BSE:
         return 0.30
-    if b in (Board.CHINEXT, Board.STAR):
+    if b is Board.STAR:
         return 0.20
-    return 0.05 if is_st(name) else 0.10
+    if b is Board.CHINEXT:
+        if _in_force(CHINEXT_20PCT_FROM, d):
+            return 0.20
+        return 0.05 if is_st(name) else 0.10
+    if is_st(name) and not _in_force(MAIN_ST_10PCT_FROM, d):
+        return 0.05
+    return 0.10
 
 
-def limit_prices(code: str, name: str, prev_close: float) -> tuple[float, float]:
+def limit_prices(code: str, name: str, prev_close: float, d: date | None = None) -> tuple[float, float]:
     """(limit_up, limit_down) rounded half-up to 0.01, computed in Decimal to avoid float drift."""
     pc = Decimal(str(prev_close))
-    pct = Decimal(str(limit_pct(code, name)))
+    pct = Decimal(str(limit_pct(code, name, d)))
     cent = Decimal("0.01")
     up = (pc * (1 + pct)).quantize(cent, rounding=ROUND_HALF_UP)
     down = (pc * (1 - pct)).quantize(cent, rounding=ROUND_HALF_UP)
     return float(up), float(down)
+
+
+def at_limit_up(price: float, up: float) -> bool:
+    """True when ``price`` is at the limit-up price, with one tick (0.01) of tolerance.
+
+    Daily bars are forward-adjusted (前复权): adjusted prices are raw prices rescaled and rounded
+    to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
+    adjusted prev_close. The tolerance absorbs that rounding. Effect on raw prices: a price exactly
+    one cent below the true limit also counts as limit-up (a buy there is skipped), which only
+    makes the simulation slightly more conservative.
+    """
+    return round(price * 100) >= round(up * 100) - 1
+
+
+def at_limit_down(price: float, down: float) -> bool:
+    """True when ``price`` is at the limit-down price, with one tick (0.01) of tolerance.
+
+    Same reason as ``at_limit_up``: forward-adjusted rounding can leave a sealed limit-down one cent
+    off. Effect on raw prices: a high exactly one cent above the true limit-down also counts as
+    sealed (the sell is skipped), again erring on the conservative side.
+    """
+    return round(price * 100) <= round(down * 100) + 1
 
 
 def round_lot(qty: float) -> int:
@@ -630,14 +758,19 @@ def round_lot(qty: float) -> int:
 
 COMMISSION_RATE = 0.00025
 COMMISSION_MIN = 5.0
-TRANSFER_RATE = 0.00001
-STAMP_RATE = 0.0005
+TRANSFER_RATE = 0.00001  # from TRANSFER_CUT_FROM
+TRANSFER_RATE_OLD = 0.00002
+STAMP_RATE = 0.0005  # from STAMP_CUT_FROM, sell side only
+STAMP_RATE_OLD = 0.001
 
 
-def calc_fee(side: str, amount: float) -> float:
-    fee = max(amount * COMMISSION_RATE, COMMISSION_MIN) + amount * TRANSFER_RATE
+def calc_fee(side: str, amount: float, d: date | None = None) -> float:
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"side must be 'BUY' or 'SELL', got {side!r}")
+    transfer = TRANSFER_RATE if _in_force(TRANSFER_CUT_FROM, d) else TRANSFER_RATE_OLD
+    fee = max(amount * COMMISSION_RATE, COMMISSION_MIN) + amount * transfer
     if side == "SELL":
-        fee += amount * STAMP_RATE
+        fee += amount * (STAMP_RATE if _in_force(STAMP_CUT_FROM, d) else STAMP_RATE_OLD)
     return round(fee, 2)
 ```
 
@@ -646,7 +779,7 @@ def calc_fee(side: str, amount: float) -> float:
 ```powershell
 uv run pytest tests/test_rules.py -v
 ```
-预期：23 passed。
+预期：32 passed（`test_board` 11 个、`test_limit_pct` 6 个参数化用例）。
 
 
 **Step 5: Commit**
