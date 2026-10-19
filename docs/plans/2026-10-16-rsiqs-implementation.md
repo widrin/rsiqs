@@ -1809,17 +1809,18 @@ git commit -m "feat(engine): add open-auction SimBroker"
 ## Part 2: 存储、指标、回测与评估器
 
 > 契约歧义的取舍（每条一行）：
-> - `summarize` 的 `excess_ann` 与 `promotion.compare` 的年化超额 = 逐日超额收益（inner join 对齐）均值 × 252（算术年化）。
+> - `summarize` 的 `excess_ann` 与 `promotion.compare` 的年化超额 = 逐日超额收益均值 × 252（算术年化）。`compare` 先按日期对齐两条净值再算收益（一方缺日时两边都用跨过缺口的同一段收益）；`summarize` 的 `n_days` 是收益天数（净值点数减一）。
 > - `deflated_sharpe` 使用每期（日）SR；各试验 SR 的方差近似为 `1/n_obs`（零假设下 SR 估计量方差），`n_trials<=1` 时 SR0=0；逆正态用标准库 `statistics.NormalDist().inv_cdf`，CDF 用 `math.erf`。
 > - `sharpe` 把 `std <= 1e-12`（含 pandas 浮点噪声，如 `[0.1]*3` 的 std≈1.7e-17）按 `std==0` 处理，返回 0。
-> - `DataView.asof` 为只读 property；私有状态用 `__slots__` + 双下划线名字改编（沙箱禁止 `__` 属性访问，策略拿不到完整面板）；`bar_on` 当日无数据抛 `KeyError`。
-> - `run_backtest`：净值按"最近收盘价"估值（停牌沿用上次收盘）；持有期越过日历末尾的 pick 当日丢弃；`benchmark_nav` 索引先 `pd.to_datetime` 归一（兼容 date 对象索引）。
+> - `DataView.asof` 为只读 property；私有状态用 `__slots__` + 双下划线名字改编。改编后的 `_DataView__panel` 仍可访问，挡住它靠两层：Task 3.6 的源码检查禁止任何含 `__` 的属性、名字和标识符式字符串；`run_backtest` 只把截断到本段末尾的面板交给 DataView，训练、验证段看不到之后的数据。`codes()` 只列出 asof 时已有数据的股票；`bar_on` 当日无数据抛 `KeyError`。
+> - `run_backtest`：净值第一个点是 start 前一交易日的期初资金（首日建仓成本和涨跌计入指标，基准同样从这一天起算）；按"最近有效收盘价"估值（停牌或收盘价为 NaN 时沿用上一个有效收盘价）；持有期越过日历末尾的 pick 当日丢弃；`benchmark_nav` 索引先 `pd.to_datetime` 归一（兼容 date 对象索引）；每天的行情用 `DayBars`（一次性转成数组，按日二分查找）取，结果与 `bars_for_day` 相同。
 > - `evaluate` 增加仅供测试的可选关键字参数 `splits: dict|None=None`（默认 `SPLITS`）；holdout 的 `None` 解析为 `min(calendar.last(), 面板最后有数据日)`，因为新浪交易日历含未来日期。
-> - `evaluate` 的 DSR 用训练+验证两段日收益拼接计算，`n_trials` 含本次；所有门槛比较为 `>=`；留出期 `n_days==0` 视为不通过。
+> - `evaluate` 的 DSR 用训练+验证两段日收益拼接计算，`n_trials` 含本次；所有门槛比较为 `>=`；留出期 `n_days==0` 视为不通过。试验在回放留出期之前入库（`holdout_pass` 先记为 None，跑完再更新）；训练、验证段报错时同样入库（夏普记为 None）再抛出；留出期任何异常（含 `SystemExit`）都只记为未通过，不外传异常文本。
 > - `to_agent_dict` 返回 `strategy, train, val, dsr, gate_pass, holdout_pass, n_trials`（dsr/n_trials 只来自训练+验证）；`EvalReport` 本身不保存任何留出期数值。
 > - `Store` 用一把 `RLock` 串行化同一 sqlite 连接（`check_same_thread=False`），供 `agents/premarket.run_final` 双线程共用；`set_status` 对非法状态抛 `ValueError`。
-> - `promotion.decide`：无现任时以 `bench:csi300` 净值为基准；晋升取年化超额最大者，旧现任全部 `retired`；降级 = 无晋升时，若某影子已有 ≥`DEMOTE_WINDOW` 个影子期净值点且现任最近 `DEMOTE_WINDOW` 点相对它年化超额 ≤`DEMOTE_EXCESS_ANN`，现任降为 `shadow`、落后最多的那个影子接任（算作本次唯一的晋升）。
-> - `integrity` 计算哈希前把 `\r\n` 归一为 `\n`（防 Windows git autocrlf 误报）；清单缺失时 `verify` 返回 `[MANIFEST_PATH]`（视为不通过）。
+> - `promotion.decide`：无现任时以 `bench:csi300` 净值为基准；影子期按收益日计数，净值从进入影子后第一个交易日的前一交易日（结算记基线的那天）开始取；晋升取年化超额最大者，旧现任全部 `retired`；降级 = 无晋升时，若某影子已有 ≥`DEMOTE_WINDOW` 个收益日，且现任最近 `DEMOTE_WINDOW` 个收益日相对它年化超额 ≤`DEMOTE_EXCESS_ANN`、t ≤ `-DEMOTE_T`，现任降为 `shadow`、落后最多的那个影子接任（算作本次唯一的晋升）。降级也要求显著，否则零超额的噪声会让现任和影子来回换位。
+> - `integrity` 覆盖 `.py` 和 `.pyw`，计算哈希前把 `\r\n` 归一为 `\n`（防 Windows git autocrlf 误报）；清单缺失、损坏或格式不对时 `verify` 返回 `[MANIFEST_PATH]`（视为不通过）；读取时用 `utf-8-sig`，兼容记事本加的 BOM。
+> - `Store.record_nav` 拒绝非有限净值（SQLite 会把 NaN 存成 NULL）；`add_trial` 返回试验 id，另有 `set_trial_holdout`、`last_trial`。
 
 本部分依赖 Part 1 的 `engine/types.py`（Bar/Pick/Fill）、`engine/rules.py`、`engine/calendar.py`（TradingCalendar）、`engine/ledger.py`（Account）、`engine/broker.py`（SimBroker）。按顺序执行：2.1 → 2.2 → 2.3 → 2.4 → 2.5（依赖 2.1–2.4）→ 2.6 → 2.7（依赖 2.1）→ 2.8。
 
@@ -1843,6 +1844,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+import engine.store as store_mod
 from engine.ledger import Account
 from engine.store import Store
 from engine.types import Pick
@@ -1860,8 +1862,10 @@ def _pick(code="600000"):
 def test_account_roundtrip(store):
     acc = Account(name="q:baseline_momo", cash=500_000.0)
     acc.buy(date(2026, 1, 5), "600000", "浦发银行", 10.0, 1000, 9.3, 11.0, date(2026, 1, 12))
+    acc.last_trade_day = date(2026, 1, 5)
     store.save_account(acc)
     got = store.load_account("q:baseline_momo")
+    assert got == acc and got.last_trade_day == date(2026, 1, 5)
     assert got.cash == pytest.approx(acc.cash)
     assert got.positions["600000"].qty == 1000
     assert got.positions["600000"].exit_date == date(2026, 1, 12)
@@ -1907,11 +1911,15 @@ def test_jobs(store):
     assert store.job_done("settle", d)
     assert not store.job_done("settle", date(2026, 1, 6))
 
-def test_llm_usage_month_cost(store):
-    store.add_llm_usage("premarket:active", 1000, 200, 1.5)
+def test_llm_usage_month_cost(store, monkeypatch):
+    stamps = iter(["2026-01-31T23:59:59", "2026-02-01T00:00:00", "2025-01-15T10:00:00"])
+    monkeypatch.setattr(store_mod, "_now", lambda: next(stamps))
+    store.add_llm_usage("premarket:active", 1000, 200, 1.0)
     store.add_llm_usage("review", 1000, 200, 2.0)
-    today = date.today()
-    assert store.month_llm_cost(today.year, today.month) == pytest.approx(3.5)
+    store.add_llm_usage("research", 1000, 200, 4.0)
+    assert store.month_llm_cost(2026, 1) == pytest.approx(1.0)
+    assert store.month_llm_cost(2026, 2) == pytest.approx(2.0)
+    assert store.month_llm_cost(2025, 1) == pytest.approx(4.0)
     assert store.month_llm_cost(2000, 1) == 0.0
 
 
@@ -1947,19 +1955,45 @@ def test_kv(store):
     assert store.kv_get("k") == {"a": [1, 2]}
 
 
-def test_store_shared_across_threads(store):
+def test_store_shared_across_threads(store, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
+    monkeypatch.setattr(store_mod, "_now", lambda: "2026-03-10T09:00:00")
     with ThreadPoolExecutor(2) as ex:
         list(ex.map(lambda i: store.add_llm_usage(f"p{i}", 1, 1, 1.0), range(50)))
-    today = date.today()
-    assert store.month_llm_cost(today.year, today.month) == pytest.approx(50.0)
+    assert store.month_llm_cost(2026, 3) == pytest.approx(50.0)
 
 
 def test_file_db_persists(tmp_path):
     p = tmp_path / "sub" / "x.sqlite"
     Store(p).kv_set("a", 1)
     assert Store(p).kv_get("a") == 1
+
+
+def test_nav_series_sorted_regardless_of_insert_order(store):
+    for d in (date(2026, 1, 8), date(2026, 1, 6), date(2026, 1, 7), date(2026, 1, 5)):
+        store.record_nav("b", d, float(d.day))
+    s = store.nav_series("b")
+    assert list(s.index) == [pd.Timestamp(f"2026-01-0{i}") for i in (5, 6, 7, 8)]
+    assert list(s) == [5.0, 6.0, 7.0, 8.0]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_record_nav_rejects_non_finite(store, bad):
+    with pytest.raises(ValueError):
+        store.record_nav("a", date(2026, 1, 5), bad)
+    assert store.nav_series("a").empty
+
+
+def test_trial_holdout_update_and_last_trial(store):
+    assert store.last_trial("a") is None
+    tid = store.add_trial("a", {}, 0.6, None, True, None)  # val 夏普缺失也能入库
+    store.add_trial("b", {}, 0.1, 0.2, False, None)
+    assert store.last_trial("a")["holdout_pass"] is None and store.last_trial("a")["val_sharpe"] is None
+    store.set_trial_holdout(tid, True)
+    t = store.last_trial("a")
+    assert t["id"] == tid and t["gate_pass"] is True and t["holdout_pass"] is True
+    assert store.recent_trials(2)[1]["holdout_pass"] is True
 ```
 
 **Step 2: 运行，确认失败**
@@ -1977,6 +2011,7 @@ uv run pytest tests/test_store.py -v
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import date, datetime
@@ -2047,7 +2082,10 @@ class Store:
 
     # ---- nav ----
     def record_nav(self, account: str, d: date, equity: float) -> None:
-        self._exec("INSERT OR REPLACE INTO nav VALUES (?, ?, ?)", (account, d.isoformat(), float(equity)))
+        equity = float(equity)
+        if not math.isfinite(equity):  # SQLite 会把 NaN 存成 NULL，之后 nav_series 永远读不出来
+            raise ValueError(f"{account} {d}: equity must be finite, got {equity!r}")
+        self._exec("INSERT OR REPLACE INTO nav VALUES (?, ?, ?)", (account, d.isoformat(), equity))
 
     def nav_series(self, account: str) -> pd.Series:
         rows = self._all("SELECT d, equity FROM nav WHERE account=? ORDER BY d", (account,))
@@ -2094,24 +2132,43 @@ class Store:
         return float(row[0])
 
     # ---- trials ----
-    def add_trial(self, strategy: str, params: dict, train_sharpe: float, val_sharpe: float,
-                  gate_pass: bool, holdout_pass: bool | None) -> None:
-        self._exec("INSERT INTO trials (ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass) "
-                   "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (_now(), strategy, _dump(params), float(train_sharpe), float(val_sharpe), int(bool(gate_pass)),
-                    None if holdout_pass is None else int(bool(holdout_pass))))
+    def add_trial(self, strategy: str, params: dict, train_sharpe: float | None, val_sharpe: float | None,
+                  gate_pass: bool, holdout_pass: bool | None) -> int:
+        """记录一次试验，返回其 id。回测中途失败时夏普可以为 None。"""
+        def num(x):
+            return None if x is None or not math.isfinite(float(x)) else float(x)
+
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO trials (ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_now(), strategy, _dump(params), num(train_sharpe), num(val_sharpe), int(bool(gate_pass)),
+                 None if holdout_pass is None else int(bool(holdout_pass))))
+            return int(cur.lastrowid)
+
+    def set_trial_holdout(self, trial_id: int, holdout_pass: bool) -> None:
+        self._exec("UPDATE trials SET holdout_pass=? WHERE id=?", (int(bool(holdout_pass)), int(trial_id)))
 
     def trial_count(self, strategy: str | None = None) -> int:
         if strategy is None:
             return int(self._one("SELECT COUNT(*) FROM trials")[0])
         return int(self._one("SELECT COUNT(*) FROM trials WHERE strategy=?", (strategy,))[0])
 
+    _TRIAL_COLS = "id, ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass"
+
+    @staticmethod
+    def _trial(r) -> dict:
+        return {"id": r[0], "ts": r[1], "strategy": r[2], "params": json.loads(r[3]), "train_sharpe": r[4],
+                "val_sharpe": r[5], "gate_pass": bool(r[6]), "holdout_pass": None if r[7] is None else bool(r[7])}
+
     def recent_trials(self, n: int = 20) -> list[dict]:
-        rows = self._all("SELECT ts, strategy, params, train_sharpe, val_sharpe, gate_pass, holdout_pass "
-                         "FROM trials ORDER BY id DESC LIMIT ?", (n,))
-        return [{"ts": r[0], "strategy": r[1], "params": json.loads(r[2]), "train_sharpe": r[3],
-                 "val_sharpe": r[4], "gate_pass": bool(r[5]), "holdout_pass": None if r[6] is None else bool(r[6])}
-                for r in rows]
+        rows = self._all(f"SELECT {self._TRIAL_COLS} FROM trials ORDER BY id DESC LIMIT ?", (n,))
+        return [self._trial(r) for r in rows]
+
+    def last_trial(self, strategy: str) -> dict | None:
+        row = self._one(f"SELECT {self._TRIAL_COLS} FROM trials WHERE strategy=? ORDER BY id DESC LIMIT 1",
+                        (strategy,))
+        return self._trial(row) if row else None
 
     # ---- strategy status ----
     def set_status(self, strategy: str, status: str, d: date) -> None:
@@ -2187,6 +2244,8 @@ def test_annualized_return():
     r = _s([0.01] * 252)
     assert m.annualized_return(r) == pytest.approx(1.01 ** 252 - 1)
     assert m.annualized_return(_s([])) == 0.0
+    assert m.annualized_return(_s([-0.5, -0.6, 0.1])) == pytest.approx(0.22 ** (252 / 3) - 1)
+    assert m.annualized_return(_s([0.1, -1.0])) == -1.0  # 净值归零
 
 
 def test_sharpe_hand_computed():
@@ -2227,8 +2286,28 @@ def test_summarize():
     assert set(s) == {"total_return", "ann_return", "sharpe", "max_dd", "excess_ann", "n_days"}
     assert s["total_return"] == pytest.approx(0.089)
     assert s["max_dd"] == pytest.approx(-0.1)
-    assert s["n_days"] == 4
+    assert s["n_days"] == 3  # 收益天数：净值第一个点是起点
     assert s["excess_ann"] == pytest.approx((0.1 - 0.1 + 0.1) / 3 * 252)
+
+
+def test_deflated_sharpe_reference_values():
+    # 参考值由独立实现复算（Bailey & Lopez de Prado 2014，kurt 为非超额峰度）
+    assert m.deflated_sharpe(0.1, 10, 250, skew=-0.5, kurt=5.0) == pytest.approx(0.5025292790757397, rel=1e-9)
+    assert m.deflated_sharpe(0.1, 100, 500) == pytest.approx(0.38456717973214927, rel=1e-9)
+    assert m.deflated_sharpe(0.1, 2, 250) < m.deflated_sharpe(0.1, 1, 250)
+    # 负偏度让 DSR 更低（A 股策略常见左偏）
+    assert m.deflated_sharpe(0.1, 10, 250, skew=-0.5) < m.deflated_sharpe(0.1, 10, 250, skew=0.5)
+
+
+def test_summarize_with_moving_benchmark():
+    nav = _s([100, 103, 101, 106, 104, 109])
+    bench = _s([100, 101, 103, 102, 104, 105])
+    s = m.summarize(nav, bench)
+    r = m.daily_returns(nav)
+    assert s["sharpe"] == pytest.approx(m.sharpe(r))
+    assert s["ann_return"] == pytest.approx(m.annualized_return(r))
+    assert s["excess_ann"] == pytest.approx(float((r - m.daily_returns(bench)).mean() * 252))
+    assert s["sharpe"] != pytest.approx(m.sharpe(r - m.daily_returns(bench)))
 ```
 
 **Step 2: 运行，确认失败**
@@ -2315,7 +2394,7 @@ def summarize(nav: pd.Series, bench_nav: pd.Series) -> dict:
         "sharpe": sharpe(r),
         "max_dd": max_drawdown(nav),
         "excess_ann": float(ex.mean() * 252) if len(ex) else 0.0,
-        "n_days": int(len(nav)),
+        "n_days": int(len(r)),  # 收益天数；nav 的第一个点是起点（回测为期初资金）
     }
 ```
 
@@ -2398,6 +2477,8 @@ def test_asof_readonly_and_state_sealed(view):
     with pytest.raises(AttributeError):
         view.asof = date(2030, 1, 1)
     assert not hasattr(view, "_panel") and not hasattr(view, "panel")
+    # 改编后的名字仍然存在：挡住它靠的是策略源码检查（Task 3.6）和 run_backtest 按段截断的面板
+    assert hasattr(view, "_DataView__panel")
     with pytest.raises(TypeError):
         vars(view)  # 无 __dict__
 
@@ -2406,6 +2487,26 @@ def test_history_zero_and_unknown(view):
     assert view.history("600000", 0).empty
     with pytest.raises(KeyError):
         view.history("999999")
+
+
+def test_codes_exclude_stocks_not_yet_listed():
+    panel = {"600000": _frame(), "000001": _frame(start="2026-01-12")}  # 000001 在 asof 之后才上市
+    v = DataView(panel, {}, asof=date(2026, 1, 9))
+    assert v.codes() == ["600000"]
+    assert DataView(panel, {}, asof=date(2026, 1, 12)).codes() == ["000001", "600000"]
+    assert DataView({"600000": _frame().iloc[:0]}, {}, asof=date(2026, 1, 9)).codes() == []
+
+
+def test_history_n_larger_than_available(view):
+    assert len(view.history("600000", 7)) == 5
+
+
+def test_bar_on_missing_day_raises_key_error(view):
+    with pytest.raises(KeyError):
+        view.bar_on("600000", date(2026, 1, 3))  # 周六
+    panel = {"600000": _frame().drop(pd.Timestamp("2026-01-07"))}  # 停牌日没有这一行
+    with pytest.raises(KeyError):
+        DataView(panel, {}, asof=date(2026, 1, 9)).bar_on("600000", date(2026, 1, 7))
 ```
 
 **Step 2: 运行，确认失败**
@@ -2434,22 +2535,25 @@ class LookaheadError(Exception):
 
 
 class DataView:
-    # 私有状态用双下划线（名字改编为 _DataView__xxx）且无 __dict__：
-    # 沙箱禁止含 "__" 的属性访问，策略代码因此拿不到完整面板。
-    __slots__ = ("__panel", "__names", "__asof", "__ts")
+    # 私有状态用双下划线（名字改编为 _DataView__xxx）且无 __dict__。改编后的名字仍可访问，挡住它的是
+    # 策略源码检查（Task 3.6 禁止任何含 "__" 的属性、名字和标识符式字符串），以及 run_backtest
+    # 只把截断到本段末尾的面板交给 DataView（训练、验证段看不到之后的数据）。
+    __slots__ = ("__panel", "__names", "__asof", "__ts", "__codes")
 
     def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str], asof: date):
         self.__panel = panel
         self.__names = names
         self.__asof = asof
         self.__ts = pd.Timestamp(asof)
+        # 只列出 asof 时已经有数据的股票：之后才上市的代码本身就是未来信息
+        self.__codes = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= self.__ts)
 
     @property
     def asof(self) -> date:
         return self.__asof
 
     def codes(self) -> list[str]:
-        return sorted(self.__panel)
+        return list(self.__codes)
 
     def name(self, code: str) -> str:
         return self.__names.get(code, "")
@@ -2490,7 +2594,7 @@ git commit -m "feat: add lookahead-safe DataView" -m "Co-Authored-By: Claude Opu
 - Create: `engine/backtest.py`
 - Test: `tests/test_backtest.py`
 
-合成 3 只股票的面板 + 简单策略；验证 select 收到的 asof 恰为 `calendar.prev_day(t)`；偷看未来的策略在回测中直接抛出 `LookaheadError`。`bars_for_day` 跳过 `prev_close` 为 NaN 的行（上市首日/面板首行），也供 `jobs.settle` 使用。
+合成 3 只股票的面板 + 简单策略；验证 select 收到的 asof 恰为 `calendar.prev_day(t)`；偷看未来的策略在回测中直接抛出 `LookaheadError`。`bars_for_day` 跳过 `prev_close` 为 NaN 的行（手工构造的面板首行；Task 3.2 的 `load_panel` 会把首行昨收填成开盘价），也供 `jobs.settle` 使用。
 
 **Step 1: 写失败测试** `tests/test_backtest.py`
 
@@ -2500,7 +2604,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from engine.backtest import BacktestResult, bars_for_day, run_backtest
+from engine.backtest import BacktestResult, DayBars, bars_for_day, run_backtest
 from engine.calendar import TradingCalendar
 from engine.dataview import LookaheadError
 from engine.types import Pick
@@ -2580,12 +2684,13 @@ def test_peeking_strategy_raises():
 def test_backtest_result_shape_and_trading():
     res = run_backtest(Recorder(), _panel(), NAMES, CAL, DAYS[2], DAYS[20], BENCH, capital=100_000, max_picks=1)
     assert isinstance(res, BacktestResult)
-    assert list(res.nav.index) == [pd.Timestamp(d) for d in CAL.between(DAYS[2], DAYS[20])]
-    assert res.nav.iloc[0] < 100_000  # 首日买入扣了费用和滑点
+    # 第一个点是 start 前一交易日的期初资金，首日的建仓成本和涨跌因此计入指标
+    assert list(res.nav.index) == [IDX[1]] + [pd.Timestamp(d) for d in CAL.between(DAYS[2], DAYS[20])]
+    assert res.nav.iloc[0] == 100_000 and res.nav.iloc[1] < 100_000  # 首日买入扣了费用和滑点
     buys = [f for f in res.fills if f.side == "BUY"]
     assert buys and all(f.code == "600001" for f in buys)
     assert any(f.side == "SELL" and f.reason == "到期" for f in res.fills)
-    assert res.metrics["n_days"] == len(res.nav)
+    assert res.metrics["n_days"] == len(CAL.between(DAYS[2], DAYS[20])) == len(res.nav) - 1
     assert res.metrics["total_return"] > 0  # 买的是上涨股
 
 
@@ -2599,6 +2704,95 @@ def test_benchmark_with_date_index_is_normalized():
 def test_picks_beyond_calendar_end_dropped():
     res = run_backtest(Recorder(), _panel(), NAMES, CAL, DAYS[-2], DAYS[-1], BENCH)
     assert res.fills == []
+
+
+class BuyOnce:
+    """第一次被调用时买 600001，持有 hold 个交易日；止损止盈设得很远，只靠到期卖出。"""
+
+    def __init__(self, hold=10):
+        self.name, self.hold, self.done = "buy_once", hold, False
+
+    def select(self, view):
+        if self.done:
+            return []
+        self.done = True
+        last = float(view.history("600001", 1)["close"].iloc[-1])
+        return [Pick("600001", "上涨股", 1.0, last * 1.05, last * 0.5, last * 2.0, self.hold)]
+
+
+def test_nav_marks_to_market_and_suspended_day_keeps_last_close():
+    panel = _panel()
+    panel["600001"] = panel["600001"].drop(IDX[6])  # 停牌一天
+    res = run_backtest(BuyOnce(), panel, NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert [f.side for f in res.fills] == ["BUY"]
+    nav = res.nav
+    assert nav[IDX[1]] == 100_000 > nav[IDX[2]]
+    assert nav[IDX[2]] < nav[IDX[3]] < nav[IDX[4]] < nav[IDX[5]]  # 上涨股按市值计价，不是只算现金
+    assert nav[IDX[6]] == pytest.approx(nav[IDX[5]])  # 停牌日沿用上一个收盘价，不按成本估值
+
+
+def test_first_day_loss_counts_in_metrics():
+    closes = [10.0] * 3 + [9.2] * 27
+    opens = list(closes)
+    opens[3] = 10.0  # DAYS[3] 开盘 10.00 买入，收盘 9.20，之后横盘
+    panel = {"600001": _frame(closes, opens)}
+    res = run_backtest(BuyOnce(hold=20), panel, NAMES, CAL, DAYS[3], DAYS[15], BENCH, capital=100_000, max_picks=1)
+    assert [f.side for f in res.fills] == ["BUY"]
+    assert res.metrics["total_return"] < -0.07 and res.metrics["max_dd"] < -0.07
+
+
+@pytest.mark.parametrize("start,end,hold,bought", [
+    (DAYS[-5], DAYS[-1], 4, True),   # 到期日正好是日历最后一天
+    (DAYS[-5], DAYS[-1], 5, False),  # 越过日历末尾一天：丢弃
+    (DAYS[-5], DAYS[-3], 4, True),   # 持有期可以越过回测末端，只要不越过日历
+])
+def test_hold_period_horizon_boundary(start, end, hold, bought):
+    res = run_backtest(BuyOnce(hold), _panel(), NAMES, CAL, start, end, BENCH)
+    assert any(f.side == "BUY" for f in res.fills) is bought
+
+
+@pytest.mark.parametrize("bps", [10.0, 0.0])
+def test_budget_per_pick_and_slippage(bps):
+    res = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[4], BENCH, capital=100_000, max_picks=5,
+                       slippage_bps=bps)
+    f = res.fills[0]
+    assert f.price == pytest.approx(10.0 * 1.01 ** 2 * (1 + bps / 10_000))
+    assert 15_000 < f.price * f.qty <= 20_000  # 每只约占资金的 1/max_picks
+
+
+def test_nan_close_falls_back_to_last_finite_close():
+    panel = _panel()
+    panel["600001"].loc[IDX[6], "close"] = float("nan")
+    res = run_backtest(BuyOnce(), panel, NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert res.nav.notna().all()
+    assert res.nav[IDX[6]] == pytest.approx(res.nav[IDX[5]])
+
+
+class PanelProbe:
+    """测试专用：直接读改编后的私有面板（策略源码检查不允许这样写），确认面板已截断到本段末尾。"""
+    name = "probe"
+
+    def __init__(self):
+        self.max_seen = None
+
+    def select(self, view):
+        panel = view._DataView__panel
+        self.max_seen = max(df.index.max() for df in panel.values())
+        return []
+
+
+def test_strategy_never_receives_data_after_segment_end():
+    probe = PanelProbe()
+    run_backtest(probe, _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH)
+    assert probe.max_seen == IDX[10]
+
+
+def test_day_bars_matches_bars_for_day():
+    panel = _panel()
+    panel["600002"] = panel["600002"].drop(IDX[4])
+    index = DayBars(panel, NAMES)
+    for d in DAYS + [date(2030, 1, 1)]:
+        assert index.get(d) == bars_for_day(panel, NAMES, d)
 ```
 
 **Step 2: 运行，确认失败**
@@ -2615,9 +2809,11 @@ uv run pytest tests/test_backtest.py -v
 """逐日回放：t 日用 asof=t-1 的 DataView 选股，用 t 日 bar 撮合。"""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from engine.broker import SimBroker
@@ -2635,7 +2831,12 @@ class BacktestResult:
     metrics: dict
 
 
+_COLS = ["open", "high", "low", "close", "prev_close", "volume", "amount"]
+
+
 def bars_for_day(panel: dict[str, pd.DataFrame], names: dict[str, str], d: date) -> dict[str, Bar]:
+    """d 日有日线的股票的 Bar。昨收为 NaN 的行跳过（Part 3 的 load_panel 会把首行昨收填成开盘价，
+    所以真实数据里一般不会出现；手工构造的面板首行常为 NaN）。"""
     ts = pd.Timestamp(d)
     out: dict[str, Bar] = {}
     for code, df in panel.items():
@@ -2643,7 +2844,7 @@ def bars_for_day(panel: dict[str, pd.DataFrame], names: dict[str, str], d: date)
             continue
         row = df.loc[ts]
         prev = float(row["prev_close"])
-        if prev != prev:  # NaN：上市首日无昨收，跳过
+        if prev != prev:  # NaN：无昨收，跳过
             continue
         out[code] = Bar(code=code, date=d, open=float(row["open"]), high=float(row["high"]),
                         low=float(row["low"]), close=float(row["close"]), prev_close=prev,
@@ -2651,28 +2852,60 @@ def bars_for_day(panel: dict[str, pd.DataFrame], names: dict[str, str], d: date)
     return out
 
 
+def _ns(ts) -> np.ndarray:
+    return np.asarray(ts, dtype="datetime64[ns]").view("int64")
+
+
+class DayBars:
+    """回测用的按日索引：一次性把面板转成数组，每天对每只股票只做一次二分查找。结果与 bars_for_day 相同。"""
+
+    def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str]):
+        self._names = names
+        self._data = [(code, _ns(df.index.values), df[_COLS].to_numpy(dtype=float)) for code, df in panel.items()]
+
+    def get(self, d: date) -> dict[str, Bar]:
+        t = _ns([pd.Timestamp(d).to_datetime64()])[0]
+        out: dict[str, Bar] = {}
+        for code, keys, cols in self._data:
+            i = int(np.searchsorted(keys, t))  # 索引升序
+            if i >= len(keys) or keys[i] != t:
+                continue
+            o, h, lo, c, pc, v, a = (float(x) for x in cols[i])
+            if pc != pc:  # NaN：无昨收，跳过
+                continue
+            out[code] = Bar(code=code, date=d, open=o, high=h, low=lo, close=c, prev_close=pc,
+                            volume=v, amount=a, name=self._names.get(code, ""))
+        return out
+
+
 def run_backtest(strategy, panel, names, calendar: TradingCalendar, start: date, end: date,
                  benchmark_nav: pd.Series, capital: float = 500_000, max_picks: int = 5,
                  slippage_bps: float = 10.0) -> BacktestResult:
+    """nav 的第一个点是 start 前一交易日的期初资金，首日的建仓成本和涨跌因此计入指标。
+    策略拿到的面板截断到 end：本段回测看不到之后（例如留出期）的任何数据。"""
     acct = Account(name=f"bt:{getattr(strategy, 'name', 'strategy')}", cash=float(capital))
     broker = SimBroker(slippage_bps=slippage_bps)
     last_close: dict[str, float] = {}
     days = calendar.between(start, end)
     horizon = len(calendar.between(start, calendar.last()))
-    navs: list[float] = []
+    panel = {c: df.loc[:pd.Timestamp(end)] for c, df in panel.items()}
+    day_bars = DayBars(panel, names)
+    dates = [calendar.prev_day(days[0])] + days if days else []
+    navs: list[float] = [float(capital)] if days else []
     for i, t in enumerate(days):
         view = DataView(panel, names, asof=calendar.prev_day(t))
         picks = list(strategy.select(view))[:max_picks]
         # 持有期越过日历末尾的 pick 无法确定到期日，丢弃（t 之后还剩 horizon-1-i 个交易日）
         picks = [p for p in picks if p.hold_days <= horizon - 1 - i]
-        bars = bars_for_day(panel, names, t)
+        bars = day_bars.get(t)
         broker.execute_day(acct, t, bars, picks, calendar, capital / max_picks)
-        last_close.update({c: b.close for c, b in bars.items()})
+        # 收盘价缺失（NaN）时沿用上一个有效收盘价，净值不会变成 NaN
+        last_close.update({c: b.close for c, b in bars.items() if math.isfinite(b.close)})
         navs.append(acct.equity(last_close))
-    nav = pd.Series(navs, index=pd.DatetimeIndex([pd.Timestamp(t) for t in days]), dtype=float)
+    nav = pd.Series(navs, index=pd.DatetimeIndex([pd.Timestamp(t) for t in dates]), dtype=float)
     bench = benchmark_nav.copy()
     bench.index = pd.to_datetime(bench.index)  # 兼容 date 对象索引
-    bench = bench.sort_index().loc[pd.Timestamp(start):pd.Timestamp(end)]
+    bench = bench.sort_index().loc[pd.Timestamp(dates[0] if dates else start):pd.Timestamp(end)]
     return BacktestResult(nav=nav, fills=list(acct.trades), metrics=summarize(nav, bench))
 ```
 
@@ -2706,6 +2939,7 @@ import json
 from datetime import date
 
 import pandas as pd
+import pytest
 
 import engine.evaluator as ev
 from engine.calendar import TradingCalendar
@@ -2812,6 +3046,107 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
     assert isinstance(d["holdout_pass"], bool)
     assert str(sentinel) not in json.dumps(d)
     assert str(sentinel) not in repr(rep)
+
+
+GOOD_TRAIN = {"sharpe": 0.5}
+GOOD_VAL = {"sharpe": 0.8, "excess_ann": 0.03, "max_dd": -0.25}
+
+
+def test_gate_boundaries_inclusive_and_each_condition_counts():
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.90) is True
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.90 - 1e-9) is False
+    assert ev._passes_gate({"sharpe": 0.5 - 1e-9}, GOOD_VAL, 0.95) is False
+    for key in GOOD_VAL:
+        assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, key: GOOD_VAL[key] - 1e-9}, 0.95) is False, key
+    assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, "sharpe": float("nan")}, 0.95) is False
+
+
+def test_splits_are_contiguous_and_holdout_starts_2026_07():
+    tr, va, ho = ev.SPLITS["train"], ev.SPLITS["val"], ev.SPLITS["holdout"]
+    assert tr == (date(2016, 1, 1), date(2024, 12, 31))
+    assert va == (date(2025, 1, 1), date(2026, 6, 30))
+    assert ho == (date(2026, 7, 1), None)
+
+
+def _patched(monkeypatch, holdout_metrics=None, holdout_raises=None):
+    real = ev.run_backtest
+
+    def fake(strategy, panel, names, calendar, start, end, benchmark_nav, **kw):
+        if start == SPL["holdout"][0]:
+            if holdout_raises is not None:
+                raise holdout_raises
+            res = real(strategy, panel, names, calendar, start, end, benchmark_nav, **kw)
+            res.metrics.update(holdout_metrics or {})
+            return res
+        return real(strategy, panel, names, calendar, start, end, benchmark_nav, **kw)
+
+    monkeypatch.setattr(ev, "run_backtest", fake)
+
+
+@pytest.mark.parametrize("over,passed", [
+    ({"n_days": 0}, False),
+    ({"excess_ann": -1e-9}, False),
+    ({"sharpe": 0.5 - 1e-9}, False),
+    ({"excess_ann": 0.0, "sharpe": 0.5}, True),  # 边界含等号
+])
+def test_holdout_gate_conditions(monkeypatch, over, passed):
+    _patched(monkeypatch, holdout_metrics=over)
+    rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, Store(":memory:"), splits=SPL)
+    assert rep.gate_pass is True and rep.holdout_pass is passed
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("holdout_return=0.4451"), SystemExit(0), KeyError("x")])
+def test_holdout_failure_is_a_counted_fail_without_details(monkeypatch, exc):
+    _patched(monkeypatch, holdout_raises=exc)
+    store = Store(":memory:")
+    rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
+    assert rep.gate_pass is True and rep.holdout_pass is False
+    assert store.trial_count() == 1 and store.last_trial("winner")["holdout_pass"] is False
+    assert "0.4451" not in json.dumps(rep.to_agent_dict()) and "0.4451" not in repr(rep)
+
+
+class Crasher:
+    name = "crasher"
+
+    def select(self, view):
+        raise ValueError("boom")
+
+
+def test_failed_train_val_run_still_counts_as_trial():
+    store = Store(":memory:")
+    with pytest.raises(ValueError, match="boom"):
+        ev.evaluate(Crasher(), "crasher", _panel(), NAMES, CAL, BENCH, store, {"p": 2}, splits=SPL)
+    t = store.last_trial("crasher")
+    assert store.trial_count() == 1
+    assert t["gate_pass"] is False and t["holdout_pass"] is None and t["params"] == {"p": 2}
+
+
+def test_dsr_inputs_and_trial_sharpes(monkeypatch):
+    store = Store(":memory:")
+    store.add_trial("other", {}, 0.0, 0.0, False, None)
+    store.add_trial("other2", {}, 0.0, 0.0, False, None)
+    seen, navs = {}, {}
+    real_bt, real_dsr = ev.run_backtest, ev.deflated_sharpe
+
+    def bt(strategy, panel, names, calendar, start, end, benchmark_nav, **kw):
+        res = real_bt(strategy, panel, names, calendar, start, end, benchmark_nav, **kw)
+        navs[start] = res.nav
+        return res
+
+    def dsr(sr, n_trials, n_obs, skew=0.0, kurt=3.0):
+        seen.update(sr=sr, n_trials=n_trials, n_obs=n_obs, skew=skew, kurt=kurt)
+        return real_dsr(sr, n_trials, n_obs, skew, kurt)
+
+    monkeypatch.setattr(ev, "run_backtest", bt)
+    monkeypatch.setattr(ev, "deflated_sharpe", dsr)
+    rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
+    r = pd.concat([navs[SPL["train"][0]].pct_change().dropna(), navs[SPL["val"][0]].pct_change().dropna()])
+    assert seen["n_trials"] == 3  # 所有策略的既往试验 + 本次
+    assert seen["n_obs"] == len(r)
+    assert seen["sr"] == pytest.approx(ev.sharpe(r, periods=1))  # 日频夏普，不是年化
+    assert seen["kurt"] == pytest.approx(float(r.kurt()) + 3.0)  # 非超额峰度
+    t = store.last_trial("winner")
+    assert (t["train_sharpe"], t["val_sharpe"]) == (pytest.approx(rep.train["sharpe"]), pytest.approx(rep.val["sharpe"]))
 ```
 
 **Step 2: 运行，确认失败**
@@ -2882,18 +3217,30 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
         start, end = splits[key]
         return run_backtest(strategy, panel, names, calendar, start, end or _data_end(panel, calendar), benchmark_nav)
 
-    tr, va = bt("train"), bt("val")
-    r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
     n_trials = store.trial_count() + 1  # 含本次
+    try:
+        tr, va = bt("train"), bt("val")
+    except BaseException:
+        # 跑不完的试验同样计入 n_trials（DSR 的多重检验校正）；训练、验证段的报错照常抛出
+        store.add_trial(name, params or {}, None, None, False, None)
+        raise
+    r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
     dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r), float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
     gate_pass = _passes_gate(tr.metrics, va.metrics, dsr)
+    # 先入库再回放留出期：留出期中途失败或进程被杀，这次试验也已计数
+    trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
     if gate_pass:
-        ho = bt("holdout").metrics
-        holdout_pass = (ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
-                        and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
-    store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, holdout_pass)
+        try:
+            ho = bt("holdout").metrics
+            holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
+                                and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
+        except KeyboardInterrupt:
+            raise
+        except BaseException:  # noqa: BLE001 - 含 SystemExit；只记未通过，异常文本可能带出留出期数值，不外传
+            holdout_pass = False
+        store.set_trial_holdout(trial_id, holdout_pass)
     return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr, gate_pass=gate_pass,
                       holdout_pass=holdout_pass, n_trials=store.trial_count())
 ```
@@ -2919,20 +3266,23 @@ git commit -m "feat: add locked evaluator with gate, DSR and blind holdout" -m "
 - Create: `engine/integrity.py`
 - Test: `tests/test_integrity.py`
 
-只校验 `LOCKED_DIRS` 下的 `*.py`；清单缺失时 `verify` 返回 `[MANIFEST_PATH]`（视为不通过）。
+只校验 `LOCKED_DIRS` 下的 `*.py` 和 `*.pyw`；清单缺失或损坏时 `verify` 返回 `[MANIFEST_PATH]`（视为不通过）。测试文件用 `write_bytes` 写入 LF，否则 Windows 上换行归一的测试恒为真。
 
 **Step 1: 写失败测试** `tests/test_integrity.py`
 
 ```python
 from pathlib import Path
 
+import pytest
+
 from engine import integrity
 
 
 def _tree(root: Path):
+    # write_bytes：Windows 上 write_text 会把 \n 写成 \r\n，换行归一的测试就失去意义
     (root / "engine" / "sub").mkdir(parents=True)
-    (root / "engine" / "a.py").write_text("x = 1\n", encoding="utf-8")
-    (root / "engine" / "sub" / "b.py").write_text("y = 2\n", encoding="utf-8")
+    (root / "engine" / "a.py").write_bytes(b"x = 1\n")
+    (root / "engine" / "sub" / "b.py").write_bytes(b"y = 2\n")
     (root / "engine" / "notes.txt").write_text("ignored", encoding="utf-8")
     (root / "strategies").mkdir()
     (root / "strategies" / "s.py").write_text("z = 3\n", encoding="utf-8")
@@ -2942,6 +3292,8 @@ def test_manifest_covers_only_locked_py(tmp_path):
     _tree(tmp_path)
     m = integrity.compute_manifest(tmp_path)
     assert set(m) == {"engine/a.py", "engine/sub/b.py"}
+    (tmp_path / "engine" / "c.pyw").write_bytes(b"w = 1\n")  # Windows 上 .pyw 同样可被 import
+    assert set(integrity.compute_manifest(tmp_path)) == {"engine/a.py", "engine/c.pyw", "engine/sub/b.py"}
     assert all(len(v) == 64 for v in m.values())
 
 
@@ -2962,7 +3314,26 @@ def test_verify_ok_then_detects_changes(tmp_path):
 def test_crlf_does_not_trigger(tmp_path):
     _tree(tmp_path)
     integrity.write_manifest(tmp_path)
+    assert (tmp_path / "engine" / "a.py").read_bytes() == b"x = 1\n"
     (tmp_path / "engine" / "a.py").write_bytes(b"x = 1\r\n")
+    assert integrity.verify(tmp_path) == []
+    (tmp_path / "engine" / "a.py").write_bytes(b"x = 2\r\n")
+    assert integrity.verify(tmp_path) == ["engine/a.py"]
+
+
+@pytest.mark.parametrize("content", [b"{", b"[]", b'{"engine/a.py": 1}', b"\xff\xfe"])
+def test_unreadable_manifest_fails_verify(tmp_path, content):
+    _tree(tmp_path)
+    integrity.write_manifest(tmp_path)
+    (tmp_path / integrity.MANIFEST_PATH).write_bytes(content)
+    assert integrity.verify(tmp_path) == [integrity.MANIFEST_PATH]
+
+
+def test_manifest_with_bom_is_accepted(tmp_path):
+    _tree(tmp_path)
+    integrity.write_manifest(tmp_path)
+    p = tmp_path / integrity.MANIFEST_PATH
+    p.write_bytes(b"\xef\xbb\xbf" + p.read_bytes())  # 记事本另存为 UTF-8 会加 BOM
     assert integrity.verify(tmp_path) == []
 ```
 
@@ -2977,7 +3348,7 @@ uv run pytest tests/test_integrity.py -v
 **Step 3: 最小实现** `engine/integrity.py`
 
 ```python
-"""锁定区哈希校验：engine/ 下所有 .py 的 sha256 清单。"""
+"""锁定区哈希校验：engine/ 下所有 .py / .pyw 的 sha256 清单。"""
 from __future__ import annotations
 
 import hashlib
@@ -2985,6 +3356,7 @@ import json
 from pathlib import Path
 
 LOCKED_DIRS = ["engine"]
+SUFFIXES = (".py", ".pyw")  # Windows 上 .pyw 同样能被 import
 MANIFEST_PATH = ".integrity/manifest.json"
 
 
@@ -2997,8 +3369,9 @@ def compute_manifest(root: Path) -> dict[str, str]:
     root = Path(root)
     out: dict[str, str] = {}
     for d in LOCKED_DIRS:
-        for p in sorted((root / d).rglob("*.py")):
-            out[p.relative_to(root).as_posix()] = _digest(p)
+        for p in sorted((root / d).rglob("*")):
+            if p.is_file() and p.suffix.lower() in SUFFIXES:
+                out[p.relative_to(root).as_posix()] = _digest(p)
     return out
 
 
@@ -3008,11 +3381,22 @@ def write_manifest(root: Path) -> None:
     path.write_text(json.dumps(compute_manifest(root), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _load(path: Path) -> dict[str, str] | None:
+    """读取清单；缺失、无法解析或格式不对时返回 None。utf-8-sig 兼容记事本加的 BOM。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):  # 含 UnicodeDecodeError、JSONDecodeError
+        return None
+    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        return None
+    return data
+
+
 def verify(root: Path) -> list[str]:
-    path = Path(root) / MANIFEST_PATH
-    if not path.exists():
+    """返回与清单不符的文件；清单缺失或损坏时返回 [MANIFEST_PATH]（视为不通过）。"""
+    expected = _load(Path(root) / MANIFEST_PATH)
+    if expected is None:
         return [MANIFEST_PATH]
-    expected: dict[str, str] = json.loads(path.read_text(encoding="utf-8"))
     actual = compute_manifest(root)
     return sorted(k for k in expected.keys() | actual.keys() if expected.get(k) != actual.get(k))
 ```
@@ -3038,7 +3422,7 @@ git commit -m "feat: add engine integrity manifest and verify" -m "Co-Authored-B
 - Create: `engine/promotion.py`
 - Test: `tests/test_promotion.py`
 
-影子期净值 = `q:<name>` 账户在 `status_since` 至 today 间的净值点；不足 `MIN_SHADOW_DAYS` 个点不参与。晋升：年化超额 >= `PROMOTE_EXCESS_ANN` 且 t >= `PROMOTE_T`，取超额最大者，旧现任 `retired`。降级：无晋升时，若某影子已满 `DEMOTE_WINDOW` 个点且现任最近 `DEMOTE_WINDOW` 点相对它年化超额 <= `DEMOTE_EXCESS_ANN`，现任降为 `shadow`，落后最多的那个影子接任。
+影子期净值 = `q:<name>` 账户从进入影子后第一个交易日的前一交易日（结算记基线的那天；研究在周六运行时是周五）到 today 的净值点；收益日（点数减一）不足 `MIN_SHADOW_DAYS` 不参与。晋升：年化超额 >= `PROMOTE_EXCESS_ANN` 且 t >= `PROMOTE_T`，取超额最大者，旧现任 `retired`。降级：无晋升时，若某影子已满 `DEMOTE_WINDOW` 个收益日，且现任最近 `DEMOTE_WINDOW` 个收益日相对它年化超额 <= `DEMOTE_EXCESS_ANN`、t <= `-DEMOTE_T`，现任降为 `shadow`，落后最多的那个影子接任。`compare` 先对齐净值再算收益。
 
 **Step 1: 写失败测试** `tests/test_promotion.py`
 
@@ -3097,7 +3481,7 @@ def test_promote_after_20_days_retires_old():
 
 
 def test_no_promotion_with_fewer_than_20_days():
-    store = _setup(cand_daily=0.002, shadow_from=45)  # 15 个交易日
+    store = _setup(cand_daily=0.002, shadow_from=45)  # 15 个收益日
     assert pr.decide(store, DAYS[-1], CAL) == []
     assert store.get_status("new") == "shadow" and store.get_status("old") == "incumbent"
 
@@ -3117,7 +3501,7 @@ def test_at_most_one_promotion():
 
 
 def test_demotion_when_incumbent_lags(monkeypatch):
-    # 晋升门槛设为不可达，单独验证降级规则
+    # 晋升门槛设为不可达，单独验证降级规则（降级用自己的 DEMOTE_T）
     monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
     store = _setup(cand_daily=0.0005, inc_daily=0.0)
     events = pr.decide(store, DAYS[-1], CAL)
@@ -3139,6 +3523,102 @@ def test_no_incumbent_compares_to_benchmark():
     _record(store, "q:new", _nav(0.002, noise=0.001))
     events = pr.decide(store, DAYS[-1], CAL)
     assert [(e.kind, e.strategy) for e in events] == [("promote", "new")]
+
+
+@pytest.mark.parametrize("shadow_from,promoted", [(40, True), (41, False)])
+def test_min_shadow_days_counts_return_days(shadow_from, promoted):
+    # 影子期从 DAYS[shadow_from] 开始：前一交易日的净值是基线，之后每天一个收益日
+    store = _setup(cand_daily=0.002, shadow_from=shadow_from)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert bool(events) is promoted, (60 - shadow_from, events)
+
+
+def test_shadow_set_on_weekend_keeps_friday_baseline():
+    store = Store(":memory:")
+    friday = DAYS[29]
+    assert friday.weekday() == 4
+    saturday = pd.Timestamp(friday) + pd.Timedelta(days=1)
+    store.set_status("new", "shadow", saturday.date())  # 研究任务在周六运行
+    _record(store, "q:new", _nav(0.002)[29:], days=DAYS[29:])  # 周一首次结算时在周五记基线
+    nav = pr._shadow_nav(store, "new", DAYS[-1], CAL)
+    assert nav.index[0] == pd.Timestamp(friday) and len(nav) == 31
+
+
+def test_shadow_nav_stops_at_today():
+    store = _setup(cand_daily=0.002, shadow_from=30)
+    assert pr._shadow_nav(store, "new", DAYS[45], CAL).index[-1] == IDX[45]
+    assert pr.decide(store, DAYS[45], CAL) == []  # 截至当天只有 16 个收益日
+
+
+def test_compare_aligns_nav_before_returns():
+    base = pd.Series(_nav(0.003, noise=0.01), index=IDX)
+    gappy = base.drop(IDX[3::4])  # 同一条净值，每 4 天缺一个点
+    assert pr.compare(base, gappy) == pytest.approx((0.0, 0.0))
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status("dup", "shadow", DAYS[0])
+    _record(store, "q:old", list(base))
+    for ts, v in gappy.items():
+        store.record_nav("q:dup", ts.date(), v)
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def test_small_steady_excess_neither_promotes_nor_demotes():
+    # 超额恒定约年化 2.5%：t 值极大，但没到晋升的 5%，现任也没落后到降级的 -5%
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status("new", "shadow", DAYS[0])
+    _record(store, "q:old", _nav(0.0, noise=0.002))
+    _record(store, "q:new", _nav(0.0001, noise=0.002))
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def _two_navs(store, inc_rets, cand_rets, name="new"):
+    store.set_status("old", "incumbent", DAYS[0])
+    store.set_status(name, "shadow", DAYS[0])
+    for acct, rets in (("q:old", inc_rets), (f"q:{name}", cand_rets)):
+        v, vals = 100.0, []
+        for r in rets:
+            v *= 1 + r
+            vals.append(v)
+        _record(store, acct, vals)
+
+
+def test_demotion_uses_only_recent_window(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    # 影子前 19 天每天领先 1%，之后与现任完全同步：近 40 个收益日没有落后，不降级
+    inc = [0.001 if i % 2 else -0.001 for i in range(60)]
+    cand = [r + (0.01 if i < 20 else 0.0) for i, r in enumerate(inc)]
+    _two_navs(store, inc, cand)
+    assert pr.decide(store, DAYS[-1], CAL) == []
+
+
+def test_demotion_requires_significant_lag(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    lag = -0.0003  # 现任每天落后约 0.03%，年化约 -7.5%
+    noisy, quiet = Store(":memory:"), Store(":memory:")
+    # 噪声很大时同样的落后幅度只是运气，不降级
+    _two_navs(noisy, [lag + (0.01 if i % 2 else -0.01) for i in range(60)], [0.0] * 60)
+    assert pr.decide(noisy, DAYS[-1], CAL) == []
+    _two_navs(quiet, [lag + (0.0002 if i % 2 else -0.0002) for i in range(60)], [0.0] * 60)
+    assert [e.kind for e in pr.decide(quiet, DAYS[-1], CAL)] == ["demote", "promote"]
+
+
+def test_demotion_picks_the_shadow_incumbent_lags_most(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    inc = [0.0002 if i % 2 else -0.0002 for i in range(60)]
+    jitter = [0.0001 if i % 3 else -0.0002 for i in range(60)]  # 超额不能恒定，否则 t 值无穷大
+    _two_navs(store, inc, [r + 0.0005 + j for r, j in zip(inc, jitter)], name="mild")
+    store.set_status("strong", "shadow", DAYS[0])
+    v, vals = 100.0, []
+    for r, j in zip(inc, jitter):
+        v *= 1 + r + 0.001 + j
+        vals.append(v)
+    _record(store, "q:strong", vals)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert [(e.kind, e.strategy) for e in events] == [("demote", "old"), ("promote", "strong")]
 ```
 
 **Step 2: 运行，确认失败**
@@ -3152,7 +3632,8 @@ uv run pytest tests/test_promotion.py -v
 **Step 3: 最小实现** `engine/promotion.py`
 
 ```python
-"""量化策略晋升/降级：影子盘 >= 20 日且显著跑赢现任 -> 晋升；现任近 40 日落后影子 >= 5% -> 降级。"""
+"""量化策略晋升/降级：影子盘 >= 20 个收益日且显著跑赢现任 -> 晋升；
+现任近 40 个收益日显著落后影子、年化 >= 5% -> 降级。"""
 from __future__ import annotations
 
 import math
@@ -3169,6 +3650,7 @@ PROMOTE_EXCESS_ANN = 0.05
 PROMOTE_T = 1.5
 DEMOTE_WINDOW = 40
 DEMOTE_EXCESS_ANN = -0.05
+DEMOTE_T = 1.5  # 降级同样要求显著：否则零超额的噪声也会让现任和影子来回换位
 BENCH_ACCOUNT = "bench:csi300"
 
 
@@ -3179,9 +3661,13 @@ class Event:
     detail: str
 
 
-def compare(base_nav: pd.Series, cand_nav: pd.Series) -> tuple[float, float]:
-    b, c = base_nav.pct_change().dropna().align(cand_nav.pct_change().dropna(), join="inner")
-    ex = c - b
+def compare(base_nav: pd.Series, cand_nav: pd.Series, window: int | None = None) -> tuple[float, float]:
+    """cand 相对 base 的年化超额与 t 值。先按日期对齐净值再算收益：一方缺某天的点时，两边都用跨过
+    这个缺口的同一段收益，缺口不会被当成超额。window 只取对齐后最近 window 个收益日。"""
+    b, c = base_nav.align(cand_nav, join="inner")
+    if window is not None:
+        b, c = b.iloc[-(window + 1):], c.iloc[-(window + 1):]
+    ex = (c.pct_change() - b.pct_change()).dropna()
     if len(ex) < 2:
         return 0.0, 0.0
     ann = float(ex.mean() * 252)
@@ -3191,10 +3677,16 @@ def compare(base_nav: pd.Series, cand_nav: pd.Series) -> tuple[float, float]:
 
 
 def _shadow_nav(store: Store, s: str, today: date, calendar: TradingCalendar) -> pd.Series:
+    """影子期净值：从进入影子后第一个交易日的前一交易日（结算时记下基线的那一天）到 today。
+    研究任务在周六运行时，基线是周五的净值；第 n 个点对应第 n-1 个收益日。"""
     since = store.status_since(s)
     nav = store.nav_series(f"q:{s}")
-    days = pd.DatetimeIndex([pd.Timestamp(d) for d in calendar.between(since, today)])
-    return nav[nav.index.isin(days)]
+    first = since if calendar.is_trading_day(since) else calendar.next_day(since)
+    try:
+        start = calendar.prev_day(first)
+    except ValueError:  # 日历第一天
+        start = first
+    return nav[(nav.index >= pd.Timestamp(start)) & (nav.index <= pd.Timestamp(today))]
 
 
 def decide(store: Store, today: date, calendar: TradingCalendar) -> list[Event]:
@@ -3203,7 +3695,7 @@ def decide(store: Store, today: date, calendar: TradingCalendar) -> list[Event]:
     base = store.nav_series(f"q:{inc}" if inc else BENCH_ACCOUNT)
     base = base[base.index <= pd.Timestamp(today)]
     shadows = {s: _shadow_nav(store, s, today, calendar) for s in store.strategies_with_status("shadow")}
-    shadows = {s: nav for s, nav in shadows.items() if len(nav) >= MIN_SHADOW_DAYS}
+    shadows = {s: nav for s, nav in shadows.items() if len(nav) - 1 >= MIN_SHADOW_DAYS}
 
     # 1) 晋升：影子期内年化超额 >= 5% 且 t >= 1.5，取超额最大者
     best: tuple[float, float, str] | None = None
@@ -3213,21 +3705,21 @@ def decide(store: Store, today: date, calendar: TradingCalendar) -> list[Event]:
             best = (ann, t, s)
     if best:
         ann, t, s = best
-        events = [Event("promote", s, f"影子 {len(shadows[s])} 日，年化超额 {ann:.2%}，t={t:.2f}")]
+        events = [Event("promote", s, f"影子 {len(shadows[s]) - 1} 日，年化超额 {ann:.2%}，t={t:.2f}")]
         for old in incs:
             store.set_status(old, "retired", today)
             events.append(Event("retire", old, f"被 {s} 取代"))
         store.set_status(s, "incumbent", today)
         return events
 
-    # 2) 降级：影子已满 DEMOTE_WINDOW 日，且现任在这一窗口内相对该影子年化超额 <= -5%
+    # 2) 降级：影子已满 DEMOTE_WINDOW 个收益日，且现任在最近这一窗口内相对该影子年化超额 <= -5%、t <= -1.5
     if inc:
         worst: tuple[float, str] | None = None
         for s, nav in shadows.items():
-            if len(nav) < DEMOTE_WINDOW:
+            if len(nav) - 1 < DEMOTE_WINDOW:
                 continue
-            ann, _ = compare(nav.iloc[-DEMOTE_WINDOW:], base.iloc[-DEMOTE_WINDOW:])
-            if ann <= DEMOTE_EXCESS_ANN and (worst is None or ann < worst[0]):
+            ann, t = compare(nav, base, window=DEMOTE_WINDOW)
+            if ann <= DEMOTE_EXCESS_ANN and t <= -DEMOTE_T and (worst is None or ann < worst[0]):
                 worst = (ann, s)
         if worst:
             ann, s = worst
