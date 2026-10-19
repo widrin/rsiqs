@@ -51,7 +51,7 @@ def load_checked(kind: str) -> tuple[dict, bool]:
     if not p.exists():
         return empty, True
     try:
-        pb = json.loads(p.read_text(encoding="utf-8"))
+        pb = json.loads(p.read_text(encoding="utf-8-sig"))  # 记事本、PowerShell 5.1 保存的文件带 BOM
     except (ValueError, OSError):
         pb = None
     if not _valid(pb):
@@ -137,6 +137,11 @@ def _window_return(store: Store, account: str, start: dt.date, end: dt.date) -> 
 
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
+    if corrupt_kinds():
+        # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
+        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始
+        store.kv_set(RELEASE_KEY, today.isoformat())
+        return None
     last = store.kv_get(RELEASE_KEY)
     if last is None:
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -144,8 +149,6 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
     start = dt.date.fromisoformat(last)
     if len(calendar.between(start, today)) - 1 < MIN_DAYS_BETWEEN_RELEASES:
         return None
-    if corrupt_kinds():
-        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     active, cand = load("active"), load("candidate")
     if cand.get("rules") == active.get("rules"):
         store.kv_set(RELEASE_KEY, today.isoformat())

@@ -145,7 +145,25 @@ def test_maybe_release_skips_when_a_playbook_is_corrupt(pbdir, cal, broken):
     (pbdir / f"{broken}.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
     assert playbook.maybe_release(store, TODAY, cal) is None
     assert (pbdir / f"{other}.json").read_text(encoding="utf-8") == before  # 空规则没有写进另一份
-    assert store.kv_get("playbook_released") != TODAY.isoformat()  # 修好之后照常比较这个窗口
+    # 损坏期间盘前按空规则交易：窗口从今天重新开始，修好后不拿这段净值比较两版规则
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def test_maybe_release_after_repair_ignores_corrupt_days(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    good = (pbdir / "candidate.json").read_text(encoding="utf-8")
+    (pbdir / "candidate.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
+    playbook.maybe_release(store, TODAY - dt.timedelta(days=1), cal)  # 昨天的复盘发现损坏
+    (pbdir / "candidate.json").write_text(good, encoding="utf-8")       # 今天修好
+    assert playbook.maybe_release(store, TODAY, cal) is None             # 新窗口还不满 10 个交易日
+    assert playbook.load("active")["version"] == 2
+
+
+def test_load_checked_accepts_bom(pbdir):
+    (pbdir / "active.json").write_text('\ufeff{"version": 3, "rules": [{"id": "r1", "text": "t", "evidence": "e"}]}',
+                                       encoding="utf-8")
+    pb, ok = playbook.load_checked("active")
+    assert ok and pb["version"] == 3
 
 
 def test_long_lesson_is_truncated_not_wiping_rules():

@@ -423,7 +423,7 @@ def _summary(today: date, out: dict, error: str) -> str:
 def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
                    evals: int, out: dict) -> tuple[list[dict], int]:
     """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
-    每次评估后都校验 engine/：不符时不再处理后面的草稿，并把 out["engine_changed"] 置为 True。
+    每次评估后都校验 engine/：不符时不再处理后面的草稿，并把不符的文件记在 out["engine_changed"]。
 
     结果边做边记进 out：即使本地出错抛异常，已写入的文件也会照常提交。"""
     results = []
@@ -440,8 +440,9 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
             out["written"].append(res["name"])
             evals += 1  # 先计数：超时、失败同样消耗一次额度
             res.update(evaluate_strategy(settings, store, res["name"]))
-            if verify(Path(settings.root)):
-                out["engine_changed"] = True
+            changed = verify(Path(settings.root))
+            if changed:
+                out["engine_changed"] = changed
                 break
     return results, evals
 
@@ -499,16 +500,24 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         out["status"], error = "error", f"{type(e).__name__}: {e}"
     out["cost_cny"] = _month_cost(store) - cost0
 
-    out.pop("engine_changed", None)
+    mid = out.pop("engine_changed", None) or []
     bad = verify(root)
-    if bad:
-        # engine/ 被改动时得到的门槛结果不可信：本次进入影子盘的策略改回 candidate，不参与前向模拟
+    if bad or mid:
+        # 会话中或会后 engine/ 不符（会后又相符时可能是有人改了又改回）：本次的门槛结果不可信。
+        # 试验记录作废（仍计入 n_trials），进入影子盘的策略改回 candidate，不参与前向模拟
         reverted = [n for n in out["written"] if store.get_status(n) == "shadow"]
+        for n in out["written"]:
+            trial = store.last_trial(n)
+            if trial is not None:
+                store.void_trial(trial["id"])
         for n in reverted:
             store.set_status(n, "candidate", today)
+        title = ("研究会话后 engine/ 校验不符，未提交 git" if bad
+                 else "研究会话中 engine/ 校验不符，已提前停止，未提交 git")
         notifier.send_text(format_alert(
-            "研究会话后 engine/ 校验不符，未提交 git",
-            "\n".join(bad) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"
+            title,
+            "\n".join(bad or mid) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"
+            + ("\n本次的试验记录已作废（仍计入 n_trials）" if out["written"] else "")
             + (f"\n已从影子盘改回 candidate：{'、'.join(reverted)}" if reverted else "")))
         return {**out, "status": "integrity_failed"}
 

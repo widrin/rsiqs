@@ -365,6 +365,14 @@ def test_feedback_truncates_long_code_and_hypothesis(env):
     assert len(fb) < len(llm.calls[0]["user"]) + research.FEEDBACK_CODE_CHARS + 3000
 
 
+def test_draft_block_caps_message_and_error():
+    res = {"name": "x_one", "hypothesis": "h", "message": "m" * 10_000, "saved": True, "ok": False,
+           "report": None, "error": "e" * 10_000}
+    block = research._draft_block(res, Draft(name="x_one", hypothesis="h", code="X = 1\n"))
+    assert "m" * (research.FEEDBACK_MESSAGE_CHARS + 1) not in block
+    assert "e" * (research.EVAL_ERROR_CHARS + 1_601) not in block and "e" * research.EVAL_ERROR_CHARS in block
+
+
 def test_context_built_once_and_round_task_has_current_n_trials(env, monkeypatch):
     e = env
     built = []
@@ -390,6 +398,27 @@ def test_engine_change_mid_session_stops_and_reverts_shadow(env):
     assert e.store.get_status("a_one") == "candidate"           # 不参与前向模拟
     assert e.store.strategies_with_status("shadow") == [] and e.commits == []
     assert "已从影子盘改回 candidate：a_one" in e.notifier.sent[-1]
+    trial = e.store.last_trial("a_one")                         # 试验记录作废，仍计入 n_trials
+    assert trial["gate_pass"] is False and trial["holdout_pass"] is False and e.store.trial_count() == 1
+
+
+def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
+    e = env
+    e.evals.outcomes["a_one"] = report("a_one", gate=True, holdout=True)
+    calls = []
+    real = research.verify
+
+    def flaky_verify(root):
+        calls.append(1)
+        return [".integrity/manifest.json"] if len(calls) == 2 else real(root)  # 只有第一次评估后不符
+
+    monkeypatch.setattr(research, "verify", flaky_verify)
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
+    out = run(e, llm)
+    assert out["status"] == "integrity_failed" and e.evals.names == ["a_one"] and len(llm.calls) == 1
+    assert e.store.get_status("a_one") == "candidate" and e.commits == []
+    alert = e.notifier.sent[-1]
+    assert "会话中 engine/ 校验不符" in alert and ".integrity/manifest.json" in alert
 
 
 def test_commit_failure_is_reported(env, monkeypatch):

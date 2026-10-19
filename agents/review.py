@@ -129,7 +129,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
     bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = None if bad else playbook.maybe_release(store, d, calendar)
+    release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
     parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"

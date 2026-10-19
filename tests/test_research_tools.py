@@ -319,3 +319,19 @@ def test_evaluate_error_includes_strategy_frames(written):
         '{"error": "IndexError: single positional indexer is out-of-bounds"}\n', returncode=1, stderr=stderr))
     assert 'strategies/probe_one.py 第 12 行（select）：x = h["close"].iloc[-21]' in out["error"]
     assert "backtest.py" not in out["error"]           # 只给策略文件里的帧
+
+
+def test_evaluate_error_length_is_capped(written):
+    settings, store = written
+    frame = '  File "/p/strategies/probe_one.py", line 7, in select\n    y = 1\n'
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(
+        '{"error": "' + "x" * 10_000 + '"}\n', returncode=1, stderr=frame * 2000))
+    assert len(out["error"]) <= research.EVAL_ERROR_CHARS + 1_600
+    assert len(research._strategy_frames(frame * 2000, "probe_one")) <= 1500
+
+
+def test_strategy_frames_without_source_line():
+    stderr = ('  File "/p/strategies/probe_one.py", line 7, in select\n'
+              '  File "/p/strategies/probe_one.py", line 3, in helper\n')
+    assert research._strategy_frames(stderr, "probe_one") == (
+        "strategies/probe_one.py 第 7 行（select）：\nstrategies/probe_one.py 第 3 行（helper）：")

@@ -219,6 +219,7 @@ def test_corrupt_playbook_is_not_released_or_overwritten(env, monkeypatch, tmp_p
     assert (tmp_path / f"{other}.json").read_text(encoding="utf-8") == before
     assert env["commits"] == []
     assert f"playbook/{broken}.json 损坏" in env["notifier"].sent[0]
+    assert env["store"].kv_get(playbook.RELEASE_KEY) == D.isoformat()  # 发布窗口从今天重新开始
 
 
 def test_evidence_only_merge_is_committed(env):
