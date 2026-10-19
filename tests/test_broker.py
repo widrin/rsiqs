@@ -57,7 +57,8 @@ def test_open_above_entry_max_skipped():
 def test_suspended_pick_skipped():
     acc = Account("t", 100_000.0)
     assert run(acc, [bar(vol=0)], [pick()]) == []
-    assert run(acc, [], [pick()]) == []
+    acc2 = Account("t", 100_000.0)  # fresh account: a second run on acc would be a same-day no-op
+    assert run(acc2, [], [pick()]) == [] and not acc2.positions
 
 
 def test_qty_below_one_lot_skipped():
@@ -125,7 +126,8 @@ def test_all_day_limit_down_blocks_sell():
 def test_suspended_position_not_sold():
     acc = held(exit_date=D1)
     assert run(acc, [bar(vol=0)]) == []
-    assert run(acc, []) == []
+    acc2 = held(exit_date=D1)
+    assert run(acc2, []) == [] and acc2.positions["600000"].qty == 1000
 
 
 def test_bought_today_not_exited_today():
@@ -194,11 +196,13 @@ def test_earlier_day_than_last_trade_day_raises():
 
 
 def test_last_trade_day_survives_serialization():
-    acc = Account("t", 100_000.0)
-    run(acc, [bar()], [pick()])
+    acc = held(cash=10_100.0)
+    bars, picks = [bar(o=10.5, h=11.2, l=10.4), bar(**PA_BAR)], [pick(**PA_PICK)]
+    run(acc, bars, picks)
     acc2 = Account.from_dict(acc.to_dict())
     assert acc2.last_trade_day == D1
-    assert run(acc2, [bar()], [pick(code="000001", name="平安银行")]) == []
+    before = acc2.to_dict()
+    assert run(acc2, bars, picks) == [] and acc2.to_dict() == before
 
 
 @pytest.mark.parametrize("over", [dict(o=float("nan")), dict(h=float("nan")), dict(l=0.0),
@@ -242,10 +246,10 @@ def test_st_sealed_limit_down_before_rule_change_blocks_sell():
 
 
 def test_open_at_or_below_stop_not_bought():
-    acc = Account("t", 100_000.0)
-    assert run(acc, [bar(o=9.6, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
-    assert run(acc, [bar(o=9.8, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
-    assert not acc.positions
+    for o in (9.6, 9.8):  # below and equal to the stop; a fresh account each time
+        acc = Account("t", 100_000.0)
+        assert run(acc, [bar(o=o, h=9.9, l=9.5, c=9.7)], [pick(stop=9.8)]) == []
+        assert not acc.positions
 
 
 def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
@@ -256,22 +260,27 @@ def test_ex_rights_day_buy_not_clipped_to_stale_limit_band():
     assert f.side == "BUY" and f.price == pytest.approx(13.40 * (1 + SLIP))
 
 
-def test_unreliable_band_skips_limit_checks():
-    # o=h=l would look sealed at limit-down / limit-up, but the prices lie outside the band
-    acc = held(exit_date=D1)
-    f = run(acc, [bar(o=13.4, h=13.4, l=13.4, c=13.4, pc=20.0)])[0]
-    assert f.reason == "到期" and f.price == pytest.approx(13.4 * (1 - SLIP))
-    acc2 = Account("t", 100_000.0)
-    f2 = run(acc2, [bar(o=15.0, h=15.0, l=15.0, c=15.0, pc=10.0)],
-             [pick(entry_max=15.5, stop=14.0, target=17.0)])[0]
-    assert f2.side == "BUY" and f2.price == pytest.approx(15.0 * (1 + SLIP))
+def test_unreliable_band_keeps_limit_checks():
+    # forward adjustment subtracts later cash dividends, so an old one-price limit-up can sit above
+    # the limit computed from the adjusted prev_close: 9.50 gives 10.45, the bar is 10.50
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=10.5, h=10.5, l=10.5, c=10.5, pc=9.5)],
+               [pick(entry_max=11.0, stop=9.8, target=12.0)]) == []
+    # the same on the way down: limit-down 8.55, a one-price bar at 8.50 cannot be sold, even at expiry
+    acc2 = held(exit_date=D1)
+    assert run(acc2, [bar(o=8.5, h=8.5, l=8.5, c=8.5, pc=9.5)]) == []
+    # ex-rights day with a stale prev_close (band [18.00, 22.00]): the whole day sits below
+    # limit-down, so the position stays put instead of being stopped out at a fake price
+    acc3 = held(exit_date=D1)
+    assert run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)]) == []
+    assert acc2.positions["600000"].qty == acc3.positions["600000"].qty == 1000
 
 
 def test_unreliable_band_intraday_stop_not_clipped():
-    acc = held(stop=9.3)
-    # band [18.00, 22.00] from the stale prev_close; the stop fill stays at stop * (1 - slip)
-    f = run(acc, [bar(o=9.8, h=9.9, l=9.2, c=9.5, pc=20.0)])[0]
-    assert f.reason == "止损" and f.price == pytest.approx(9.3 * (1 - SLIP))
+    acc = held(stop=11.7, target=13.0)
+    # band [9.00, 11.00] is below the whole day; the stop fill stays at stop * (1 - slip), not 11.00
+    f = run(acc, [bar(o=12.0, h=12.5, l=11.6, c=12.2, pc=10.0)])[0]
+    assert f.reason == "止损" and f.price == pytest.approx(11.7 * (1 - SLIP))
 
 
 @pytest.mark.parametrize("h,clipped", [(22.01, True), (22.02, False)])
@@ -282,6 +291,15 @@ def test_band_reliability_allows_one_tick(h, clipped):
             [pick(entry_max=22.5, stop=20.0, target=24.0)])[0]
     raw = 21.98 * (1 + SLIP)
     assert f.price == (22.0 if clipped else pytest.approx(raw))
+
+
+@pytest.mark.parametrize("low,clipped", [(17.99, True), (17.98, False)])
+def test_band_reliability_allows_one_tick_below(low, clipped):
+    # band [18.00, 22.00]: only the low decides; the intraday stop at 18.00 sells at 17.982 before clipping
+    acc = held(stop=18.0, target=21.0)
+    f = run(acc, [bar(o=18.5, h=18.8, l=low, c=18.6, pc=20.0)])[0]
+    assert f.reason == "止损"
+    assert f.price == (18.0 if clipped else pytest.approx(18.0 * (1 - SLIP)))
 
 
 def test_reliable_band_still_clips_buy_at_limit_up():

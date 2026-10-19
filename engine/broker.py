@@ -7,7 +7,7 @@ from engine.ledger import Account, Position
 from engine.rules import at_limit_down, at_limit_up, calc_fee, limit_prices, round_lot
 from engine.types import Bar, Fill, Pick
 
-Band = tuple[float, float] | None  # (limit_up, limit_down), or None when the band is unreliable
+Band = tuple[float, float, bool]  # (limit_up, limit_down, reliable)
 
 
 def _valid(bar: Bar | None) -> bool:
@@ -18,22 +18,22 @@ def _valid(bar: Bar | None) -> bool:
 
 
 def _band(bar: Bar, d: date) -> Band:
-    """Limit band for ``bar`` on ``d``, or None if the day's prices show the band is wrong.
+    """Limit prices for ``bar`` on ``d`` and whether the day's prices agree with them.
 
-    The band is trusted only if open, high and low all lie within [limit_down - 0.01,
+    The band is reliable only if open, high and low all lie within [limit_down - 0.01,
     limit_up + 0.01] (one tick for forward-adjusted rounding). A price outside it means the band
-    itself is off, e.g. an ex-rights day whose prev_close is still the pre-split close, or an ST
-    status taken from today's name.
+    itself is off, e.g. an ex-rights day whose prev_close is still the pre-split close, an ST
+    status taken from today's name, or later cash dividends subtracted from forward-adjusted
+    prices (which shifts an old sealed price by 10% of those dividends).
     """
     up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
     lo, hi = round(down * 100) - 1, round(up * 100) + 1
-    if all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low)):
-        return up, down
-    return None
+    return up, down, all(lo <= round(v * 100) <= hi for v in (bar.open, bar.high, bar.low))
 
 
 def _clip(price: float, band: Band) -> float:
-    return price if band is None else min(max(price, band[1]), band[0])
+    up, down, reliable = band
+    return min(max(price, down), up) if reliable else price
 
 
 class SimBroker:
@@ -53,8 +53,8 @@ class SimBroker:
            is treated as suspended and nothing trades in it. Limits come from
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
-           day with a stale prev_close); then no limit check is made and fill prices are not
-           clipped.
+           day with a stale prev_close); then fill prices are not clipped. The limit checks below
+           still apply: a price beyond a limit counts as sealed, which errs on the safe side.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -87,7 +87,7 @@ class SimBroker:
             if pos.available <= 0 or not _valid(bar):
                 continue  # locked by T+1, or suspended / bad data
             band = _band(bar, d)
-            if band and at_limit_down(bar.high, band[1]):
+            if at_limit_down(bar.high, band[1]):
                 continue  # sealed at limit-down all day: cannot sell
             if d >= pos.exit_date:
                 reason = "到期"
@@ -108,7 +108,7 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            if band and at_limit_up(bar.open, band[0]):
+            if at_limit_up(bar.open, band[0]):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone

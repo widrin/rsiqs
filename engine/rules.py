@@ -75,7 +75,9 @@ def at_limit_up(price: float, up: float) -> bool:
 
     Daily bars are forward-adjusted (前复权): adjusted prices are raw prices rescaled and rounded
     to 0.01, so a stock sealed at limit-up can sit one cent away from the limit computed from the
-    adjusted prev_close. The tolerance absorbs that rounding. Effect on raw prices: a price exactly
+    adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
+    than rescaled, so an old sealed price can also sit above the computed limit by more than a
+    cent; any price above it counts as limit-up too. Effect on raw prices: a price exactly
     one cent below the true limit also counts as limit-up (a buy there is skipped), which only
     makes the simulation slightly more conservative.
     """
@@ -86,8 +88,9 @@ def at_limit_down(price: float, down: float) -> bool:
     """True when ``price`` is at the limit-down price, with one tick (0.01) of tolerance.
 
     Same reason as ``at_limit_up``: forward-adjusted rounding can leave a sealed limit-down one cent
-    off. Effect on raw prices: a high exactly one cent above the true limit-down also counts as
-    sealed (the sell is skipped), again erring on the conservative side.
+    off, and any price below the computed limit counts as limit-down. Effect on raw prices: a high
+    exactly one cent above the true limit-down also counts as sealed (the sell is skipped), again
+    erring on the conservative side.
     """
     return round(price * 100) <= round(down * 100) + 1
 
