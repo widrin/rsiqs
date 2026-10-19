@@ -24,7 +24,7 @@
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，531 个测试全部通过（Part 1 共 152 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，532 个测试全部通过（Part 1 共 152 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -4655,6 +4655,20 @@ def test_rebased_history_triggers_full_refetch(cache):
     assert panel["600000"]["prev_close"].iloc[-1] == pytest.approx(10.1)  # 除息日的昨收已是复权后的价格
 
 
+def test_rebase_refetch_keeps_full_history(tmp_path):
+    days = pd.bdate_range("2026-01-05", periods=12)
+    rows = [(d.strftime("%Y-%m-%d"), 10.0 + i, 10.5 + i, 9.5 + i, 10.2 + i, 1000, 1e6) for i, d in enumerate(days)]
+    client = FakeClient({"600000": frame(rows[:11])})
+    c = BarCache(tmp_path / "c.sqlite", client)
+    c.update(["600000"], days[10].date())
+    rebased = frame(rows)  # 第 12 天除息：此前 11 天整体下调 0.3
+    rebased.loc[:10, ["open", "high", "low", "close"]] -= 0.3
+    client.data["600000"] = rebased
+    c.update(["600000"], days[11].date())
+    panel, _ = c.load_panel(["600000"], days[0].date(), days[11].date())
+    assert c.last_rebased == ["600000"] and len(panel["600000"]) == 12  # 不是只剩重叠的最后几行
+
+
 def test_rounding_noise_is_not_a_rebase(cache):
     c, client = cache
     c.update(["600000"], date(2026, 1, 7))
@@ -4948,7 +4962,7 @@ class BarCache:
 uv run pytest tests/test_cache.py -v
 ```
 
-预期：14 passed。
+预期：15 passed。
 
 **Step 5: 提交**
 
@@ -6112,7 +6126,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：74 passed。
+预期：75 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -11001,7 +11015,8 @@ def test_recommendation_prices_adjusted_on_ex_date(env):
     _split_from(env, "600001", dates[101])  # 除权日起的不复权日线（参考昨收是除权参考价）
     settle.main(now=at(dates[101], 16))  # 当天推荐的股票也会刷新分红记录
     buys = [f for f in store.load_account("h:active").trades if f.side == "BUY" and f.code == "600001"]
-    assert buys and store.load_account("h:active").positions["600001"].stop == pytest.approx(3.0)
+    pos = store.load_account("h:active").positions["600001"]
+    assert buys and pos.stop == pytest.approx(3.0) and pos.target == pytest.approx(999.0 / 2)
 
 
 def test_dividend_fetch_failure_alerts_but_settles(env):
