@@ -7504,7 +7504,25 @@ def test_maybe_release_skips_when_a_playbook_is_corrupt(pbdir, cal, broken):
     (pbdir / f"{broken}.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
     assert playbook.maybe_release(store, TODAY, cal) is None
     assert (pbdir / f"{other}.json").read_text(encoding="utf-8") == before  # 空规则没有写进另一份
-    assert store.kv_get("playbook_released") != TODAY.isoformat()  # 修好之后照常比较这个窗口
+    # 损坏期间盘前按空规则交易：窗口从今天重新开始，修好后不拿这段净值比较两版规则
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+def test_maybe_release_after_repair_ignores_corrupt_days(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    good = (pbdir / "candidate.json").read_text(encoding="utf-8")
+    (pbdir / "candidate.json").write_text('{"version": 2, "rules": [', encoding="utf-8")
+    playbook.maybe_release(store, TODAY - dt.timedelta(days=1), cal)  # 昨天的复盘发现损坏
+    (pbdir / "candidate.json").write_text(good, encoding="utf-8")       # 今天修好
+    assert playbook.maybe_release(store, TODAY, cal) is None             # 新窗口还不满 10 个交易日
+    assert playbook.load("active")["version"] == 2
+
+
+def test_load_checked_accepts_bom(pbdir):
+    (pbdir / "active.json").write_text('\ufeff{"version": 3, "rules": [{"id": "r1", "text": "t", "evidence": "e"}]}',
+                                       encoding="utf-8")
+    pb, ok = playbook.load_checked("active")
+    assert ok and pb["version"] == 3
 
 
 def test_long_lesson_is_truncated_not_wiping_rules():
@@ -7644,7 +7662,7 @@ def load_checked(kind: str) -> tuple[dict, bool]:
     if not p.exists():
         return empty, True
     try:
-        pb = json.loads(p.read_text(encoding="utf-8"))
+        pb = json.loads(p.read_text(encoding="utf-8-sig"))  # 记事本、PowerShell 5.1 保存的文件带 BOM
     except (ValueError, OSError):
         pb = None
     if not _valid(pb):
@@ -7730,6 +7748,11 @@ def _window_return(store: Store, account: str, start: dt.date, end: dt.date) -> 
 
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
+    if corrupt_kinds():
+        # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
+        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始
+        store.kv_set(RELEASE_KEY, today.isoformat())
+        return None
     last = store.kv_get(RELEASE_KEY)
     if last is None:
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -7737,8 +7760,6 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
     start = dt.date.fromisoformat(last)
     if len(calendar.between(start, today)) - 1 < MIN_DAYS_BETWEEN_RELEASES:
         return None
-    if corrupt_kinds():
-        return None  # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警
     active, cand = load("active"), load("candidate")
     if cand.get("rules") == active.get("rules"):
         store.kv_set(RELEASE_KEY, today.isoformat())
@@ -9368,6 +9389,7 @@ def test_corrupt_playbook_is_not_released_or_overwritten(env, monkeypatch, tmp_p
     assert (tmp_path / f"{other}.json").read_text(encoding="utf-8") == before
     assert env["commits"] == []
     assert f"playbook/{broken}.json 损坏" in env["notifier"].sent[0]
+    assert env["store"].kv_get(playbook.RELEASE_KEY) == D.isoformat()  # 发布窗口从今天重新开始
 
 
 def test_evidence_only_merge_is_committed(env):
@@ -9583,7 +9605,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
     bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    release = None if bad else playbook.maybe_release(store, d, calendar)
+    release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
     parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
@@ -9682,7 +9704,7 @@ git commit -m "feat: add post-close LLM review that evolves candidate playbook a
   2. 代码规范：`compile()` 通过，且 `strategies.sandbox.check_source()` 无违规（import 白名单、禁用的内建与反射写法、双下划线、pandas/numpy 读写函数）。违规原因原样反馈给下一轮。
   3. 隔离评估：独立子进程 `python -m engine.run_eval <name>`（`cwd=root`，`EVAL_TIMEOUT=1800` 秒；基线策略在约 800 只股票、2,600 个交易日上实测约 7 分钟，留出余量给更复杂的策略），只解析最后一行 JSON（`EvalReport.to_agent_dict()`），留出集只有 `holdout_pass` 布尔值。超时、非零退出、输出异常一律按失败处理并反馈。
   4. 次数上限：每会话最多 `MAX_ROUNDS=3` 轮，每轮最多 `MAX_DRAFTS_PER_ROUND=3` 个草稿，整个会话最多 `MAX_EVALS_PER_SESSION=5` 次评估（超时也算）。DSR 按全部历史试验折减，多试只会更难过门槛。
-  5. 完整性：会话前 `integrity.verify(root)` 必须为 `[]`，否则告警且不调用 LLM；每次评估后都校验一次，有变化就立即停止会话（不再评估，也不再请求 LLM）；会话后再校验一次，有变化就告警、不提交 git，本次进入影子盘的策略改回 candidate（不参与前向模拟），文件留在工作区供人工排查。
+  5. 完整性：会话前 `integrity.verify(root)` 必须为 `[]`，否则告警且不调用 LLM；每次评估后都校验一次，有变化就立即停止会话（不再评估，也不再请求 LLM）；会话后再校验一次。会话中或会后任一次不符（会后又相符时可能是有人改了又改回）都告警、不提交 git，本次的试验记录作废（仍计入 n_trials），进入影子盘的策略改回 candidate（不参与前向模拟），文件留在工作区供人工排查。
   6. 预算：开始前 `check_budget(False)`；每轮 `max_budget_usd=min(3.0, 本月剩余预算折合美元)`；`BudgetExceeded` 立即停止。
   7. 审计：所有写入的策略文件都用带假设的提交信息 `git_commit`，并推送企业微信摘要；提交失败时摘要里写明"git 提交失败，请人工提交"和文件路径。
   8. 晋升：过门槛和留出集只代表进入影子盘；能否成为现任由至少 20 个交易日的前向模拟盘决定（Task 2.7），研究会话影响不了。
@@ -10026,6 +10048,22 @@ def test_evaluate_error_includes_strategy_frames(written):
         '{"error": "IndexError: single positional indexer is out-of-bounds"}\n', returncode=1, stderr=stderr))
     assert 'strategies/probe_one.py 第 12 行（select）：x = h["close"].iloc[-21]' in out["error"]
     assert "backtest.py" not in out["error"]           # 只给策略文件里的帧
+
+
+def test_evaluate_error_length_is_capped(written):
+    settings, store = written
+    frame = '  File "/p/strategies/probe_one.py", line 7, in select\n    y = 1\n'
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(
+        '{"error": "' + "x" * 10_000 + '"}\n', returncode=1, stderr=frame * 2000))
+    assert len(out["error"]) <= research.EVAL_ERROR_CHARS + 1_600
+    assert len(research._strategy_frames(frame * 2000, "probe_one")) <= 1500
+
+
+def test_strategy_frames_without_source_line():
+    stderr = ('  File "/p/strategies/probe_one.py", line 7, in select\n'
+              '  File "/p/strategies/probe_one.py", line 3, in helper\n')
+    assert research._strategy_frames(stderr, "probe_one") == (
+        "strategies/probe_one.py 第 7 行（select）：\nstrategies/probe_one.py 第 3 行（helper）：")
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -10698,6 +10736,14 @@ def test_feedback_truncates_long_code_and_hypothesis(env):
     assert len(fb) < len(llm.calls[0]["user"]) + research.FEEDBACK_CODE_CHARS + 3000
 
 
+def test_draft_block_caps_message_and_error():
+    res = {"name": "x_one", "hypothesis": "h", "message": "m" * 10_000, "saved": True, "ok": False,
+           "report": None, "error": "e" * 10_000}
+    block = research._draft_block(res, Draft(name="x_one", hypothesis="h", code="X = 1\n"))
+    assert "m" * (research.FEEDBACK_MESSAGE_CHARS + 1) not in block
+    assert "e" * (research.EVAL_ERROR_CHARS + 1_601) not in block and "e" * research.EVAL_ERROR_CHARS in block
+
+
 def test_context_built_once_and_round_task_has_current_n_trials(env, monkeypatch):
     e = env
     built = []
@@ -10723,6 +10769,27 @@ def test_engine_change_mid_session_stops_and_reverts_shadow(env):
     assert e.store.get_status("a_one") == "candidate"           # 不参与前向模拟
     assert e.store.strategies_with_status("shadow") == [] and e.commits == []
     assert "已从影子盘改回 candidate：a_one" in e.notifier.sent[-1]
+    trial = e.store.last_trial("a_one")                         # 试验记录作废，仍计入 n_trials
+    assert trial["gate_pass"] is False and trial["holdout_pass"] is False and e.store.trial_count() == 1
+
+
+def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
+    e = env
+    e.evals.outcomes["a_one"] = report("a_one", gate=True, holdout=True)
+    calls = []
+    real = research.verify
+
+    def flaky_verify(root):
+        calls.append(1)
+        return [".integrity/manifest.json"] if len(calls) == 2 else real(root)  # 只有第一次评估后不符
+
+    monkeypatch.setattr(research, "verify", flaky_verify)
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
+    out = run(e, llm)
+    assert out["status"] == "integrity_failed" and e.evals.names == ["a_one"] and len(llm.calls) == 1
+    assert e.store.get_status("a_one") == "candidate" and e.commits == []
+    alert = e.notifier.sent[-1]
+    assert "会话中 engine/ 校验不符" in alert and ".integrity/manifest.json" in alert
 
 
 def test_commit_failure_is_reported(env, monkeypatch):
@@ -10945,7 +11012,7 @@ def _summary(today: date, out: dict, error: str) -> str:
 def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
                    evals: int, out: dict) -> tuple[list[dict], int]:
     """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
-    每次评估后都校验 engine/：不符时不再处理后面的草稿，并把 out["engine_changed"] 置为 True。
+    每次评估后都校验 engine/：不符时不再处理后面的草稿，并把不符的文件记在 out["engine_changed"]。
 
     结果边做边记进 out：即使本地出错抛异常，已写入的文件也会照常提交。"""
     results = []
@@ -10962,8 +11029,9 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
             out["written"].append(res["name"])
             evals += 1  # 先计数：超时、失败同样消耗一次额度
             res.update(evaluate_strategy(settings, store, res["name"]))
-            if verify(Path(settings.root)):
-                out["engine_changed"] = True
+            changed = verify(Path(settings.root))
+            if changed:
+                out["engine_changed"] = changed
                 break
     return results, evals
 
@@ -11021,16 +11089,24 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         out["status"], error = "error", f"{type(e).__name__}: {e}"
     out["cost_cny"] = _month_cost(store) - cost0
 
-    out.pop("engine_changed", None)
+    mid = out.pop("engine_changed", None) or []
     bad = verify(root)
-    if bad:
-        # engine/ 被改动时得到的门槛结果不可信：本次进入影子盘的策略改回 candidate，不参与前向模拟
+    if bad or mid:
+        # 会话中或会后 engine/ 不符（会后又相符时可能是有人改了又改回）：本次的门槛结果不可信。
+        # 试验记录作废（仍计入 n_trials），进入影子盘的策略改回 candidate，不参与前向模拟
         reverted = [n for n in out["written"] if store.get_status(n) == "shadow"]
+        for n in out["written"]:
+            trial = store.last_trial(n)
+            if trial is not None:
+                store.void_trial(trial["id"])
         for n in reverted:
             store.set_status(n, "candidate", today)
+        title = ("研究会话后 engine/ 校验不符，未提交 git" if bad
+                 else "研究会话中 engine/ 校验不符，已提前停止，未提交 git")
         notifier.send_text(format_alert(
-            "研究会话后 engine/ 校验不符，未提交 git",
-            "\n".join(bad) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"
+            title,
+            "\n".join(bad or mid) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"
+            + ("\n本次的试验记录已作废（仍计入 n_trials）" if out["written"] else "")
             + (f"\n已从影子盘改回 candidate：{'、'.join(reverted)}" if reverted else "")))
         return {**out, "status": "integrity_failed"}
 
