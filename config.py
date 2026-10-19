@@ -3,9 +3,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env"
 
 
 @dataclass(frozen=True)
@@ -44,12 +45,17 @@ def _num(env, name: str, default: str, cast):
         raise ValueError(f"配置 {name} 必须是{kind}，当前为 {raw!r}") from None
 
 
-def get_settings() -> Settings:
-    load_dotenv(ROOT / ".env")
+def get_settings(env_file: Path | None = None) -> Settings:
+    """每个键依次取：非空的系统环境变量、非空的 .env 值、默认值。不写入 os.environ。
+
+    不用 load_dotenv：它不会覆盖系统里已存在的空变量，.env 的值会被忽略。"""
+    file_values = dotenv_values(ENV_FILE if env_file is None else env_file)
 
     def env(name: str, default: str) -> str:
-        value = os.environ.get(name, "")
-        return value if value.strip() else default  # 空字符串（含纯空白）回退到默认值
+        for value in (os.environ.get(name), file_values.get(name)):
+            if value is not None and value.strip():  # 空字符串（含纯空白）视为未设置
+                return value
+        return default
 
     return Settings(
         anthropic_api_key=env("ANTHROPIC_API_KEY", ""),

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import config
@@ -5,10 +7,16 @@ import config
 ENV_NAMES = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE",
              "WECOM_WEBHOOK_URL", "MONTHLY_BUDGET_CNY", "USD_CNY", "DB_PATH", "LLM_MODEL", "CAPITAL",
              "MAX_PICKS"]
+REAL_ENV_FILE = config.ENV_FILE
+
+
+@pytest.fixture(autouse=True)
+def _no_real_env_file(monkeypatch, tmp_path):
+    """get_settings() without an argument must never read this machine's real .env."""
+    monkeypatch.setattr(config, "ENV_FILE", tmp_path / "absent.env")
 
 
 def _isolate(monkeypatch):
-    monkeypatch.setattr(config, "load_dotenv", lambda *a, **k: False)
     for n in ENV_NAMES:
         monkeypatch.delenv(n, raising=False)
 
@@ -94,3 +102,45 @@ def test_env_example_lists_every_key_without_secrets():
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE"):
         assert values[k] == ""
     assert values["WECOM_WEBHOOK_URL"].endswith("key=YOUR-KEY-HERE")
+
+
+def _env_file(tmp_path, *lines):
+    f = tmp_path / ".env"
+    f.write_text("".join(ln + "\n" for ln in lines), encoding="utf-8")
+    return f
+
+
+def test_env_file_value_used_when_system_var_is_empty(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("CAPITAL", "")
+    s = config.get_settings(_env_file(tmp_path, "CAPITAL=1000000", "MAX_PICKS=3"))
+    assert s.capital == 1_000_000.0 and s.max_picks == 3
+
+
+def test_non_empty_system_var_wins_over_env_file(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("CAPITAL", "200000")
+    assert config.get_settings(_env_file(tmp_path, "CAPITAL=1000000")).capital == 200_000.0
+
+
+def test_both_empty_fall_back_to_default(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("CAPITAL", "")
+    s = config.get_settings(_env_file(tmp_path, "CAPITAL=", "USD_CNY=  ", "MAX_PICKS"))
+    assert s.capital == 500_000.0 and s.usd_cny == 7.2 and s.max_picks == 5
+
+
+def test_get_settings_does_not_write_environment(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    s = config.get_settings(_env_file(tmp_path, "ANTHROPIC_AUTH_TOKEN=tok-file"))
+    assert s.anthropic_auth_token == "tok-file"
+    assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+
+
+def test_default_env_file_is_root_dotenv(monkeypatch):
+    _isolate(monkeypatch)
+    assert REAL_ENV_FILE == config.ROOT / ".env"
+    seen = []
+    monkeypatch.setattr(config, "dotenv_values", lambda path: seen.append(path) or {})
+    config.get_settings()
+    assert seen == [config.ENV_FILE]
