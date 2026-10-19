@@ -14,21 +14,23 @@
 
 **修订（2026-10-19，Part 1 审查修复）：** 涨跌停与费用按日期生效，创业板含 302 号段，涨跌停判断容忍一分钱；撮合改为开盘卖出、开盘买入、盘中卖出三步；账本自保 T+1、拒绝加仓与异常价格；`Pick`、`Fill`、配置增加输入校验。后续 Part 的代码无需改动，只同步了提示词中的撮合与费用描述。
 
-**修订（2026-10-19，Part 1 第二至四轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断，封板只看一字形态：最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
+**修订（2026-10-19，Part 1 第二至四轮审查修复）：** 当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]（不含一档）时，视为区间不可靠（例如除权日的昨收仍是除权前价格），成交价不截断，封板只看一字形态：最高价等于最低价才算封死涨停或跌停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出；开盘价不高于 pick 止损价时不买；`execute_day` 依据 `Account.last_trade_day` 保证每个交易日只执行一次；配置每个键依次取非空的系统环境变量、非空的 `.env` 值、默认值。后续 Part 的改动：(a) Task 3.5 基线策略按 `view.asof` 当天的规则计算涨停价，并用 `at_limit_up` 判断涨停（容忍一分钱），新增 1 个测试；(b) Task 5.2 `RESEARCH_SYSTEM` 补充编码约定（涨跌停价传入 `view.asof`，涨跌停判断用 `at_limit_up` / `at_limit_down`），买入规则补上“开盘价不高于 stop 不成交”，提示词测试增加对应关键词；(c) Task 4.3 `auction_filter` 剔除竞价价不高于采用止损价的股票，与撮合口径一致，新增 1 个测试，盘前、复盘提示词同步；(d) Task 6.8 说明鉴权取值顺序。
 
 **修订（2026-10-19，Part 2 审查修复）：** 评估器在回放留出期之前记录试验，训练、验证段报错也计入 n_trials，留出期任何异常只记为未通过、不外传文本；回测净值前置期初资金点，面板截断到本段末尾；晋升先对齐净值再算收益，按收益日计数，降级要求 t <= -1.5；`DataView.codes()` 不列出尚未上市的股票；`record_nav` 拒绝非有限值；清单损坏视为校验不通过。后续 Part 的改动：(a) Task 3.5 基线只取需要的 60 行；(b) Task 3.6 源码检查禁止任何含 `__` 的名字、属性和标识符式字符串，以及动态取属性、`print`、`exit`、`SystemExit`，`run_eval` 对 `SystemExit` 也回传错误 JSON；(c) Task 5.1 `evaluate_strategy` 以数据库里本次的试验记录决定是否进入影子盘，`EVAL_TIMEOUT` 改为 1800 秒；(d) Task 5.2 编码约定同步；(e) Task 6.2 已有清单时不重写，只校验并告警；(f) Task 6.3 先存账户再记净值，收盘价缺失时沿用上一个有效值，策略只拿到截至前一交易日的面板。
 
+**修订（2026-10-19，Part 2 修复复审）：** 留出期里任何异常（含策略抛出的 KeyboardInterrupt）都只记为未通过，Ctrl+C 时改抛不带消息的新异常；区间不可靠时开盘涨停也只认一字板，不再用"开盘价等于最高价"（那等于让当天之后的走势决定买不买）；降级后的影子期从下一交易日算起；源码检查补上按字符串求值（`typing.get_type_hints`、`ForwardRef`）、含 `__` 的普通字符串、对已导入模块或类的属性赋值、经 `import engine.types` 绑定的包名访问白名单之外的模块；`run_eval` 评估前后核对评估规则，被改过就作废试验（`Store.void_trial`）。
+
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，484 个测试全部通过（Part 1 共 145 个、Part 2 共 90 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，503 个测试全部通过（Part 1 共 147 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
 ## Part 1: 工程脚手架与撮合核心
 
-> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，封板只看一字形态（最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停）。(5) 除权除息只在模拟盘结算时由 `Account.apply_dividend` 处理：回测用的是一致的前复权历史，不需要调整；不建模配股，送转后的零碎股向下取整，分红一律按持股 1 个月以内的 20% 扣税。
+> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，封板只看一字形态（最高价等于最低价才算封死涨跌停）。(5) 除权除息只在模拟盘结算时由 `Account.apply_dividend` 处理：回测用的是一致的前复权历史，不需要调整；不建模配股，送转后的零碎股向下取整，分红一律按持股 1 个月以内的 20% 扣税。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（145 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（147 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -803,7 +805,7 @@ def at_limit_up(price: float, up: float) -> bool:
     adjusted prev_close. The tolerance absorbs that rounding. Cash dividends are subtracted rather
     than rescaled, so an old sealed price can also sit above the computed limit by more than a
     cent; any price above it counts as limit-up too (SimBroker additionally requires
-    open == high when the day's prices show the computed band is wrong). Effect on raw prices: a
+    a one-price bar when the day's prices show the computed band is wrong). Effect on raw prices: a
     price exactly one cent below the true limit also counts as limit-up (a buy there is skipped),
     which only makes the simulation slightly more conservative.
     """
@@ -1382,7 +1384,7 @@ git commit -m "feat(engine): add T+1 account ledger"
 
 执行顺序（`execute_day` 的 docstring 写明了同样的规则）：
 
-0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断，下面的封板判断改为只看一字形态：最高价等于最低价才算封死跌停，开盘价等于最高价才算开盘涨停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出。
+0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01]，就说明这只股票当天的区间不可靠（例如除权日的昨收仍是除权前价格，或用今天的名称判断历史 ST 状态，或前复权扣减了之后的现金分红），此时成交价不截断，下面的封板判断改为只看一字形态：最高价等于最低价才算封死涨停或跌停。算错的区间可能窄得多（前复权扣减了之后的现金分红时，高分红股早期原始价格涨跌三四个点就会越过算出的涨跌停价），普通交易日照常成交；一字板仍然买不进、卖不出。
 1. 开盘卖出：`at_limit_down(high, down)` 说明全天封死跌停，不能卖。否则依次判断：到期按开盘价卖出；开盘价 ≤ 止损价按开盘价止损；开盘价 ≥ 目标价按开盘价止盈；只在盘中触及止损或目标的持仓推迟到第 3 步。
 2. 开盘买入（按 picks 顺序）：跳过已持仓、无效行情、`at_limit_up(open, up)`、开盘价高于 entry_max、开盘价不高于 pick 止损价的情况；股数按整手计算并考虑最低 5 元佣金，现金不会为负；exit_date 用 `calendar.offset` 计算。
 3. 盘中卖出：处理第 1 步推迟的持仓。盘中低点 ≤ 止损价按止损价卖出（止损和目标同时触及时止损优先，因为日线看不出盘中先后）；否则按目标价卖出。
@@ -1687,10 +1689,18 @@ def test_unreliable_band_ordinary_day_trades():
     assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
 
 
-def test_unreliable_band_open_at_high_counts_as_sealed_limit_up():
-    # the open beyond the computed limit-up is also the day's high: treated as opening sealed
+@pytest.mark.parametrize("h,l,c", [(1.70, 1.62, 1.66), (1.78, 1.68, 1.76)])
+def test_unreliable_band_buy_decision_ignores_the_rest_of_the_day(h, l, c):
+    # same +13% open beyond the computed limit-up 1.65: whether it later fades (open == high) or keeps
+    # rising must not decide the buy, otherwise the day's later path leaks into the decision
     acc = Account("t", 100_000.0)
-    assert run(acc, [bar(o=1.70, h=1.70, l=1.62, c=1.66, pc=1.50)],
+    f = run(acc, [bar(o=1.70, h=h, l=l, c=c, pc=1.50)], [pick(entry_max=1.75, stop=1.55, target=1.90)])[0]
+    assert f.side == "BUY" and f.price == pytest.approx(1.70 * (1 + SLIP))
+
+
+def test_unreliable_band_one_price_open_is_sealed_limit_up():
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=1.70, h=1.70, l=1.70, c=1.70, pc=1.50)],
                [pick(entry_max=1.75, stop=1.55, target=1.90)]) == []
 
 
@@ -1798,10 +1808,11 @@ class SimBroker:
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
            day with a stale prev_close); then fill prices are not clipped, and a limit counts as
-           sealed only when the bar shows it: at limit-down only if high == low (one price all
-           day), at limit-up only if open == high. A wrong band can be far too narrow (e.g. later
-           cash dividends subtracted from forward-adjusted prices), so an ordinary day beyond it
-           still trades; a one-price bar beyond it is still sealed.
+           sealed only for a one-price bar (high == low, so the open was also the high and the
+           low). A wrong band can be far too narrow (e.g. later cash dividends subtracted from
+           forward-adjusted prices), so an ordinary day beyond it still trades; a one-price bar
+           beyond it is still sealed. Requiring open == high alone would let the rest of the day
+           decide the buy (a gap-up that fades is skipped, one that keeps rising is bought).
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -1856,8 +1867,8 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            opened_at_high = _cents(bar.open) == _cents(bar.high)
-            if at_limit_up(bar.open, band[0]) and (band[2] or opened_at_high):
+            one_price = _cents(bar.high) == _cents(bar.low)
+            if at_limit_up(bar.open, band[0]) and (band[2] or one_price):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
@@ -1891,7 +1902,7 @@ class SimBroker:
 ```powershell
 uv run pytest tests/test_broker.py -v
 ```
-预期：43 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试各含 2 个用例）。
+预期：45 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试和开盘买入不看当日走势的参数化测试各含 2 个用例）。
 
 
 **Step 4b: 全量回归**
@@ -1899,7 +1910,7 @@ uv run pytest tests/test_broker.py -v
 ```powershell
 uv run pytest -v
 ```
-预期：Part 1 共 145 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 26 + broker 43）全部通过。
+预期：Part 1 共 145 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 26 + broker 45）全部通过。
 
 
 **Step 5: Commit**
@@ -2101,6 +2112,13 @@ def test_trial_holdout_update_and_last_trial(store):
     t = store.last_trial("a")
     assert t["id"] == tid and t["gate_pass"] is True and t["holdout_pass"] is True
     assert store.recent_trials(2)[1]["holdout_pass"] is True
+
+
+def test_void_trial(store):
+    tid = store.add_trial("a", {}, 1.0, 1.2, True, True)
+    store.void_trial(tid)
+    t = store.last_trial("a")
+    assert t["gate_pass"] is False and t["holdout_pass"] is False and store.trial_count() == 1
 ```
 
 **Step 2: 运行，确认失败**
@@ -2255,6 +2273,10 @@ class Store:
 
     def set_trial_holdout(self, trial_id: int, holdout_pass: bool) -> None:
         self._exec("UPDATE trials SET holdout_pass=? WHERE id=?", (int(bool(holdout_pass)), int(trial_id)))
+
+    def void_trial(self, trial_id: int) -> None:
+        """作废一次试验（评估规则在评估期间被改动）：仍计入 n_trials，但门槛和留出期都记为未通过。"""
+        self._exec("UPDATE trials SET gate_pass=0, holdout_pass=0 WHERE id=?", (int(trial_id),))
 
     def trial_count(self, strategy: str | None = None) -> int:
         if strategy is None:
@@ -2897,9 +2919,25 @@ def test_strategy_never_receives_data_after_segment_end():
 def test_day_bars_matches_bars_for_day():
     panel = _panel()
     panel["600002"] = panel["600002"].drop(IDX[4])
+    for i, (code, df) in enumerate(panel.items()):  # 开高低收、量、额各不相同，列序错了才测得出来
+        df = df.copy()
+        df["open"] = df["close"] * (1 + 0.003 * (i + 1))
+        df["high"] = df[["open", "close"]].max(axis=1) * 1.02
+        df["low"] = df[["open", "close"]].min(axis=1) * 0.98
+        df["volume"] = range(1000, 1000 + len(df))
+        df["amount"] = df["volume"] * 7.0
+        panel[code] = df
     index = DayBars(panel, NAMES)
     for d in DAYS + [date(2030, 1, 1)]:
         assert index.get(d) == bars_for_day(panel, NAMES, d)
+
+
+def test_benchmark_counts_first_day():
+    bench = pd.Series(100.0, index=IDX)
+    bench[IDX[2]:] = 110.0  # 基准只在 start 当天上涨 10%，之后横盘
+    res = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[10], bench, capital=100_000, max_picks=1)
+    flat = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert res.metrics["excess_ann"] == pytest.approx(flat.metrics["excess_ann"] - 0.1 / 9 * 252)
 ```
 
 **Step 2: 运行，确认失败**
@@ -3202,10 +3240,17 @@ def test_holdout_gate_conditions(monkeypatch, over, passed):
     assert rep.gate_pass is True and rep.holdout_pass is passed
 
 
-@pytest.mark.parametrize("exc", [RuntimeError("holdout_return=0.4451"), SystemExit(0), KeyError("x")])
+@pytest.mark.parametrize("exc", [RuntimeError("holdout_return=0.4451"), SystemExit(0), KeyError("x"),
+                                 KeyboardInterrupt("holdout_return=0.4451")])
 def test_holdout_failure_is_a_counted_fail_without_details(monkeypatch, exc):
     _patched(monkeypatch, holdout_raises=exc)
     store = Store(":memory:")
+    if isinstance(exc, KeyboardInterrupt):  # 真正的 Ctrl+C 照样中断，但抛出的是不带消息的新异常
+        with pytest.raises(KeyboardInterrupt) as info:
+            ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
+        assert str(info.value) == "" and info.value.__context__ is None and info.value.__cause__ is None
+        assert store.last_trial("winner")["holdout_pass"] is False
+        return
     rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
     assert rep.gate_pass is True and rep.holdout_pass is False
     assert store.trial_count() == 1 and store.last_trial("winner")["holdout_pass"] is False
@@ -3219,10 +3264,15 @@ class Crasher:
         raise ValueError("boom")
 
 
-def test_failed_train_val_run_still_counts_as_trial():
+@pytest.mark.parametrize("exc", [ValueError("boom"), SystemExit(0), KeyboardInterrupt()])
+def test_failed_train_val_run_still_counts_as_trial(exc):
+    class Raiser(Crasher):
+        def select(self, view):
+            raise exc
+
     store = Store(":memory:")
-    with pytest.raises(ValueError, match="boom"):
-        ev.evaluate(Crasher(), "crasher", _panel(), NAMES, CAL, BENCH, store, {"p": 2}, splits=SPL)
+    with pytest.raises(type(exc)):
+        ev.evaluate(Raiser(), "crasher", _panel(), NAMES, CAL, BENCH, store, {"p": 2}, splits=SPL)
     t = store.last_trial("crasher")
     assert store.trial_count() == 1
     assert t["gate_pass"] is False and t["holdout_pass"] is None and t["params"] == {"p": 2}
@@ -3339,15 +3389,16 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
     trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
     if gate_pass:
+        interrupted = False
         try:
             ho = bt("holdout").metrics
             holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
                                 and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
-        except KeyboardInterrupt:
-            raise
-        except BaseException:  # noqa: BLE001 - 含 SystemExit；只记未通过，异常文本可能带出留出期数值，不外传
-            holdout_pass = False
+        except BaseException as e:  # noqa: BLE001 - 任何异常只记未通过：异常文本可能带出留出期数值，不外传
+            holdout_pass, interrupted = False, isinstance(e, KeyboardInterrupt)
         store.set_trial_holdout(trial_id, holdout_pass)
+        if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
+            raise KeyboardInterrupt from None
     return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr, gate_pass=gate_pass,
                       holdout_pass=holdout_pass, n_trials=store.trial_count())
 ```
@@ -3726,6 +3777,66 @@ def test_demotion_picks_the_shadow_incumbent_lags_most(monkeypatch):
     _record(store, "q:strong", vals)
     events = pr.decide(store, DAYS[-1], CAL)
     assert [(e.kind, e.strategy) for e in events] == [("demote", "old"), ("promote", "strong")]
+
+
+def test_demoted_incumbent_shadow_period_starts_next_day(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    cal = TradingCalendar(DAYS + [d.date() for d in pd.bdate_range(IDX[-1] + pd.Timedelta(days=1), periods=5)])
+    store = _setup(cand_daily=0.0005, inc_daily=0.0)
+    assert [e.kind for e in pr.decide(store, DAYS[-1], cal)] == ["demote", "promote"]
+    assert store.status_since("old") == cal.next_day(DAYS[-1])
+    nav = pr._shadow_nav(store, "old", DAYS[-1], cal)
+    assert list(nav.index) == [IDX[-1]]  # 只有基线，还没有影子期的收益日
+
+
+def _steady(store, name, excess_daily, noise, status="shadow"):
+    """现任 q:old 为 0 收益加交替噪声；name 在其上叠加每日 excess_daily 和独立的交替噪声 noise。"""
+    if store.get_status("old") is None:
+        store.set_status("old", "incumbent", DAYS[0])
+        _record(store, "q:old", _nav(0.0, noise=0.002))
+    store.set_status(name, status, DAYS[0])
+    base = _nav(0.0, noise=0.002)
+    rets = [base[0] / 100 - 1] + [base[i] / base[i - 1] - 1 for i in range(1, len(base))]
+    v, vals = 100.0, []
+    for i, r in enumerate(rets):
+        v *= 1 + r + excess_daily + (noise if i % 3 == 0 else -noise / 2)
+        vals.append(v)
+    _record(store, f"q:{name}", vals)
+
+
+@pytest.mark.parametrize("excess,noise,promoted", [
+    (0.0003, 0.0, True),      # 年化约 7.6%，t 很大
+    (0.00016, 0.0, False),    # 年化约 4%：不到 5%，t 再大也不晋升
+    (0.00024, 0.0, True),     # 年化约 6%
+    (0.0003, 0.02, False),    # 同样的超额、噪声很大：t < 1.5，不晋升
+])
+def test_promotion_needs_both_excess_and_significance(excess, noise, promoted):
+    store = Store(":memory:")
+    _steady(store, "new", excess, noise)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert any(e.kind == "promote" and e.strategy == "new" for e in events) is promoted
+
+
+@pytest.mark.parametrize("lag,demoted", [(-0.00016, False), (-0.00024, True)])
+def test_demotion_excess_threshold(monkeypatch, lag, demoted):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    # 现任落后影子：影子每日比现任多 -lag
+    _steady(store, "new", -lag, 0.0001)
+    kinds = [e.kind for e in pr.decide(store, DAYS[-1], CAL)]
+    assert (kinds[:1] == ["demote"]) is demoted
+
+
+@pytest.mark.parametrize("points,demoted", [(40, False), (41, True)])
+def test_demotion_window_boundary(monkeypatch, points, demoted):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    _record(store, "q:old", _nav(0.0, noise=0.0002))
+    store.set_status("new", "shadow", DAYS[len(DAYS) - points + 1])  # 影子期净值点数 = points
+    _record(store, "q:new", _nav(0.001, noise=0.0004))  # 噪声不同：超额不恒定，t 值有限
+    assert len(pr._shadow_nav(store, "new", DAYS[-1], CAL)) == points
+    assert bool(pr.decide(store, DAYS[-1], CAL)) is demoted
 ```
 
 **Step 2: 运行，确认失败**
@@ -3830,7 +3941,12 @@ def decide(store: Store, today: date, calendar: TradingCalendar) -> list[Event]:
                 worst = (ann, s)
         if worst:
             ann, s = worst
-            store.set_status(inc, "shadow", today)
+            # decide 在当天结算之后运行，当天仍是现任时期：影子期从下一交易日算起
+            try:
+                since = calendar.next_day(today)
+            except ValueError:  # 日历末端
+                since = today
+            store.set_status(inc, "shadow", since)
             store.set_status(s, "incumbent", today)
             return [Event("demote", inc, f"近 {DEMOTE_WINDOW} 日落后 {s} 年化 {-ann:.2%}，降为影子"),
                     Event("promote", s, f"接替被降级的 {inc}")]
@@ -3877,7 +3993,7 @@ uv run pytest tests/test_store.py tests/test_metrics.py tests/test_dataview.py t
 > - `spot()` 新浪备用源的 `成交量` 单位为股，统一除以 100 换算成手（和东财一致），需在冒烟步骤中核实。
 > - `NullNotifier.sent` 是 `list[str]`（消息原文）。`notify/wecom.py` 额外导出常量 `TEXT_LIMIT`/`MARKDOWN_LIMIT`/`FAIL_PREFIX` 和函数 `split_utf8`；失败日志会把 webhook 的 `key=` 脱敏。
 > - `baseline_momo` 额外排除最后一根 K 线不在 `view.asof` 的股票（asof 当日停牌）。同分时按代码升序。策略文件不写 `from __future__ import annotations`（`__future__` 不在沙箱白名单）。
-> - `check_source` 采用更严格的口径：`getattr/setattr/delattr` 一律禁止（不只针对 dunder），另禁 `locals/vars/breakpoint/input`、任何以 `__` 开头的名字，以及 pandas/numpy 的文件读写属性（`read_*`、`to_csv` 等）。允许导入白名单模块及其子模块（`numpy.linalg` 可以，`engine.store` 不行）。沙箱是尽力而为的静态检查，不是安全边界；真正的防线是 `engine/` 哈希校验和 git 审计。
+> - `check_source` 采用更严格的口径：`getattr/setattr/delattr` 一律禁止（不只针对 dunder），另禁 `locals/vars/breakpoint/input`、任何含 `__` 的名字、属性和字符串（docstring 除外）、按字符串求值或取属性的写法、对已导入模块或类的属性赋值，以及经 `import engine.types` 绑定的包名访问白名单之外的模块，以及 pandas/numpy 的文件读写属性（`read_*`、`to_csv` 等）。允许导入白名单模块及其子模块（`numpy.linalg` 可以，`engine.store` 不行）。沙箱是尽力而为的静态检查，不是安全边界；真正的防线是 `engine/` 哈希校验和 git 审计。
 > - `engine/run_eval.py` 全程不触网：交易日历取自缓存基准指数 `sh000300` 的日期，股票池为 `cache.codes()`，基准净值为指数归一化到 1。出错时也输出一行 `{"error": ...}` JSON，退出码非 0。它在 `engine/` 内，会被纳入完整性清单。
 > - 依赖前面 Part 的 `config.py`、`engine/types.py`、`engine/rules.py`、`engine/dataview.py`、`engine/calendar.py`、`engine/store.py`、`engine/evaluator.py`，以及 `data/`、`notify/`、`strategies/` 各包的 `__init__.py`（若缺失，先创建空文件）。
 
@@ -5433,6 +5549,18 @@ def test_dunder_access_rejected():
 def test_dunder_in_docstring_and_method_name_allowed():
     src = OK.replace('    def select(self, view):', '    def select(self, view):\n        """不调用 __init__ 以外的特殊方法。"""')
     assert check_source(src) == []
+    assert check_source(OK.replace('    name = "good_one"', '    name = "good_one"\n    k = "a__b"'))  # 普通字符串不行
+
+
+def test_string_evaluation_and_engine_mutation_rejected():
+    for code in ['import typing\ndef f(x: "(lambda p=v._DataView__panel: p)"): pass',
+                 "import typing\nh = typing.get_type_hints(f)", "import typing\nr = typing.ForwardRef('x')",
+                 "import engine.types\nengine.evaluator.GATE.update(dsr=-1)",
+                 "import engine.types\nx = engine", "import strategies.base\ns = strategies.sandbox",
+                 "import engine.rules as r\nr.COMMISSION_RATE = 0", "from engine.dataview import DataView\nDataView.history = None",
+                 "raise KeyboardInterrupt('x')", "class E(BaseException): pass"]:
+        assert bad(code), code
+    assert bad("import engine.types\np = engine.types.Pick") == []  # 完整的白名单路径可以
 
 
 def test_dynamic_access_and_process_control_rejected():
@@ -5511,6 +5639,7 @@ def captured(tmp_path, monkeypatch):
 
     monkeypatch.setattr(run_eval, "evaluate", fake_evaluate)
     seen["sentinel"] = sentinel
+    seen["store_ref"] = Store(db)
     return seen
 
 
@@ -5551,6 +5680,22 @@ def test_main_reports_system_exit_as_json(captured, monkeypatch):
     assert json.loads(out.getvalue()) == {"error": "SystemExit: 0"}
 
 
+def test_mutated_rules_void_the_trial(captured, monkeypatch):
+    import engine.evaluator as ev
+
+    def tamper(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
+        store.add_trial(name, {}, 1.0, 1.0, True, True)
+        monkeypatch.setitem(ev.GATE, "dsr", -1.0)  # 模拟策略代码在评估中改了门槛
+        return FakeReport()
+
+    monkeypatch.setattr(run_eval, "evaluate", tamper)
+    out = io.StringIO()
+    assert run_eval.main(["baseline_momo"], out=out) == 1
+    assert "作废" in json.loads(out.getvalue())["error"]
+    t = captured["store_ref"].last_trial("baseline_momo")
+    assert t["gate_pass"] is False and t["holdout_pass"] is False
+
+
 def test_main_usage_error():
     out = io.StringIO()
     assert run_eval.main([], out=out) == 2
@@ -5575,24 +5720,24 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 
 **Step 3: 最小实现**
 
-沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。含 `__` 的名字、属性和标识符式字符串一律拒绝：`DataView` 的私有面板改编后叫 `_DataView__panel`，只拦以 `__` 开头的写法挡不住它。`print`、`exit`、`SystemExit` 也拒绝：评估子进程靠 stdout 最后一行回传报告，策略不能往里写，也不能提前结束进程。
+沙箱只做 AST 静态检查（尽力而为，不是安全边界）。违规信息是中文短句，直接回传给研究 agent。含 `__` 的名字、属性和字符串（docstring 除外）一律拒绝，`typing.get_type_hints`、`ForwardRef` 这类按字符串求值的入口也拒绝；对已导入模块或类的属性赋值、经包名访问白名单之外的模块（例如 `engine.evaluator`）同样拒绝。`run_eval` 在评估前后核对评估规则（门槛、切分、关键函数），被改过就作废这次试验。`DataView` 的私有面板改编后叫 `_DataView__panel`，只拦以 `__` 开头的写法挡不住它。`print`、`exit`、`SystemExit` 也拒绝：评估子进程靠 stdout 最后一行回传报告，策略不能往里写，也不能提前结束进程。
 
 ```python
 # strategies/sandbox.py
-"""策略源码静态检查：限制导入、危险内建、双下划线访问、动态取属性和文件读写。"""
+"""策略源码静态检查：限制导入、危险内建、双下划线访问、动态取属性、修改已导入模块和文件读写。"""
 import ast
-import re
 
 ALLOWED_IMPORTS = {"math", "statistics", "numpy", "pandas", "dataclasses", "typing",
                    "engine.types", "engine.dataview", "engine.rules", "strategies.base"}
 BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
                 "getattr", "setattr", "delattr", "breakpoint", "input",
                 # 评估子进程只认 stdout 最后一行和数据库里的试验记录：策略不能打印，也不能提前结束进程
-                "print", "exit", "quit", "SystemExit", "attrgetter", "methodcaller"}
+                "print", "exit", "quit", "SystemExit", "KeyboardInterrupt", "BaseException",
+                "attrgetter", "methodcaller", "get_type_hints", "ForwardRef"}
 # 按字符串求值或取属性，或经白名单模块拿到解释器内部模块（例如 dataclasses.sys、typing.operator）
 DYNAMIC_ATTRS = {"eval", "query", "sys", "os", "inspect", "operator", "builtins", "importlib",
-                 "subprocess", "attrgetter", "methodcaller"}
-DUNDER_IDENT = re.compile(r"\w*__\w*")  # 形如 _DataView__panel、__panel 的标识符字符串
+                 "subprocess", "attrgetter", "methodcaller", "get_type_hints", "ForwardRef",
+                 "_eval_type", "_evaluate", "evaluate_forward_ref"}
 IO_ATTRS = {"to_csv", "to_pickle", "to_parquet", "to_excel", "to_json", "to_hdf", "to_sql",
             "to_feather", "to_html", "to_clipboard", "load", "loadtxt", "save", "savez",
             "savetxt", "fromfile", "tofile", "genfromtxt", "memmap"}
@@ -5611,6 +5756,27 @@ def _has_strategy(tree: ast.Module) -> bool:
     return False
 
 
+def _docstrings(tree: ast.Module) -> set[int]:
+    """模块、类、函数的 docstring 节点（不会被求值，允许提到 __init__ 之类的名字）。"""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                out.add(id(first.value))
+    return out
+
+
+def _dotted(node) -> str | None:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        return ".".join([node.id, *reversed(parts)])
+    return None
+
+
 def check_source(src: str) -> list[str]:
     """返回违规列表；空列表表示通过。"""
     try:
@@ -5618,8 +5784,21 @@ def check_source(src: str) -> list[str]:
     except SyntaxError as e:
         return [f"语法错误: {e.msg} (第 {e.lineno} 行)"]
     out: list[str] = []
+    docs = _docstrings(tree)
+    parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    # import engine.types 会把包名 engine 绑定进来，经它能拿到 engine.evaluator 等任何已加载的模块
+    pkg_roots = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
+                 for a in n.names if a.asname is None and "." in a.name}
+    imported = {(a.asname or a.name.split(".")[0]) for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                for a in n.names}
     for node in ast.walk(tree):
         line = getattr(node, "lineno", "?")
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for t in targets:
+                path = _dotted(t) if isinstance(t, ast.Attribute) else None
+                if path and path.split(".")[0] in imported:
+                    out.append(f"第 {line} 行: 禁止修改已导入模块或类的属性 {path}")
         if isinstance(node, ast.Import):
             out += [f"第 {line} 行: 禁止导入 {a.name}" for a in node.names if not _allowed(a.name)]
         elif isinstance(node, ast.ImportFrom):
@@ -5632,7 +5811,13 @@ def check_source(src: str) -> list[str]:
                 out.append(f"第 {line} 行: 禁止使用 {node.id}")
             elif "__" in node.id:  # 含改编后的私有名字，例如 _DataView__panel
                 out.append(f"第 {line} 行: 禁止使用含双下划线的名字 {node.id}")
+            elif node.id in pkg_roots and not isinstance(parent.get(node), ast.Attribute):
+                out.append(f"第 {line} 行: 包名 {node.id} 只能以完整的白名单模块路径使用")
         elif isinstance(node, ast.Attribute):
+            path = _dotted(node)
+            if path and path.split(".")[0] in pkg_roots and not _allowed(path) and not any(
+                    m.startswith(path + ".") for m in ALLOWED_IMPORTS):
+                out.append(f"第 {line} 行: 只能访问白名单模块，禁止 {path}")
             if "__" in node.attr:
                 out.append(f"第 {line} 行: 禁止访问含双下划线的属性 {node.attr}")
             elif node.attr.startswith("read_") or node.attr in IO_ATTRS:
@@ -5640,8 +5825,8 @@ def check_source(src: str) -> list[str]:
             elif node.attr in DYNAMIC_ATTRS:
                 out.append(f"第 {line} 行: 禁止动态求值或访问解释器内部模块 {node.attr}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if DUNDER_IDENT.fullmatch(node.value):
-                out.append(f"第 {line} 行: 禁止含双下划线的标识符字符串 {node.value!r}")
+            if "__" in node.value and id(node) not in docs:  # 字符串注解等可以被 typing 求值
+                out.append(f"第 {line} 行: 禁止含双下划线的字符串 {node.value[:40]!r}")
     if not _has_strategy(tree):
         out.append("缺少模块级 STRATEGY 赋值")
     return out
@@ -5663,6 +5848,7 @@ from pathlib import Path
 
 from config import get_settings
 from data.cache import BarCache
+from engine import backtest, broker, evaluator, metrics
 from engine.calendar import TradingCalendar
 from engine.evaluator import evaluate
 from engine.store import Store
@@ -5670,6 +5856,13 @@ from strategies.base import load_strategy
 
 BENCHMARK = "sh000300"
 HISTORY_START = date(2015, 6, 1)
+
+
+def _rules_state() -> tuple:
+    """评估规则的快照。策略代码与评估器在同一进程里：评估结束后核对，被改过就作废这次试验。"""
+    return (repr(evaluator.GATE), repr(evaluator.HOLDOUT_GATE), repr(evaluator.SPLITS), evaluator.run_backtest,
+            evaluator.deflated_sharpe, evaluator.sharpe, evaluator._passes_gate, backtest.SimBroker,
+            broker.SimBroker.execute_day, metrics.summarize, metrics.deflated_sharpe)
 
 
 def run(name: str) -> dict:
@@ -5683,7 +5876,13 @@ def run(name: str) -> dict:
     calendar = TradingCalendar(ts.date() for ts in bench.index)
     panel, names = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
     benchmark_nav = bench / bench.iloc[0]
+    before = _rules_state()
     report = evaluate(load_strategy(name), name, panel, names, calendar, benchmark_nav, store)
+    if _rules_state() != before:
+        trial = store.last_trial(name)
+        if trial is not None:
+            store.void_trial(trial["id"])
+        raise RuntimeError("评估期间评估规则被改动，本次试验作废（策略代码不能修改 engine 模块）")
     return report.to_agent_dict()
 
 
@@ -5716,7 +5915,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：15 passed（sandbox 10 + run_eval 5）。
+预期：17 passed（sandbox 11 + run_eval 6）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -5724,7 +5923,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：61 passed。
+预期：63 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -10445,7 +10644,7 @@ def test_shadow_account_created_and_broken_strategy_skipped(env, monkeypatch):
     assert any("broken_one" in str(m) for m in env["notifier"].sent)
 
 
-def test_crash_between_account_and_nav_loses_no_trades(env, monkeypatch):
+def test_crash_before_account_saved_loses_no_trades(env, monkeypatch):
     dates, store = env["dates"], env["store"]
     real = store.save_account
 
@@ -10457,6 +10656,24 @@ def test_crash_between_account_and_nav_loses_no_trades(env, monkeypatch):
 
     monkeypatch.setattr(store, "save_account", killed_once)
     assert settle.main(now=at(dates[101], 16)) == []
+    assert settle.main(now=at(dates[101], 17)) == [dates[101]]
+    buys = [f for f in store.load_account("h:active").trades if f.side == "BUY" and f.date == dates[101]]
+    assert len(buys) == 1 and store.last_nav_date("h:active") == dates[101]
+
+
+def test_crash_after_account_saved_records_nav_once(env, monkeypatch):
+    dates, store = env["dates"], env["store"]
+    real = store.record_nav
+
+    def killed_once(account, d, equity):
+        if account == "h:active" and d == dates[101]:
+            monkeypatch.setattr(store, "record_nav", real)
+            raise RuntimeError("进程被杀")
+        return real(account, d, equity)
+
+    monkeypatch.setattr(store, "record_nav", killed_once)
+    assert settle.main(now=at(dates[101], 16)) == []
+    assert store.load_account("h:active").last_trade_day == dates[101]  # 账户已存，净值没记
     assert settle.main(now=at(dates[101], 17)) == [dates[101]]
     buys = [f for f in store.load_account("h:active").trades if f.side == "BUY" and f.date == dates[101]]
     assert len(buys) == 1 and store.last_nav_date("h:active") == dates[101]
@@ -10747,7 +10964,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：13 passed。
+预期：14 passed。
 
 **Step 5: 提交**
 
@@ -11748,7 +11965,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 56 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 13、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 57 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 14、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
