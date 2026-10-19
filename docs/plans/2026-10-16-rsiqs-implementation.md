@@ -18,9 +18,9 @@
 
 ## Part 1: 工程脚手架与撮合核心
 
-> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) `Account.buy` 对已持仓代码做加仓并摊薄成本（SimBroker 从不加仓，此为最简一致行为）。(4) 滑点价不做四舍五入，保持浮点。
+> 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（58 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（116 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -922,7 +922,7 @@ git commit -m "feat(engine): add trading calendar"
 - Create: `engine/ledger.py`
 - Test: `tests/test_ledger.py`
 
-`Position.cost` 为含买入费用的每股均价；`equity()` 对无报价的持仓按 cost 估值。
+`Position.cost` 为含买入费用的每股均价；`equity()` 对无报价的持仓按 cost 估值。T+1 由账本自己保证：`start_day(d)` 只解锁 `entry_date < d` 的持仓，买入当天再调用也不会解锁。买入已持有的代码抛 ValueError（不建模加仓）；买卖价格必须是有限正数，否则抛 ValueError；`calc_fee` 传入成交日期 `d`，按当天的过户费和印花税计费。
 
 **Step 1: 写失败测试** `tests/test_ledger.py`
 
@@ -1004,6 +1004,48 @@ def test_roundtrip_json():
     acc = _bought()
     restored = Account.from_dict(json.loads(json.dumps(acc.to_dict())))
     assert restored == acc
+
+
+def test_start_day_only_unlocks_positions_bought_earlier():
+    acc = _bought()
+    acc.start_day(D1)  # same day as the buy: still locked
+    assert acc.positions["600000"].available == 0
+    with pytest.raises(NotAvailable):
+        acc.sell(D1, "600000", 10.5, 1000, "same day")
+    acc.start_day(D2)
+    assert acc.positions["600000"].available == 1000
+
+
+def test_buy_existing_code_raises():
+    acc = _bought()
+    cash = acc.cash
+    with pytest.raises(ValueError):
+        acc.buy(D2, "600000", "浦发银行", 10.0, 100, 9.3, 11.0, EXIT)
+    assert acc.cash == cash and acc.positions["600000"].qty == 1000 and len(acc.trades) == 1
+
+
+@pytest.mark.parametrize("price", [float("nan"), 0.0, -1.0, float("inf")])
+def test_rejects_non_positive_or_non_finite_price(price):
+    acc = Account("t", 100_000.0)
+    with pytest.raises(ValueError):
+        acc.buy(D1, "600000", "浦发银行", price, 100, 9.3, 11.0, EXIT)
+    assert acc.cash == 100_000.0 and not acc.positions and not acc.trades
+    acc = _bought()
+    acc.start_day(D2)
+    with pytest.raises(ValueError):
+        acc.sell(D2, "600000", price, 1000, "x")
+    assert acc.positions["600000"].qty == 1000 and len(acc.trades) == 1
+
+
+def test_fees_follow_trade_date():
+    acc = Account("t", 200_000.0)
+    acc.buy(date(2022, 4, 28), "600000", "浦发银行", 10.0, 10_000, 9.3, 11.0, date(2023, 9, 1))
+    assert acc.trades[-1].fee == 27.0  # 25 + transfer 0.002%
+    acc.start_day(date(2023, 8, 25))
+    acc.sell(date(2023, 8, 25), "600000", 10.0, 5_000, "x")
+    assert acc.trades[-1].fee == 63.0  # 50000: 12.5 + 0.5 + stamp 0.1%
+    acc.sell(date(2023, 8, 28), "600000", 10.0, 5_000, "x")
+    assert acc.trades[-1].fee == 38.0  # 50000: 12.5 + 0.5 + stamp 0.05%
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -1018,6 +1060,7 @@ uv run pytest tests/test_ledger.py -v
 
 ```python
 """Simulated account ledger with A-share T+1 settlement."""
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 
@@ -1031,6 +1074,11 @@ class InsufficientCash(Exception):
 
 class NotAvailable(Exception):
     pass
+
+
+def _check_price(price: float) -> None:
+    if not (math.isfinite(price) and price > 0):
+        raise ValueError(f"price must be finite and > 0, got {price!r}")
 
 
 @dataclass
@@ -1054,38 +1102,37 @@ class Account:
     trades: list[Fill] = field(default_factory=list)
 
     def start_day(self, d: date) -> None:
-        """T+1 unlock: everything held before today becomes sellable."""
+        """T+1 unlock: only positions bought before ``d`` become sellable. Calling it again on the
+        buy day (or twice on the same day) keeps today's purchases locked."""
         for p in self.positions.values():
-            p.available = p.qty
+            p.available = p.qty if p.entry_date < d else 0
 
     def buy(self, d: date, code: str, name: str, price: float, qty: int, stop: float,
             target: float, exit_date: date, reason: str = "") -> Fill:
         if qty <= 0 or qty % 100:
             raise ValueError(f"qty must be a positive multiple of 100, got {qty}")
+        if code in self.positions:
+            raise ValueError(f"{self.name}: already holding {code}; adding to a position is not modelled")
+        _check_price(price)
         amount = price * qty
-        fee = calc_fee("BUY", amount)
+        fee = calc_fee("BUY", amount, d)
         if amount + fee > self.cash + 1e-9:
             raise InsufficientCash(f"{self.name}: need {amount + fee:.2f}, have {self.cash:.2f}")
         self.cash -= amount + fee
-        pos = self.positions.get(code)
-        if pos is None:
-            self.positions[code] = Position(code, name, qty, 0, (amount + fee) / qty, d,
-                                            stop, target, exit_date)
-        else:  # add-on: new shares locked until tomorrow, cost averaged
-            pos.cost = (pos.cost * pos.qty + amount + fee) / (pos.qty + qty)
-            pos.qty += qty
-            pos.stop, pos.target, pos.exit_date = stop, target, exit_date
+        self.positions[code] = Position(code, name, qty, 0, (amount + fee) / qty, d,
+                                        stop, target, exit_date)
         fill = Fill(d, code, "BUY", qty, price, fee, reason)
         self.trades.append(fill)
         return fill
 
     def sell(self, d: date, code: str, price: float, qty: int, reason: str) -> Fill:
+        _check_price(price)
         pos = self.positions.get(code)
         if pos is None or qty <= 0 or qty > pos.available:
             avail = pos.available if pos else 0
             raise NotAvailable(f"{self.name}: sell {code} x{qty}, available {avail}")
         amount = price * qty
-        fee = calc_fee("SELL", amount)
+        fee = calc_fee("SELL", amount, d)
         self.cash += amount - fee
         pos.qty -= qty
         pos.available -= qty
@@ -1126,7 +1173,7 @@ class Account:
 ```powershell
 uv run pytest tests/test_ledger.py -v
 ```
-预期：8 passed。
+预期：15 passed（非法价格的参数化测试含 4 个用例）。
 
 
 **Step 5: Commit**
@@ -1143,7 +1190,14 @@ git commit -m "feat(engine): add T+1 account ledger"
 - Create: `engine/broker.py`
 - Test: `tests/test_broker.py`
 
-执行顺序严格按契约：`start_day` → 先卖（到期 > 止损 > 止盈；停牌/全天一字跌停跳过）→ 再买（按 picks 顺序；开盘涨停、高开超过 entry_max、停牌、不足一手均跳过）。当天买入的仓位 `available=0`，当日不会被卖出。卖出先于买入，释放的资金当天可用。
+执行顺序（`execute_day` 的 docstring 写明了同样的规则）：
+
+0. 先调用 `start_day(d)`。行情只有在 volume > 0，且 open/high/low/prev_close 都是有限正数时才算有效；否则按停牌处理，不做任何交易。涨跌停价用 `limit_prices(..., d)`，即当天生效的规则。
+1. 开盘卖出：`at_limit_down(high, down)` 说明全天封死跌停，不能卖。否则依次判断：到期按开盘价卖出；开盘价 ≤ 止损价按开盘价止损；开盘价 ≥ 目标价按开盘价止盈；只在盘中触及止损或目标的持仓推迟到第 3 步。
+2. 开盘买入（按 picks 顺序）：跳过已持仓、无效行情、`at_limit_up(open, up)`、开盘价高于 entry_max 的情况；股数按整手计算并考虑最低 5 元佣金，现金不会为负；exit_date 用 `calendar.offset` 计算。
+3. 盘中卖出：处理第 1 步推迟的持仓。盘中低点 ≤ 止损价按止损价卖出（止损和目标同时触及时止损优先，因为日线看不出盘中先后）；否则按目标价卖出。
+
+卖出价 ×(1-滑点)，买入价 ×(1+滑点)，再截断在 [跌停价, 涨停价] 之内。资金时序：只有第 1 步开盘卖出回笼的资金当天可用于买入，第 3 步盘中卖出的资金当天不能用。当天买入的仓位 `available=0`，同一天重复执行 `execute_day` 不会多出成交。
 
 **Step 1: 写失败测试** `tests/test_broker.py`
 
@@ -1171,9 +1225,9 @@ def pick(code="600000", entry_max=10.5, stop=9.3, target=11.0, hold=5, name="浦
     return Pick(code, name, 1.0, entry_max, stop, target, hold, "测试")
 
 
-def held(stop=9.3, target=11.0, exit_date=DAYS[5]):
+def held(stop=9.3, target=11.0, exit_date=DAYS[5], cash=100_000.0):
     """Account holding 1000 sh of 600000 bought on D0."""
-    acc = Account("t", 100_000.0)
+    acc = Account("t", cash)
     acc.buy(D0, "600000", "浦发银行", 10.0, 1000, stop, target, exit_date, "seed")
     return acc
 
@@ -1238,7 +1292,7 @@ def test_already_held_not_rebought():
 
 def test_stop_loss_gap_down_fills_at_open():
     acc = held(stop=9.3)
-    f = run(acc, [bar(o=9.0, h=9.2, l=8.9, c=9.1)])[0]
+    f = run(acc, [bar(o=9.0, h=9.2, l=8.9, c=9.1, pc=9.8)])[0]  # limit-down 8.82: no clipping
     assert f.side == "SELL" and f.reason == "止损" and f.qty == 1000
     assert f.price == pytest.approx(9.0 * (1 - SLIP))
     assert "600000" not in acc.positions
@@ -1291,6 +1345,88 @@ def test_exit_then_enter_same_day_uses_freed_cash():
     fills = run(acc, [bar(), bar(code="000001", name="平安银行", o=12.0, h=12.3, l=11.9, pc=12.0)],
                 [pick(code="000001", name="平安银行", entry_max=12.5, stop=11.0, target=13.5)])
     assert [(f.side, f.code) for f in fills] == [("SELL", "600000"), ("BUY", "000001")]
+
+
+PA = dict(code="000001", name="平安银行")
+PA_BAR = dict(o=12.0, h=12.3, l=11.9, pc=12.0, **PA)
+PA_PICK = dict(entry_max=12.5, stop=11.0, target=13.5, **PA)
+
+
+def test_intraday_take_profit_cash_not_used_for_open_buy():
+    acc = held(cash=10_100.0)  # 94.9 cash left after the seed buy
+    fills = run(acc, [bar(o=10.5, h=11.2, l=10.4), bar(**PA_BAR)], [pick(**PA_PICK)])
+    assert [(f.side, f.code, f.reason) for f in fills] == [("SELL", "600000", "止盈")]
+    assert "000001" not in acc.positions and acc.cash > 10_000
+
+
+def test_expiry_cash_used_for_open_buy():
+    acc = held(cash=10_100.0, exit_date=D1)
+    fills = run(acc, [bar(o=10.5, h=11.2, l=10.4), bar(**PA_BAR)], [pick(**PA_PICK)])
+    assert [(f.side, f.code, f.reason) for f in fills] == [("SELL", "600000", "到期"),
+                                                          ("BUY", "000001", "测试")]
+
+
+def test_open_above_target_wins_over_later_stop():
+    acc = held(stop=9.3, target=11.0)
+    f = run(acc, [bar(o=11.1, h=11.2, l=9.2, pc=10.2)])[0]  # gap above target, then falls through stop
+    assert f.reason == "止盈" and f.price == pytest.approx(11.1 * (1 - SLIP))
+
+
+def test_intraday_stop_and_target_both_touched_stop_wins():
+    acc = held(stop=9.3, target=11.0)
+    f = run(acc, [bar(o=10.0, h=11.2, l=9.2)])[0]
+    assert f.reason == "止损" and f.price == pytest.approx(9.3 * (1 - SLIP))
+
+
+def test_rerun_same_day_adds_no_fills():
+    acc = Account("t", 100_000.0)
+    b, p = bar(o=10.0, l=9.0), pick(stop=9.3)
+    assert [f.side for f in run(acc, [b], [p])] == ["BUY"]
+    assert run(acc, [b], [p]) == []  # bought today: still locked, and not re-bought
+    assert acc.positions["600000"].qty == 1900 and len(acc.trades) == 1
+    acc2 = held(exit_date=D1)
+    assert [f.reason for f in run(acc2, [bar()])] == ["到期"]
+    assert run(acc2, [bar()]) == [] and len(acc2.trades) == 2
+
+
+@pytest.mark.parametrize("over", [dict(o=float("nan")), dict(h=float("nan")), dict(l=0.0),
+                                  dict(pc=0.0), dict(pc=float("nan")), dict(vol=float("nan"))])
+def test_invalid_bar_treated_as_suspended(over):
+    acc = held(exit_date=D1)
+    assert run(acc, [bar(**over)]) == [] and acc.positions["600000"].qty == 1000
+    acc2 = Account("t", 100_000.0)
+    assert run(acc2, [bar(**over)], [pick()]) == [] and not acc2.positions
+
+
+def test_one_tick_tolerance_blocks_buy_and_sell():
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=10.99, h=11.0, l=10.9)], [pick(entry_max=12.0)]) == []  # limit-up 11.00
+    acc2 = held(stop=9.3)
+    assert run(acc2, [bar(o=9.0, h=9.01, l=9.0, c=9.0)]) == []  # limit-down 9.00, high 9.01
+
+
+def test_sell_price_clipped_to_limit_down():
+    acc = held(stop=9.3)
+    f = run(acc, [bar(o=9.0, h=9.5, l=9.0, c=9.2, pc=10.0)])[0]  # open at limit-down 9.00, then trades
+    assert f.reason == "止损" and f.price == 9.0  # 9.0 * (1 - slip) = 8.991 -> clipped to 9.00
+
+
+ST_CAL = TradingCalendar([date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6), date(2026, 7, 7)])
+
+
+def test_st_sealed_limit_down_before_rule_change_blocks_sell():
+    # 2026-07-03: main-board ST still ±5%, so 9.50 is the sealed limit-down (would not be under ±10%)
+    d0, d = date(2026, 7, 2), date(2026, 7, 3)
+    acc = Account("t", 100_000.0)
+    acc.buy(d0, "600001", "ST测试", 10.0, 1000, 9.6, 11.0, d, "seed")
+    st_bar = Bar("600001", d, 9.5, 9.5, 9.5, 9.5, 10.0, 1e6, 9.5e6, "ST测试")
+    assert SimBroker(10.0).execute_day(acc, d, {"600001": st_bar}, [], ST_CAL, 20_000.0) == []
+    assert acc.positions["600001"].qty == 1000
+    # 2026-07-06: ±10% applies, the same prices are no longer limit-down -> expiry sell goes through
+    d2 = date(2026, 7, 6)
+    st_bar2 = Bar("600001", d2, 9.5, 9.5, 9.5, 9.5, 10.0, 1e6, 9.5e6, "ST测试")
+    fills = SimBroker(10.0).execute_day(acc, d2, {"600001": st_bar2}, [], ST_CAL, 20_000.0)
+    assert [f.reason for f in fills] == ["到期"]
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -1305,12 +1441,20 @@ uv run pytest tests/test_broker.py -v
 
 ```python
 """Simulated open-auction broker applying A-share execution rules."""
+import math
 from datetime import date
 
 from engine.calendar import TradingCalendar
-from engine.ledger import Account
-from engine.rules import calc_fee, limit_prices, round_lot
+from engine.ledger import Account, Position
+from engine.rules import at_limit_down, at_limit_up, calc_fee, limit_prices, round_lot
 from engine.types import Bar, Fill, Pick
+
+
+def _valid(bar: Bar | None) -> bool:
+    """A bar is tradable only with volume > 0 and finite, positive open/high/low/prev_close."""
+    if bar is None or not bar.volume > 0:
+        return False
+    return all(math.isfinite(v) and v > 0 for v in (bar.open, bar.high, bar.low, bar.prev_close))
 
 
 class SimBroker:
@@ -1319,48 +1463,83 @@ class SimBroker:
 
     def execute_day(self, account: Account, d: date, bars: dict[str, Bar], picks: list[Pick],
                     calendar: TradingCalendar, capital_per_pick: float) -> list[Fill]:
+        """Simulate trading day ``d`` for ``account`` in three steps.
+
+        0. ``account.start_day(d)`` unlocks positions bought before ``d`` (T+1). A bar is valid only
+           if volume > 0 and open/high/low/prev_close are finite and positive; otherwise the stock
+           is treated as suspended and nothing trades in it. Limits come from
+           ``limit_prices(..., d)``, i.e. the rules in force on ``d``.
+        1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
+           day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
+           at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
+           open (take-profit). Positions that only touch stop or target intraday are deferred to
+           step 3. Cash from step 1 is available for today's buys.
+        2. Open buys, in pick order, at the open: skip codes already held, invalid bars, an open at
+           limit-up (``at_limit_up``) and an open above ``entry_max``. Quantity is whole lots,
+           sized so cash (including the 5-yuan minimum commission) never goes negative;
+           ``exit_date = calendar.offset(d, hold_days)``.
+        3. Intraday sells of the deferred positions: low <= stop sells at the stop price (when both
+           stop and target were touched the intraday path is unknown, so the stop wins); otherwise
+           at the target price. This cash is not available to step 2.
+
+        Sell prices are multiplied by (1 - slippage), buy prices by (1 + slippage), and every fill
+        price is then clipped into [limit_down, limit_up].
+        """
         fills: list[Fill] = []
         account.start_day(d)
-        # 1) exits: only positions unlocked today (bought before d)
-        for code, pos in list(account.positions.items()):
-            bar = bars.get(code)
-            if pos.available <= 0 or bar is None or bar.volume <= 0:
-                continue  # locked by T+1, or suspended
-            _, down = limit_prices(bar.code, bar.name, bar.prev_close)
-            if bar.high <= down:
+        deferred: list[tuple[Position, float, float, float]] = []  # (position, low, up, down)
+        # 1) open sells: only positions unlocked today (bought before d)
+        for pos in list(account.positions.values()):
+            bar = bars.get(pos.code)
+            if pos.available <= 0 or not _valid(bar):
+                continue  # locked by T+1, or suspended / bad data
+            up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
+            if at_limit_down(bar.high, down):
                 continue  # sealed at limit-down all day: cannot sell
             if d >= pos.exit_date:
-                price, reason = bar.open, "到期"
-            elif bar.low <= pos.stop:
-                price, reason = min(bar.open, pos.stop), "止损"
-            elif bar.high >= pos.target:
-                price, reason = max(bar.open, pos.target), "止盈"
+                reason = "到期"
+            elif bar.open <= pos.stop:
+                reason = "止损"
+            elif bar.open >= pos.target:
+                reason = "止盈"
             else:
+                if bar.low <= pos.stop or bar.high >= pos.target:
+                    deferred.append((pos, bar.low, up, down))
                 continue
-            fills.append(account.sell(d, code, price * (1 - self.slip),
-                                      pos.available, reason))
-        # 2) entries at the open
+            fills.append(self._sell(account, d, pos, bar.open, reason, up, down))
+        # 2) open buys
         for pick in picks:
             if pick.code in account.positions:
                 continue
             bar = bars.get(pick.code)
-            if bar is None or bar.volume <= 0:
+            if not _valid(bar):
                 continue
-            up, _ = limit_prices(bar.code, bar.name, bar.prev_close)
-            if bar.open >= up:
+            up, down = limit_prices(bar.code, bar.name, bar.prev_close, d)
+            if at_limit_up(bar.open, up):
                 continue  # 开盘涨停, cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
-            price = bar.open * (1 + self.slip)
+            price = min(max(bar.open * (1 + self.slip), down), up)
             qty = round_lot(min(capital_per_pick, account.cash * 0.999) / price)
             # 0.1% buffer may not cover the 5-yuan minimum commission: shrink until affordable
-            while qty >= 100 and price * qty + calc_fee("BUY", price * qty) > account.cash:
+            while qty >= 100 and price * qty + calc_fee("BUY", price * qty, d) > account.cash:
                 qty -= 100
             if qty < 100:
                 continue
             fills.append(account.buy(d, pick.code, pick.name or bar.name, price, qty, pick.stop,
                                      pick.target, calendar.offset(d, pick.hold_days), pick.reason))
+        # 3) intraday sells deferred from step 1 (stop wins when both levels were touched)
+        for pos, low, up, down in deferred:
+            if low <= pos.stop:
+                fills.append(self._sell(account, d, pos, pos.stop, "止损", up, down))
+            else:
+                fills.append(self._sell(account, d, pos, pos.target, "止盈", up, down))
         return fills
+
+    def _sell(self, account: Account, d: date, pos: Position, price: float, reason: str,
+              up: float, down: float) -> Fill:
+        price = min(max(price * (1 - self.slip), down), up)
+        return account.sell(d, pos.code, price, pos.available, reason)
 ```
 
 **Step 4: 运行测试，确认通过**
@@ -1368,7 +1547,7 @@ class SimBroker:
 ```powershell
 uv run pytest tests/test_broker.py -v
 ```
-预期：16 passed。
+预期：30 passed（无效行情的参数化测试含 6 个用例）。
 
 
 **Step 4b: 全量回归**
@@ -1376,7 +1555,7 @@ uv run pytest tests/test_broker.py -v
 ```powershell
 uv run pytest -v
 ```
-预期：Part 1 共 57 个用例（config 3 + types 4 + rules 23 + calendar 4 + ledger 8 + broker 15）全部通过。
+预期：Part 1 共 116 个用例（config 14 + types 21 + rules 32 + calendar 4 + ledger 15 + broker 30）全部通过。
 
 
 **Step 5: Commit**

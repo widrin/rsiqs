@@ -75,3 +75,45 @@ def test_roundtrip_json():
     acc = _bought()
     restored = Account.from_dict(json.loads(json.dumps(acc.to_dict())))
     assert restored == acc
+
+
+def test_start_day_only_unlocks_positions_bought_earlier():
+    acc = _bought()
+    acc.start_day(D1)  # same day as the buy: still locked
+    assert acc.positions["600000"].available == 0
+    with pytest.raises(NotAvailable):
+        acc.sell(D1, "600000", 10.5, 1000, "same day")
+    acc.start_day(D2)
+    assert acc.positions["600000"].available == 1000
+
+
+def test_buy_existing_code_raises():
+    acc = _bought()
+    cash = acc.cash
+    with pytest.raises(ValueError):
+        acc.buy(D2, "600000", "浦发银行", 10.0, 100, 9.3, 11.0, EXIT)
+    assert acc.cash == cash and acc.positions["600000"].qty == 1000 and len(acc.trades) == 1
+
+
+@pytest.mark.parametrize("price", [float("nan"), 0.0, -1.0, float("inf")])
+def test_rejects_non_positive_or_non_finite_price(price):
+    acc = Account("t", 100_000.0)
+    with pytest.raises(ValueError):
+        acc.buy(D1, "600000", "浦发银行", price, 100, 9.3, 11.0, EXIT)
+    assert acc.cash == 100_000.0 and not acc.positions and not acc.trades
+    acc = _bought()
+    acc.start_day(D2)
+    with pytest.raises(ValueError):
+        acc.sell(D2, "600000", price, 1000, "x")
+    assert acc.positions["600000"].qty == 1000 and len(acc.trades) == 1
+
+
+def test_fees_follow_trade_date():
+    acc = Account("t", 200_000.0)
+    acc.buy(date(2022, 4, 28), "600000", "浦发银行", 10.0, 10_000, 9.3, 11.0, date(2023, 9, 1))
+    assert acc.trades[-1].fee == 27.0  # 25 + transfer 0.002%
+    acc.start_day(date(2023, 8, 25))
+    acc.sell(date(2023, 8, 25), "600000", 10.0, 5_000, "x")
+    assert acc.trades[-1].fee == 63.0  # 50000: 12.5 + 0.5 + stamp 0.1%
+    acc.sell(date(2023, 8, 28), "600000", 10.0, 5_000, "x")
+    assert acc.trades[-1].fee == 38.0  # 50000: 12.5 + 0.5 + stamp 0.05%

@@ -1,4 +1,5 @@
 """Simulated account ledger with A-share T+1 settlement."""
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 
@@ -12,6 +13,11 @@ class InsufficientCash(Exception):
 
 class NotAvailable(Exception):
     pass
+
+
+def _check_price(price: float) -> None:
+    if not (math.isfinite(price) and price > 0):
+        raise ValueError(f"price must be finite and > 0, got {price!r}")
 
 
 @dataclass
@@ -35,38 +41,37 @@ class Account:
     trades: list[Fill] = field(default_factory=list)
 
     def start_day(self, d: date) -> None:
-        """T+1 unlock: everything held before today becomes sellable."""
+        """T+1 unlock: only positions bought before ``d`` become sellable. Calling it again on the
+        buy day (or twice on the same day) keeps today's purchases locked."""
         for p in self.positions.values():
-            p.available = p.qty
+            p.available = p.qty if p.entry_date < d else 0
 
     def buy(self, d: date, code: str, name: str, price: float, qty: int, stop: float,
             target: float, exit_date: date, reason: str = "") -> Fill:
         if qty <= 0 or qty % 100:
             raise ValueError(f"qty must be a positive multiple of 100, got {qty}")
+        if code in self.positions:
+            raise ValueError(f"{self.name}: already holding {code}; adding to a position is not modelled")
+        _check_price(price)
         amount = price * qty
-        fee = calc_fee("BUY", amount)
+        fee = calc_fee("BUY", amount, d)
         if amount + fee > self.cash + 1e-9:
             raise InsufficientCash(f"{self.name}: need {amount + fee:.2f}, have {self.cash:.2f}")
         self.cash -= amount + fee
-        pos = self.positions.get(code)
-        if pos is None:
-            self.positions[code] = Position(code, name, qty, 0, (amount + fee) / qty, d,
-                                            stop, target, exit_date)
-        else:  # add-on: new shares locked until tomorrow, cost averaged
-            pos.cost = (pos.cost * pos.qty + amount + fee) / (pos.qty + qty)
-            pos.qty += qty
-            pos.stop, pos.target, pos.exit_date = stop, target, exit_date
+        self.positions[code] = Position(code, name, qty, 0, (amount + fee) / qty, d,
+                                        stop, target, exit_date)
         fill = Fill(d, code, "BUY", qty, price, fee, reason)
         self.trades.append(fill)
         return fill
 
     def sell(self, d: date, code: str, price: float, qty: int, reason: str) -> Fill:
+        _check_price(price)
         pos = self.positions.get(code)
         if pos is None or qty <= 0 or qty > pos.available:
             avail = pos.available if pos else 0
             raise NotAvailable(f"{self.name}: sell {code} x{qty}, available {avail}")
         amount = price * qty
-        fee = calc_fee("SELL", amount)
+        fee = calc_fee("SELL", amount, d)
         self.cash += amount - fee
         pos.qty -= qty
         pos.available -= qty
