@@ -7518,6 +7518,15 @@ def test_maybe_release_after_repair_ignores_corrupt_days(pbdir, cal):
     assert playbook.load("active")["version"] == 2
 
 
+def test_maybe_release_resets_when_premarket_ran_without_playbook(pbdir, cal):
+    store = _setup_release(pbdir, cal, 1.05, 1.01)
+    # 盘前 playbook 读不出来（按空规则运行），复盘前已经修好：文件完好，但这一天的净值不能用来比较
+    store.save_recommendation(TODAY, "h:candidate", [], {"llm_reviewed": True, "playbook_version": None})
+    assert playbook.maybe_release(store, TODAY, cal) is None
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+    assert playbook.load("active")["version"] == 2
+
+
 def test_load_checked_accepts_bom(pbdir):
     (pbdir / "active.json").write_text('\ufeff{"version": 3, "rules": [{"id": "r1", "text": "t", "evidence": "e"}]}',
                                        encoding="utf-8")
@@ -7746,11 +7755,21 @@ def _window_return(store: Store, account: str, start: dt.date, end: dt.date) -> 
     return float(nav.iloc[-1] / nav.iloc[0] - 1.0)
 
 
+def _ran_without_playbook(store: Store, d: dt.date) -> bool:
+    """d 日盘前有一路因为 playbook 读不出来而按空规则运行（推荐 meta 里 playbook_version 记为 None）。"""
+    for kind in KINDS:
+        rec = store.load_recommendation(d, f"h:{kind}")
+        if rec and "playbook_version" in rec[1] and rec[1]["playbook_version"] is None:
+            return True
+    return False
+
+
 def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> str | None:
     """每 MIN_DAYS_BETWEEN_RELEASES 个交易日最多发布一次 candidate。"""
-    if corrupt_kinds():
+    if corrupt_kinds() or _ran_without_playbook(store, today):
         # 任一份损坏都不发布也不重置：否则空规则会写进另一份并提交。由 run_review 告警。
-        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始
+        # 损坏期间盘前按空规则交易，这段净值不能用来比较两版规则：窗口从最后一个损坏日重新开始。
+        # 看盘前实际用的版本，不只看复盘时的文件：白天修好的那天，盘前用的仍是空规则
         store.kv_set(RELEASE_KEY, today.isoformat())
         return None
     last = store.kv_get(RELEASE_KEY)
@@ -10178,8 +10197,11 @@ def _trial_line(store: Store, t: dict) -> str:
     def f(x):
         return "?" if x is None else f"{x:.2f}"
 
-    ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     hyp = _hypothesis(store, t["strategy"])[:120]
+    if store.kv_get(f"research:voided:{t['strategy']}"):  # 作废会把门槛和 holdout 记为未通过，这里如实说明
+        return (f"- {t['ts'][:10]} {t['strategy']}：已作废（评估期间 engine/ 校验不符），结果不代表策略本身"
+                + (f"；假设：{hyp}" if hyp else ""))
+    ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
     return (f"- {t['ts'][:10]} {t['strategy']}：train 夏普 {f(t['train_sharpe'])}，val 夏普 "
             f"{f(t['val_sharpe'])}，门槛{'达标' if t['gate_pass'] else '未达标'}，holdout {ho}"
             + (f"；假设：{hyp}" if hyp else ""))
@@ -10790,6 +10812,10 @@ def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
     assert e.store.get_status("a_one") == "candidate" and e.commits == []
     alert = e.notifier.sent[-1]
     assert "会话中 engine/ 校验不符" in alert and ".integrity/manifest.json" in alert
+    assert e.store.last_trial("a_one")["gate_pass"] is False             # 试验记录已作废
+    monkeypatch.setattr(research, "verify", real)
+    ctx = research.build_context(e.settings, e.store)
+    assert "a_one：已作废" in ctx and "a_one：train" not in ctx            # 下次背景里不当作真实失败
 
 
 def test_commit_failure_is_reported(env, monkeypatch):
@@ -11099,6 +11125,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             trial = store.last_trial(n)
             if trial is not None:
                 store.void_trial(trial["id"])
+                store.kv_set(f"research:voided:{n}", True)
         for n in reverted:
             store.set_status(n, "candidate", today)
         title = ("研究会话后 engine/ 校验不符，未提交 git" if bad
@@ -11169,8 +11196,8 @@ uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research
 > 约定补充（契约在本部分内的歧义，取最简一致方案）：
 > - `run_job` 返回 `True` 表示该任务当日"已完成"（本次成功，或此前已成功而跳过），`False` 表示本次失败。
 > - `bootstrap` 把股票池写入 `store.kv_set("universe", codes)`，并在锚定日 `anchor = common.last_closed_day(now, calendar)`（今天是交易日且已过 15:10 则为今天，否则为之前最近的交易日）为每个账户记录初始净值 `capital`，`kv "bench_start"` = anchor；`settle` 以 `h:active / h:candidate / bench:csi300` 三个核心账户的最小 `last_nav_date` 决定补跑起点。
-> - `settle` 每次运行只在有待结算日时刷新一次缓存/指数（`run_job("settle_data", 最后待结算日, force=True)`，失败即告警并退出）；刷新范围是股票池、持仓，以及各待结算日推荐给 LLM 账户的代码（股票池外的推荐缺当天 K 线时才能发现并暂停）。刷新前先用 `client.universe()` 更新 `kv "universe"`（取不到时沿用旧名单），与盘前扫描用同一份成分股；量化策略的选股范围是股票池加持仓，不含当天 LLM 推荐的代码。单日日线覆盖率 <90% 或缺指数视为数据未更新，抛 `DataError`，停止后续补跑。持仓的除权除息按"建仓之后、还没调整过"判断：除权日当天没有分红记录、之后才到时补记。
-> - `run_job` 持有按任务名的跨进程文件锁（`logs/locks/<job>.lock`，进程退出时由系统释放）：开机补跑与定时任务重叠时，后到的进程直接返回 False，不重复结算或复盘。同一任务同一天只告警一次（计划任务当天会定时重试）。
+> - `settle` 每次运行只在有待结算日时刷新一次缓存/指数（`run_job("settle_data", 最后待结算日, force=True)`，失败即告警并退出）；刷新范围是股票池、持仓，以及各待结算日推荐给 LLM 账户的代码（股票池外的推荐缺当天 K 线时才能发现并暂停）。刷新前先用 `client.universe()` 更新 `kv "universe"`（取不到时沿用旧名单），与盘前扫描用同一份成分股；量化策略的选股范围是股票池加持仓，不含当天 LLM 推荐的代码。单日日线覆盖率 <90% 或缺指数视为数据未更新，抛 `DataError`，停止后续补跑。持仓的除权除息按"建仓之后、还没调整过"判断：除权日当天没有分红记录、之后才到时补记。不复权日线的参考昨收比上一收盘低 3% 以上、却没有分红记录时（送转或大额派息的记录常常晚一天到），暂停结算最多 2 个交易日等记录，否则按未换算的止损撮合会记下假止损；等满仍没有记录时按配股告警、不建模。
+> - `run_job` 持有按任务名的跨进程文件锁（`logs/locks/<job>.lock`，进程退出时由系统释放）：开机补跑与定时任务重叠时，后到的进程直接返回 False，不重复结算或复盘。同一任务、同一结算日在同一个自然日里只告警一次（计划任务当天会定时重试），第二天仍失败时再告警；推送失败不算已告警。09:25 补跑扫描失败或超时时，`premarket_final` 另推一条"今日不出推荐"。
 > - 行情缓存 `BarCache` 与 `Store` 共用 `settings.db_path` 同一个 sqlite 文件（不同表），其他部分（如 `engine.run_eval`）按同一路径构造即可读到缓存。
 > - `bootstrap` 若 `kv "playbook_released"` 不存在，则写入锚定日 ISO 字符串（视为 v1 的发布日），保证 `maybe_release` 的 10 个交易日间隔从启动日起算。
 > - `monitor` 去重键持久化在 `kv "monitor_sent:<ISO日期>"`（进程重启不重复告警）；`check_once(d, store, client, notifier, cache=None) -> list[str]`（cache 提供分红送转记录，除权除息日按换算后的价位判断）。
@@ -11182,7 +11209,7 @@ uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research
 > - `setup_logging` 把文件 handler 挂在根 logger 上：`agents.*` 记录的 `LLMError`（CLI 返回的 subtype 与输出摘要）、`notify.wecom` 的推送失败都写进 `logs/jobs.log`，排查"未经 LLM 审核"时只看这一个文件。
 > - 端到端测试依赖 Part 2 的 `Store` 可跨线程使用（`check_same_thread=False` + 锁）：`run_analyze` 与 `run_final` 都用两个线程分别处理 active/candidate。
 > - 测试共享假对象放在 `tests/jobfakes.py`，以 `from tests.jobfakes import ...` 导入；为此新增空文件 `tests/__init__.py`（若已存在则保留），使 `tests` 成为常规包，避免与 site-packages 中同名包冲突。
-> - 开机补跑用单独的计划任务 `\RSIQS\Catchup`（AtLogOn，延迟 3 分钟，顺序执行 settle → review 两个动作），满足"settle also AtLogOn"且保证复盘在结算之后。Settle、Review 不开 `StartWhenAvailable`（错过的由 Catchup 补），但每 20 分钟重复一次、持续 5 小时：当天结算失败或复盘时结算还没完成，晚上会自动重试。
+> - 开机补跑用单独的计划任务 `\RSIQS\Catchup`（AtLogOn，延迟 3 分钟，顺序执行 settle → review 两个动作），满足"settle also AtLogOn"且保证复盘在结算之后。Settle、Review 每 20 分钟重复一次、持续 5 小时（窗口结束时不终止还在跑的实例）：当天结算失败或复盘时结算还没完成，晚上会自动重试。
 
 ### Task 6.1: jobs/common.py 与测试假对象
 
@@ -11554,12 +11581,34 @@ def test_run_job_skips_while_another_process_holds_the_lock(tmp_path, monkeypatc
         assert got
 
 
-def test_run_job_alerts_once_per_job_and_day():
+def test_run_job_alerts_once_per_job_and_day(monkeypatch):
     store, notifier = Store(":memory:"), NullNotifier()
+    monkeypatch.setattr(common, "today", lambda: D)
     for _ in range(3):  # 计划任务当天定时重试
         assert run_job("settle", D, lambda: 1 / 0, store, notifier) is False
     assert len(notifier.sent) == 1 and "定时重试" in notifier.sent[0]
     run_job("settle", date(2026, 10, 19), lambda: 1 / 0, store, notifier)
+    assert len(notifier.sent) == 2
+    monkeypatch.setattr(common, "today", lambda: date(2026, 10, 19))  # 第二天同一个结算日仍失败：再提醒
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
+    assert len(notifier.sent) == 3
+
+
+def test_run_job_alert_not_recorded_when_push_fails():
+    class Flaky(NullNotifier):
+        def __init__(self):
+            super().__init__()
+            self.ok = False
+
+        def send_text(self, content):
+            super().send_text(content)
+            return self.ok
+
+    store, notifier = Store(":memory:"), Flaky()
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
+    notifier.ok = True
+    run_job("settle", D, lambda: 1 / 0, store, notifier)  # 上次没推出去：这次再发
+    run_job("settle", D, lambda: 1 / 0, store, notifier)
     assert len(notifier.sent) == 2
 
 
@@ -11778,7 +11827,8 @@ def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, 
     """幂等执行：已成功则跳过（返回 True）；成功标记 ok；异常标记 error 并告警（返回 False）。
 
     lock=True 时持有跨进程锁：同名任务正在别的进程里跑时直接返回 False（不标记、不告警）。
-    同一任务同一天只告警一次：计划任务当天会定时重试，重复失败只记日志。"""
+    同一任务、同一结算日在同一个自然日里只告警一次（计划任务当天会定时重试，重复失败只记日志）；
+    第二天仍失败时再告警一次。推送失败时不算已告警，下次重试再发。"""
     if not force and store.job_done(job, d):
         log.info("skip %s %s (already ok)", job, d)
         return True
@@ -11795,10 +11845,10 @@ def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, 
             log.error("job %s %s failed: %s\n%s", job, d, e, traceback.format_exc())
             try:
                 store.mark_job(job, d, "error")
-                key = f"job_alerted:{job}:{d.isoformat()}"
-                if not store.kv_get(key):
-                    notifier.send_text(format_alert(f"任务失败 {job} {d.isoformat()}",
-                                                    f"{type(e).__name__}: {e}\n（当天会定时重试；再次失败只记日志）"))
+                key = f"job_alerted:{job}:{d.isoformat()}:{today().isoformat()}"
+                if not store.kv_get(key) and notifier.send_text(format_alert(
+                        f"任务失败 {job} {d.isoformat()}",
+                        f"{type(e).__name__}: {e}\n（今天会定时重试，再次失败只记日志；明天仍失败时再提醒）")):
                     store.kv_set(key, True)
             except Exception as ne:  # noqa: BLE001 — 记录或告警本身失败：原始异常已写进日志
                 log.error("recording failure of %s %s failed: %s", job, d, ne)
@@ -12530,8 +12580,23 @@ def test_unexplained_ex_without_record_warns(env):
     dates, store = env["dates"], env["store"]
     settle.main(now=at(dates[101], 16))
     _split_from(env, "600001", dates[102], k=1.1)  # 配股之类：参考昨收变了，但没有分红记录
-    assert settle.main(now=at(dates[102], 16)) == [dates[102]]
+    assert settle.main(now=at(dates[102], 16)) == []  # 跌幅超过 3%：先等分红记录
+    assert settle.main(now=at(dates[103], 16)) == []
+    assert settle.main(now=at(dates[104], 16)) == dates[102:105]  # 等满 2 个交易日仍没有记录：按配股告警
     assert any("可能是配股" in str(m) for m in env["notifier"].sent)
+
+
+def test_late_bonus_share_record_pauses_until_it_arrives(env):
+    dates, store, client = env["dates"], env["store"], env["client"]
+    settle.main(now=at(dates[101], 16))  # h:active 于 dates[101] 买入 600001
+    qty = store.load_account("h:active").positions["600001"].qty
+    _split_from(env, "600001", dates[102])  # 10 转 10，分红记录当天还没到
+    assert settle.main(now=at(dates[102], 16)) == []
+    assert any("疑似送转" in str(m) for m in env["notifier"].sent)
+    client.dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}  # 第二天记录到了
+    assert settle.main(now=at(dates[103], 16)) == dates[102:104]
+    acc = store.load_account("h:active")
+    assert acc.positions["600001"].qty == 2 * qty and not any(f.side == "SELL" for f in acc.trades)
 
 
 def test_future_and_past_events_not_applied_again(env):
@@ -12660,6 +12725,8 @@ CORE_ACCOUNTS = (*common.LLM_ACCOUNTS, common.BENCH_ACCOUNT)
 LOOKBACK_CAL_DAYS = 550  # 约 370 个交易日，供策略计算因子
 MIN_COVERAGE = 0.9       # 当日有日线的股票占比低于此值视为数据未更新（股票池里同时停牌的很少超过几十只）
 KIND_CN = {"promote": "晋升", "demote": "降级", "retire": "淘汰"}
+BIG_EX_GAP = 0.03       # 参考昨收比上一收盘低这么多、又没有分红记录：多半是送转或大额派息的记录还没到
+MAX_EX_WAIT_DAYS = 2    # 最多为等分红记录暂停这么多个交易日，之后按配股告警、不建模
 
 
 def pending_days(store, calendar, now: datetime) -> list[date]:
@@ -12793,11 +12860,14 @@ def _settled(store, name: str, d: date) -> bool:
     return last is not None and last >= d
 
 
-def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()) -> list[str]:
+def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset(),
+               run_date: date | None = None) -> list[str]:
     """结算单个交易日；已记录 d 日净值的账户跳过（幂等）。返回警告列表。
 
     前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
-    不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码。"""
+    不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码；
+    run_date 是实际运行的日期（默认今天），用来判断为等分红记录已经暂停了几天。"""
+    run_date = run_date or common.today()
     codes = tracked_codes(store)
     # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
     recs = recommended_codes(store, [d])
@@ -12827,7 +12897,8 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
 
     def check_unexplained_ex(code: str, bar) -> None:
         """不复权日线的参考昨收与上一个收盘价不一致，说明 d 日除权除息。没有对应的分红记录时：分红接口今天失败
-        就暂停结算（下次重试），否则告警（多半是配股，不建模）。"""
+        就暂停结算（下次重试）；参考昨收低了 BIG_EX_GAP 以上（送转、大额派息，记录常常晚一天到）也暂停，
+        最多等 MAX_EX_WAIT_DAYS 个交易日，否则按未换算的止损撮合会记下假止损；其余告警（多半是配股，不建模）。"""
         prev = cache.last_raw_close(code, calendar.prev_day(d))
         if bar is None or prev is None or abs(bar.prev_close - prev[1]) <= 0.011:
             return
@@ -12835,6 +12906,11 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
             return
         if code in div_failed:
             raise DataError(f"{code} 于 {d.isoformat()} 疑似除权除息，但分红记录获取失败：暂停结算，下次重试")
+        waited = len(calendar.between(d, run_date)) - 1 if run_date >= d else 0
+        if bar.prev_close < prev[1] * (1 - BIG_EX_GAP) and waited < MAX_EX_WAIT_DAYS:
+            raise DataError(f"{code} 于 {d.isoformat()} 参考昨收 {bar.prev_close:.2f} 比上一收盘 {prev[1]:.2f} 低 "
+                            f"{1 - bar.prev_close / prev[1]:.1%}，疑似送转或大额派息但还没有分红记录：暂停结算，"
+                            f"等记录到了重试（最多等 {MAX_EX_WAIT_DAYS} 个交易日）")
         warnings.append(f"{code} 于 {d.isoformat()} 疑似除权除息，但没有分红记录（可能是配股，不建模），持仓未调整")
 
     def run(name: str, picks) -> None:
@@ -12895,8 +12971,9 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     return warnings
 
 
-def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset()) -> None:
-    warnings = settle_day(d, settings, store, cache, calendar, div_failed)
+def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset(),
+                      run_date: date | None = None) -> None:
+    warnings = settle_day(d, settings, store, cache, calendar, div_failed, run_date)
     if warnings:
         notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
     for ev in promotion.decide(store, d, calendar):
@@ -12923,7 +13000,7 @@ def main(now: datetime | None = None) -> list[date]:
         failed = frozenset(refresh_dividends(store, client, cache, d))  # 截至前一日的持仓与 d 日推荐
         div_failed.update(failed)
         ok = common.run_job("settle", d, lambda d=d, failed=failed: settle_and_decide(
-            d, settings, store, cache, calendar, notifier, failed), store, notifier)
+            d, settings, store, cache, calendar, notifier, failed, now.date()), store, notifier)
         if not ok:
             break
         done.append(d)
@@ -13214,6 +13291,19 @@ def test_final_not_run_when_scan_fails(env, monkeypatch):
     assert any("数据源失败" in str(m) for m in env["notifier"].sent)
 
 
+def test_final_reports_failed_inline_scan_even_after_0830_alert(env, monkeypatch):
+    d = env["dates"][10]
+
+    def boom(*a, **k):
+        raise RuntimeError("数据源失败")
+
+    monkeypatch.setattr(premarket, "scan", boom)
+    assert premarket_scan.main(now=at(d, 8, 30)) is False
+    assert len(env["notifier"].sent) == 1
+    assert premarket_final.main(now=at(d, 9, 26), sleep=env["slept"].append) is False
+    assert len(env["notifier"].sent) == 2 and "今日不出推荐" in env["notifier"].sent[-1]
+
+
 def test_review_requires_settle_and_runs_once(env):
     d = env["dates"][10]
     assert review.main(now=at(d, 16, 5)) is False  # 未结算
@@ -13397,8 +13487,9 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         budget = (until - start).total_seconds()
         scanned = common.run_job("premarket_scan", d, lambda: _within(budget, lambda: premarket_scan.scan(
             d, settings, store, client, cache, calendar)), store, notifier, lock=False)
-        if not scanned:
-            return False  # 扫描失败或超时已告警；按设计当天不出推荐
+        if not scanned:  # 按设计当天不出推荐。08:30 已告警过扫描失败时 run_job 不再告警，这里单独说明结果
+            notifier.send_text(format_alert("盘前推荐未推送", "09:25 补跑扫描失败或超时，今日不出推荐（原因见日志）"))
+            return False
         if clock().time() > STALE_AFTER:
             notifier.send_text(format_alert("盘前推荐未推送", f"补跑扫描到 {clock():%H:%M} 才完成，已过时"))
             return False
@@ -13799,7 +13890,7 @@ git commit -m "feat: jobs.monitor intraday stop/target/zhaban alerts with daily 
 | Research | 周六 10:00 | `jobs.research` |
 | Catchup | 登录时（延迟 3 分钟） | `jobs.settle` 然后 `jobs.review`（顺序执行） |
 
-只有 PremarketScan、PremarketFinal、Monitor 开启 `StartWhenAvailable`（错过的触发在开机后补跑，是否过时由代码判断：PremarketFinal 过 09:35 跳过，PremarketScan 过 09:25 只扫描不分析）。Settle、Review 错过时由 Catchup 补跑，两者都不开 `StartWhenAvailable`，否则开机后会和 Catchup 同时结算、复盘；它们的触发器每 20 分钟重复一次、持续 5 小时，当天失败会自动重试（已完成时立即退出）。Research 也不开：周六错过就跳过这一周，免得在工作日早上和盘前任务抢资源，需要时手动运行。所有任务 `MultipleInstances IgnoreNew`（同一任务不并发；不同任务之间由 `run_job` 的文件锁互斥）、允许电池供电运行。`.ps1` 保持纯 ASCII：Windows PowerShell 5.1 按系统代码页读取无 BOM 文件，中文会乱码。
+PremarketScan、PremarketFinal、Monitor、Settle、Review 开启 `StartWhenAvailable`（错过的触发在开机或睡眠唤醒后补跑，是否过时由代码判断：PremarketFinal 过 09:35 跳过，PremarketScan 过 09:25 只扫描不分析）。开机时 Settle/Review 的补跑会和 Catchup 重叠，由 `run_job` 的文件锁串行化，不会重复结算、复盘。Settle、Review 的触发器每 20 分钟重复一次、持续 5 小时，当天失败会自动重试（已完成时立即退出）；`StopAtDurationEnd` 设为 `$false`，窗口结束时不终止还在跑的实例。Research 也不开：周六错过就跳过这一周，免得在工作日早上和盘前任务抢资源，需要时手动运行。所有任务 `MultipleInstances IgnoreNew`（同一任务不并发；不同任务之间由 `run_job` 的文件锁互斥）、允许电池供电运行。`.ps1` 保持纯 ASCII：Windows PowerShell 5.1 按系统代码页读取无 BOM 文件，中文会乱码。
 
 **Step 1: 写失败测试**
 
@@ -13832,14 +13923,15 @@ def test_schedule_times_and_triggers():
     assert "-AtLogOn" in ps1 and "Saturday" in ps1 and "StartWhenAvailable:$Available" in ps1
 
 
-def test_settle_and_review_retry_and_catch_up_only_via_catchup():
+def test_settle_and_review_retry_and_start_when_available():
     ps1 = read("install_tasks.ps1")
-    assert '(New-RetryTrigger "15:35") (New-JobAction "settle")\n' in ps1
-    assert '(New-RetryTrigger "16:05") (New-JobAction "review")\n' in ps1
+    assert '(New-RetryTrigger "15:35") (New-JobAction "settle") $true' in ps1
+    assert '(New-RetryTrigger "16:05") (New-JobAction "review") $true' in ps1
     assert "-RepetitionInterval (New-TimeSpan -Minutes 20)" in ps1
-    for job in ("premarket_scan", "premarket_final", "monitor"):  # 只有早上的任务开机后补跑
+    assert "$r.StopAtDurationEnd = $false" in ps1  # 重复窗口结束时不终止还在跑的实例
+    for job in ("premarket_scan", "premarket_final", "monitor"):  # 唤醒或开机后补跑
         assert f'(New-JobAction "{job}") $true' in ps1, job
-    assert '(New-JobAction "research")\n' in ps1
+    assert '(New-JobAction "research")\n' in ps1  # 周六错过就跳过，不在工作日早上补跑
 
 
 def test_scripts_are_ascii_and_use_rsiqs_folder():
@@ -13866,8 +13958,9 @@ uv run pytest tests/test_install_tasks.py -v
 # Re-running is safe: -Force overwrites existing task definitions.
 # PremarketFinal fires at 09:25; the job itself waits until 09:25:15 for auction data.
 # Settle and Review repeat every 20 minutes for 5 hours: a failed or not-yet-ready run is retried the same
-# evening (jobs are idempotent and exit at once when already done). Missed Settle/Review runs after boot are
-# handled by Catchup, so only the morning tasks use StartWhenAvailable; a missed Saturday Research is skipped.
+# evening (jobs are idempotent and exit at once when already done). A running instance is not stopped when
+# the repetition window ends. StartWhenAvailable covers wake-up from sleep; overlapping runs (with Catchup at
+# logon) are serialized by the per-job file lock in jobs.common.run_job. A missed Saturday Research is skipped.
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Uv = (Get-Command uv -ErrorAction Stop).Source
@@ -13886,8 +13979,10 @@ function New-WeekdayTrigger([string]$At) {
 
 function New-RetryTrigger([string]$At) {
     $t = New-WeekdayTrigger $At
-    $t.Repetition = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes 20) `
+    $r = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes 20) `
         -RepetitionDuration (New-TimeSpan -Hours 5)).Repetition
+    $r.StopAtDurationEnd = $false
+    $t.Repetition = $r
     $t
 }
 
@@ -13903,8 +13998,8 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $fa
 Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true
 Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true
 Register-Rsiqs "Monitor"        (New-WeekdayTrigger "09:30") (New-JobAction "monitor") $true
-Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle")
-Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review")
+Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle") $true
+Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review") $true
 Register-Rsiqs "Research" (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "10:00") `
     (New-JobAction "research")
 
