@@ -150,7 +150,9 @@ def reset_window_if_degraded(store: Store, d: dt.date) -> bool:
     损坏期间盘前按空规则交易，这段净值不能用来比较两版规则；看盘前实际用的版本，不只看复盘时的文件：
     白天修好的那天，盘前用的仍是空规则。复盘回补较早的日子时也要逐日调用。"""
     if corrupt_kinds() or _ran_without_playbook(store, d):
-        store.kv_set(RELEASE_KEY, d.isoformat())
+        cur = store.kv_get(RELEASE_KEY)
+        if cur is None or d.isoformat() > cur:  # 只往后移：补较早的日子时不能把起点退回到上次发布之前
+            store.kv_set(RELEASE_KEY, d.isoformat())
         return True
     return False
 

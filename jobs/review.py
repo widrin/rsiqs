@@ -54,7 +54,9 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         return True
     llm = common.make_llm(settings, store)
     ok = True
-    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘；某天失败不挡住其余日子
+    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘
+        if d == last and not ok:
+            return False  # 较早的日子要先重置发布窗口：它们没补完，最近一天先不判断发布，下次重试按顺序接着补
         ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
             d, settings, store, llm, cache, notifier, calendar, backfill=(d != last)), store, notifier) and ok
     return ok

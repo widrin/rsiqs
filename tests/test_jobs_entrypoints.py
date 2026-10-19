@@ -286,15 +286,25 @@ def test_review_backfill_only_latest_day_is_a_full_review(env):
     assert env["review_kw"] == [(dates[8], True), (dates[9], True), (dates[10], False)]  # 较早的日子只补日报
 
 
-def test_review_failed_day_does_not_block_others_and_is_retried(env):
+def test_review_failed_backfill_day_holds_back_the_latest_day(env):
     dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
     env["review_fail"].add(dates[9])
     assert review.main(now=at(dates[10], 16, 5)) is False
-    assert [c[1] for c in env["calls"]] == [dates[8], dates[10]]  # 某天失败不挡住其余日子
-    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试补上失败的那天
-    assert [c[1] for c in env["calls"]] == [dates[8], dates[10], dates[9]]
+    assert [c[1] for c in env["calls"]] == [dates[8]]  # 较早的日子没补完：最近一天先不复盘、不判断发布
+    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试按顺序接着补
+    assert [c[1] for c in env["calls"]] == dates[8:11]
+
+
+def test_review_latest_failure_is_retried_alone(env):
+    dates = env["dates"]
+    for d in dates[9:11]:
+        env["store"].mark_job("settle", d, "ok")
+    env["review_fail"].add(dates[10])
+    assert review.main(now=at(dates[10], 16, 5)) is False
+    assert review.main(now=at(dates[10], 16, 25)) is True
+    assert [c[1] for c in env["calls"]] == [dates[9], dates[10]]
 
 
 def test_review_waits_when_started_together_with_settle(env, monkeypatch, tmp_path):

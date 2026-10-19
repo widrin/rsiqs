@@ -168,6 +168,14 @@ def test_maybe_release_resets_when_premarket_ran_without_playbook(pbdir, cal):
     assert playbook.load("active")["version"] == 2
 
 
+def test_window_reset_never_moves_back(pbdir, cal):
+    store = Store(":memory:")
+    store.kv_set("playbook_released", TODAY.isoformat())  # 今天刚发布过
+    store.save_recommendation(TODAY - dt.timedelta(days=1), "h:candidate", [], {"playbook_version": None})
+    assert playbook.reset_window_if_degraded(store, TODAY - dt.timedelta(days=1)) is True
+    assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
 def test_load_checked_accepts_bom(pbdir):
     (pbdir / "active.json").write_text('\ufeff{"version": 3, "rules": [{"id": "r1", "text": "t", "evidence": "e"}]}',
                                        encoding="utf-8")
