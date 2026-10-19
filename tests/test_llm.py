@@ -115,7 +115,7 @@ def test_build_args_is_the_verified_command(tmp_path):
     args = build_args(s, r"C:\cc\claude.exe", tmp_path / "sys.md", '{"type": "object"}', "high", 1.5)
     assert args == [r"C:\cc\claude.exe", "-p", "--bare", "--output-format", "json",
                     "--model", "claude-opus-5-5", "--effort", "high", "--tools", "",
-                    "--no-session-persistence", "--max-budget-usd", "1.50",
+                    "--no-session-persistence", "--setting-sources", "", "--max-budget-usd", "1.50",
                     "--system-prompt-file", str(tmp_path / "sys.md"), "--json-schema", '{"type": "object"}']
     with pytest.raises(ValueError):
         build_args(s, "claude.exe", "sys.md", "{}", "extreme", 1.0)
@@ -219,9 +219,11 @@ def test_structured_output_failing_validation_raises_llm_error(store, settings):
 def test_timeout_propagates_and_cleans_up(store, settings):
     runner = FakeRunner(exc=subprocess.TimeoutExpired(["claude.exe"], 5.0))
     with pytest.raises(subprocess.TimeoutExpired):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0)
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0, max_budget_usd=0.3)
     assert runner.system_seen == [SYSTEM.encode("utf-8")] and not runner.system_file().exists()
-    assert usage_rows(store) == []
+    # 超时时服务端可能已经计费，CLI 来不及报告：按单次上限保守记一笔，月度预算不会少算
+    [(purpose, _, _, cost)] = usage_rows(store)
+    assert purpose == "unit:timeout" and cost == pytest.approx(0.3 * 7.2)
 
 
 def test_launch_failure_raises_llm_error(store, settings):
@@ -307,3 +309,19 @@ def test_find_path_exe_then_native_install_then_error(no_claude, tmp_path):
     native.unlink()
     with pytest.raises(LLMError, match="找不到 claude.exe"):
         find_claude_exe(make_settings(tmp_path))
+
+
+def test_cli_error_reason_from_errors_field(store, settings):
+    out = {k: v for k, v in cli_output(structured=None, is_error=True, subtype="error_during_execution").items()
+           if k != "result"}
+    out["errors"] = ["API Error: 400 model not available"]
+    runner = FakeRunner(out, returncode=1)
+    with pytest.raises(LLMError, match="model not available"):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+
+
+def test_tiny_budget_is_budget_exceeded(store, settings):
+    runner = FakeRunner()
+    with pytest.raises(BudgetExceeded):  # --max-budget-usd 0.00 会被 CLI 拒绝
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, max_budget_usd=0.004)
+    assert runner.calls == []

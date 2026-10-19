@@ -107,8 +107,10 @@ def build_args(settings: Settings, exe: str, system_file: str | Path, schema_jso
     """已实测可用的无头调用命令行；用户提示词不在命令行里，走 stdin。"""
     if effort not in EFFORTS:
         raise ValueError(f"unknown effort: {effort!r}")
+    # --setting-sources ""：不加载用户、项目、本地设置文件。设置文件里的 env（例如本机 Claude Code 配的中转地址和
+    # Token）会被 claude.exe 写进自己的进程环境，覆盖 child_env，鉴权就不再只由 .env 决定
     return [exe, "-p", "--bare", "--output-format", "json", "--model", settings.llm_model,
-            "--effort", effort, "--tools", "", "--no-session-persistence",
+            "--effort", effort, "--tools", "", "--no-session-persistence", "--setting-sources", "",
             "--max-budget-usd", f"{max_budget_usd:.2f}", "--system-prompt-file", str(system_file),
             "--json-schema", schema_json]
 
@@ -152,6 +154,8 @@ class LLM:
         claude.exe 启动失败、CLI 报错、拒答、没有 structured_output、输出不是 JSON、结构校验失败都抛 LLMError。
         """
         self.check_budget(essential)
+        if max_budget_usd < 0.01:  # 格式化成 0.00 后会被 CLI 拒绝
+            raise BudgetExceeded(f"{purpose}: 单次预算 {max_budget_usd:.4f} 美元不足 0.01 美元")
         exe = self._claude_exe()
         schema_json = json.dumps(strict_schema(schema), ensure_ascii=True)
         fd, system_file = tempfile.mkstemp(prefix="rsiqs_system_", suffix=".md")
@@ -161,6 +165,10 @@ class LLM:
             args = build_args(self.settings, exe, system_file, schema_json, effort, max_budget_usd)
             proc = self.runner(args, input=user.encode("utf-8"), capture_output=True,
                                env=child_env(self.settings), cwd=str(self.settings.root), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 子进程已被杀掉，CLI 没来得及报告用量，服务端可能已经计费：按单次上限保守记一笔
+            self.store.add_llm_usage(f"{purpose}:timeout", 0, 0, max_budget_usd * self.settings.usd_cny)
+            raise
         except OSError as e:  # claude.exe 启动不了（安装后被删除、没有权限等）
             raise LLMError(f"{purpose}: 无法运行 claude.exe：{e!r}") from e
         finally:
@@ -180,7 +188,8 @@ class LLM:
                                  float(out.get("total_cost_usd") or 0.0) * self.settings.usd_cny)
         structured = out.get("structured_output")
         if proc.returncode != 0 or out.get("is_error") or structured is None:
-            raise LLMError(f"{purpose}: {out.get('subtype', '')} {str(out.get('result') or '')[:300]}")
+            reason = out.get("result") or "; ".join(map(str, out.get("errors") or []))  # 错误结果的原因在 errors
+            raise LLMError(f"{purpose}: {out.get('subtype', '')} {str(reason)[:300]}")
         try:
             return schema.model_validate(structured)
         except ValidationError as e:
