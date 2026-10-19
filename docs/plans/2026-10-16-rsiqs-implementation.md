@@ -18,11 +18,13 @@
 
 **修订（2026-10-19，Part 2 审查修复）：** 评估器在回放留出期之前记录试验，训练、验证段报错也计入 n_trials，留出期任何异常只记为未通过、不外传文本；回测净值前置期初资金点，面板截断到本段末尾；晋升先对齐净值再算收益，按收益日计数，降级要求 t <= -1.5；`DataView.codes()` 不列出尚未上市的股票；`record_nav` 拒绝非有限值；清单损坏视为校验不通过。后续 Part 的改动：(a) Task 3.5 基线只取需要的 60 行；(b) Task 3.6 源码检查禁止任何含 `__` 的名字、属性和标识符式字符串，以及动态取属性、`print`、`exit`、`SystemExit`，`run_eval` 对 `SystemExit` 也回传错误 JSON；(c) Task 5.1 `evaluate_strategy` 以数据库里本次的试验记录决定是否进入影子盘，`EVAL_TIMEOUT` 改为 1800 秒；(d) Task 5.2 编码约定同步；(e) Task 6.2 已有清单时不重写，只校验并告警；(f) Task 6.3 先存账户再记净值，收盘价缺失时沿用上一个有效值，策略只拿到截至前一交易日的面板。
 
+**修订（2026-10-19，结算改用不复权日线）：** 复审发现结算直接用前复权日线撑不住补跑：多日补跑跨越除权日时，较早的日子已是之后的复权基准，除权前按下调后的价格成交，到除权日分红又入账一次；除权日日线缺失时股数放大而估值仍是除权前价格；除权日分红接口失败后再也不会补调整。修订：Task 3.1 `AkClient.raw_bars`，Task 3.2 `bar_raw` 表，Task 6.3 撮合与估值改用不复权日线（量化价位按当天两根 K 线换算，估值价按除权参考价换算，疑似除权缺记录时暂停或告警），Task 4.3 盘前定稿在除权日按竞价快照昨收换算价位。另外：开盘买入只看开盘价（开盘达到或越过算出的涨停价不买）；源码检查改为只允许给 self 的属性赋值，`strategies.base` 移出导入白名单，补齐读写文件的属性；`run_eval` 的规则快照在加载策略之前取，并覆盖 pandas、math、numpy 的关键函数和 `engine.rules` 常量。
+
 **修订（2026-10-19，Part 2 修复复审）：** 留出期里任何异常（含策略抛出的 KeyboardInterrupt）都只记为未通过，Ctrl+C 时改抛不带消息的新异常；区间不可靠时开盘涨停也只认一字板，不再用"开盘价等于最高价"（那等于让当天之后的走势决定买不买）；降级后的影子期从下一交易日算起；源码检查补上按字符串求值（`typing.get_type_hints`、`ForwardRef`）、含 `__` 的普通字符串、对已导入模块或类的属性赋值、经 `import engine.types` 绑定的包名访问白名单之外的模块；`run_eval` 评估前后核对评估规则，被改过就作废试验（`Store.void_trial`）。
 
 **修订（2026-10-19，除权除息）：** 前复权缓存在除权后整体变化，持仓的股数、成本和价位却停留在除权前，除权日会记下假止损。修订：(a) Task 1.5 `Account.apply_dividend` 按除权参考价 (价格 - 每股派息) / (1 + 每股送转) 调整股数、成本、止损和目标价，现金分红按 20% 扣税后入账，已调整的事件记入 `corporate_actions`，重复调用不会重复调整；(b) Task 3.1 `AkClient.dividends` 读取新浪分红明细中已实施的方案；(c) Task 3.2 增量更新时与已存的最后 5 行比对，复权基准变化就全量重新下载这只股票，并新增分红表；(d) Task 6.3 结算前刷新持仓和当日推荐股票的分红记录，撮合前调整上次结算之后除权的持仓，盘前推荐的价位在除权日换算到除权后；(e) Task 6.5 盘中监控在除权日按换算后的价位判断。
 
-**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，503 个测试全部通过（Part 1 共 147 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，531 个测试全部通过（Part 1 共 152 个、Part 2 共 104 个）。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -30,7 +32,7 @@
 
 > 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) 不建模加仓：`Account.buy` 对已持仓代码抛 ValueError（SimBroker 本来就跳过已持仓代码）。(4) 滑点价不做四舍五入，保持浮点，只截断在当日 [跌停价, 涨停价] 之内；当天开盘、最高、最低价中任何一个超出 [跌停价-0.01, 涨停价+0.01] 时，说明区间本身不可靠（例如除权日的昨收仍是除权前价格），此时不截断，封板只看一字形态（最高价等于最低价才算封死涨跌停）。(5) 除权除息只在模拟盘结算时由 `Account.apply_dividend` 处理：回测用的是一致的前复权历史，不需要调整；不建模配股，送转后的零碎股向下取整，分红一律按持股 1 个月以内的 20% 扣税。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（147 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（152 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -1377,7 +1379,7 @@ class Account:
 ```powershell
 uv run pytest tests/test_ledger.py -v
 ```
-预期：26 passed（非法价格的参数化测试含 4 个用例，非法分红参数的参数化测试含 5 个用例）。
+预期：27 passed（非法价格的参数化测试含 4 个用例，非法分红参数的参数化测试含 5 个用例）。
 
 
 **Step 5: Commit**
@@ -1915,7 +1917,7 @@ class SimBroker:
 ```powershell
 uv run pytest tests/test_broker.py -v
 ```
-预期：45 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试和开盘买入不看当日走势的参数化测试各含 2 个用例）。
+预期：49 passed（无效行情的参数化测试含 6 个用例，区间可靠性的两个参数化测试各含 2 个用例，开盘买入不看当日走势的参数化测试含 6 个用例）。
 
 
 **Step 4b: 全量回归**
@@ -1923,7 +1925,7 @@ uv run pytest tests/test_broker.py -v
 ```powershell
 uv run pytest -v
 ```
-预期：Part 1 共 145 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 26 + broker 45）全部通过。
+预期：Part 1 共 152 个用例（config 19 + types 21 + rules 32 + calendar 4 + ledger 27 + broker 49）全部通过。
 
 
 **Step 5: Commit**
@@ -3999,7 +4001,8 @@ uv run pytest tests/test_store.py tests/test_metrics.py tests/test_dataview.py t
 ## Part 3: 数据层、推送与策略
 
 > 合同歧义处理（本节统一采用以下最简一致选择）：
-> - `BarCache.update` 每只股票只请求"最后存储日的次日"到 `end`；单只股票失败不影响其他股票，返回失败代码列表。前复权基准会在除权后变化，增量拼接会在除权日留下跳变，所以额外提供 `update(..., full=True)` 删除后全量重拉（bootstrap 和定期维护用）。这是已知局限。
+> - `BarCache.update` 从已存的最后 `OVERLAP_ROWS`（5）行开始请求到 `end`，重叠部分价格差超过 `ADJ_TOL`（0.011 元）就判定前复权基准变了，先取到完整数据再删旧数据、全量重拉（记在 `last_rebased`）；单只股票失败不影响其他股票，返回失败代码列表。`update(..., full=True)` 删除后全量重拉。
+> - 前复权日线只给策略算因子。`BarCache.update_raw` / `raw_bars` / `last_raw_close` 另存不复权日线（`bar_raw` 表），只供模拟盘结算撮合与估值：不复权价格不会因为之后的除权而变，多日补跑时也是当天的真实价格；`prev_close` 由涨跌幅反推，是交易所当天的参考昨收（除权日即除权参考价）。分红送转存 `dividends` 表（`save_dividends` / `dividends`）。
 > - `load_panel` 先在全部历史上算 `prev_close = close.shift(1)`，再按 `[start, end]` 截取；每只股票第一根 K 线缺失的 `prev_close` 用当日 `open` 填充。
 > - `BarCache` 额外提供 `codes()`（缓存中全部代码）和 `last_date(code)`。表名加前缀（`bar_daily`/`bar_names`/`index_daily`），和 `Store` 共用同一个 sqlite 文件时不会冲突。约定 bootstrap 用 `save_index("sh000300", ...)` 保存基准。
 > - `index_daily` / `load_index` 返回的 Series 使用归一化 `DatetimeIndex`（和 panel 一致），`name` 为指数代码。`daily_bars` 的 `date` 列是归一化的 `datetime64`。
@@ -4097,6 +4100,23 @@ def test_daily_bars_normalizes_chinese_columns(monkeypatch):
     assert df["date"].tolist() == [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]
     assert df["close"].tolist() == [10.2, 10.3]
     assert df["volume"].dtype == float
+
+
+def test_raw_bars_unadjusted_with_reference_prev_close(monkeypatch):
+    seen = {}
+    raw = pd.DataFrame({  # 1 月 6 日 10 转 5：除权参考价 10.40 / 1.5 = 6.93，当天收 7.00，涨跌幅 1.01%
+        "日期": ["2026-01-06", "2026-01-05"], "开盘": [6.95, 10.1], "收盘": [7.0, 10.4], "最高": [7.1, 10.5],
+        "最低": [6.9, 10.0], "成交量": [1500, 1000], "成交额": [1.05e6, 1.04e6], "涨跌幅": [1.01, 1.96]})
+
+    def hist(**kw):
+        seen.update(kw)
+        return raw
+
+    fake_ak(monkeypatch, stock_zh_a_hist=hist)
+    df = AkClient().raw_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert seen["adjust"] == ""
+    assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
+    assert df["prev_close"].tolist() == [10.2, 6.93]  # 收盘 / (1 + 涨跌幅%)：交易所当天的参考昨收
 
 
 def test_daily_bars_empty_and_bad_columns(monkeypatch):
@@ -4260,6 +4280,7 @@ log = logging.getLogger(__name__)
 
 DAILY_COLS = {"日期": "date", "开盘": "open", "最高": "high", "最低": "low",
               "收盘": "close", "成交量": "volume", "成交额": "amount"}
+RAW_COLS = {**DAILY_COLS, "涨跌幅": "pct"}
 SPOT_EM_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": "prev_close",
                 "最新价": "last", "涨跌幅": "pct", "成交量": "volume", "成交额": "amount", "最高": "high"}
 SPOT_SINA_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": "prev_close",
@@ -4336,6 +4357,21 @@ class AkClient:
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
         return out[cols].sort_values("date").reset_index(drop=True)
 
+    def raw_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
+        """不复权日线，供模拟盘结算撮合与估值：date open high low close volume amount prev_close。
+
+        不复权价格不会因为之后的除权而改变。prev_close 由涨跌幅反推（收盘 / (1 + 涨跌幅%)），即交易所当天的
+        参考昨收；除权除息日就是除权参考价，涨跌停区间据此计算才与交易所一致。"""
+        cols = ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
+        df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
+                        start_date=_fmt(start), end_date=_fmt(end), adjust="")
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        out = _pick(df, RAW_COLS, f"stock_zh_a_hist({code}, 不复权)")
+        out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+        out["prev_close"] = (out["close"] / (1 + out["pct"] / 100)).round(2)
+        return out[cols].sort_values("date").reset_index(drop=True)
+
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
         df = self._call(ak.stock_zh_index_daily, symbol=symbol)
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
@@ -4409,7 +4445,7 @@ class AkClient:
 uv run pytest tests/test_akshare_client.py -v
 ```
 
-预期：15 passed。
+预期：16 passed。
 
 **Step 5: 手工冒烟脚本（Manual smoke step，需联网）**
 
@@ -4436,6 +4472,7 @@ def main() -> int:
     checks = {
         "trade_calendar": lambda: c.trade_calendar()[-3:],
         "daily_bars": lambda: c.daily_bars("600000", start, end).tail(3),
+        "raw_bars": lambda: c.raw_bars("600000", start, end).tail(3),
         "index_daily": lambda: c.index_daily("sh000300").tail(3),
         "dividends": lambda: c.dividends("600000").tail(3),
         "universe": lambda: (len(u := c.universe()), u[:5]),
@@ -4512,6 +4549,14 @@ class FakeClient:
     def __init__(self, data):
         self.data = data  # code -> DataFrame
         self.calls = []
+        self.raw_calls = []
+
+    def raw_bars(self, code, start, end):
+        self.raw_calls.append((code, start, end))
+        df = self.daily_bars(code, start, end)
+        self.calls.pop()
+        df["prev_close"] = df["close"].shift(1).fillna(df["open"])
+        return df
 
     def daily_bars(self, code, start, end):
         self.calls.append((code, start, end))
@@ -4650,6 +4695,29 @@ def test_dividends_roundtrip(tmp_path):
     assert c.dividends("000001") == []
 
 
+def test_raw_bars_incremental_and_lookup(cache):
+    c, client = cache
+    assert c.update_raw(["600000", "BAD"], date(2026, 1, 7), date(2026, 1, 1)) == ["BAD"]
+    assert c.update_raw(["600000"], date(2026, 1, 8), date(2026, 1, 1)) == []
+    assert client.raw_calls == [("600000", date(2026, 1, 1), date(2026, 1, 7)), ("BAD", date(2026, 1, 1), date(2026, 1, 7)),
+                                ("600000", date(2026, 1, 8), date(2026, 1, 8))]
+    bars = c.raw_bars(["600000", "000001"], date(2026, 1, 7), {"600000": "浦发银行"})
+    assert list(bars) == ["600000"]
+    b = bars["600000"]
+    assert (b.open, b.close, b.prev_close, b.name) == (10.6, 10.4, 10.6, "浦发银行")
+    assert c.last_raw_close("600000", date(2026, 1, 7)) == (date(2026, 1, 7), 10.4)
+    assert c.last_raw_close("600000", date(2026, 1, 4)) is None
+
+
+def test_raw_bars_none_values_become_nan(cache):
+    c, _ = cache
+    c.update_raw(["600000"], date(2026, 1, 8), date(2026, 1, 1))
+    with c.conn:
+        c.conn.execute("UPDATE bar_raw SET close=NULL WHERE date='2026-01-08'")
+    assert pd.isna(c.raw_bars(["600000"], date(2026, 1, 8))["600000"].close)
+    assert c.last_raw_close("600000", date(2026, 1, 8)) == (date(2026, 1, 7), 10.4)  # 跳过缺失的收盘价
+
+
 def test_index_roundtrip_and_persistence(tmp_path):
     path = tmp_path / "c.sqlite"
     c = BarCache(path, FakeClient({}))
@@ -4687,6 +4755,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from engine.types import Bar
+
 log = logging.getLogger(__name__)
 
 BAR_COLS = ["open", "high", "low", "close", "volume", "amount"]
@@ -4701,6 +4771,10 @@ CREATE TABLE IF NOT EXISTS bar_daily (
 CREATE TABLE IF NOT EXISTS bar_names (code TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_daily (
     symbol TEXT NOT NULL, date TEXT NOT NULL, close REAL NOT NULL, PRIMARY KEY (symbol, date));
+CREATE TABLE IF NOT EXISTS bar_raw (
+    code TEXT NOT NULL, date TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL, amount REAL, prev_close REAL,
+    PRIMARY KEY (code, date));
 CREATE TABLE IF NOT EXISTS dividends (
     code TEXT NOT NULL, ex_date TEXT NOT NULL, cash REAL NOT NULL, ratio REAL NOT NULL,
     PRIMARY KEY (code, ex_date));
@@ -4803,6 +4877,46 @@ class BarCache:
         names = {code: known.get(code, "") for code in panel}
         return panel, names
 
+    def update_raw(self, codes: list[str], end: date, start_default: date) -> list[str]:
+        """不复权日线增量更新（只供模拟盘结算）；不复权价格不会因除权而变，不需要重叠比对。返回失败的代码。"""
+        failed = []
+        for code in codes:
+            try:
+                row = self.conn.execute("SELECT MAX(date) FROM bar_raw WHERE code=?", (code,)).fetchone()
+                start = date.fromisoformat(row[0]) + timedelta(days=1) if row[0] else start_default
+                if start > end:
+                    continue
+                df = self.client.raw_bars(code, start, end)
+                rows = [(code, pd.Timestamp(r.date).date().isoformat(), r.open, r.high, r.low, r.close,
+                         r.volume, r.amount, r.prev_close) for r in df.itertuples(index=False)]
+                with self.conn:
+                    self.conn.executemany("INSERT OR REPLACE INTO bar_raw VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            except Exception as e:  # noqa: BLE001
+                log.warning("更新 %s 不复权日线失败: %s", code, e)
+                failed.append(code)
+        return failed
+
+    def raw_bars(self, codes: list[str], d: date, names: dict | None = None) -> dict[str, Bar]:
+        """d 日的不复权 Bar；缺失的数值记为 NaN（撮合会按停牌处理）。"""
+        def num(x):
+            return float("nan") if x is None else float(x)
+
+        out: dict[str, Bar] = {}
+        for code in codes:
+            r = self.conn.execute("SELECT open, high, low, close, volume, amount, prev_close FROM bar_raw "
+                                  "WHERE code=? AND date=?", (code, d.isoformat())).fetchone()
+            if r:
+                o, h, lo, c, v, a, pc = (num(x) for x in r)
+                out[code] = Bar(code=code, date=d, open=o, high=h, low=lo, close=c, prev_close=pc, volume=v,
+                                amount=a, name=(names or {}).get(code, ""))
+        return out
+
+    def last_raw_close(self, code: str, d: date) -> tuple[date, float] | None:
+        """d 日（含）之前最近一个有效的不复权收盘价。"""
+        r = self.conn.execute("SELECT date, close FROM bar_raw WHERE code=? AND date<=? AND close IS NOT NULL "
+                              "ORDER BY date DESC LIMIT 1", (code, d.isoformat())).fetchone()
+        return (date.fromisoformat(r[0]), float(r[1])) if r else None
+
     def save_dividends(self, code: str, df: pd.DataFrame) -> None:
         """写入 AkClient.dividends 的结果（按除权日覆盖）。空表不清除已有记录：接口偶尔返回空表。"""
         rows = [(code, pd.Timestamp(r.ex_date).date().isoformat(), float(r.cash), float(r.ratio))
@@ -4834,7 +4948,7 @@ class BarCache:
 uv run pytest tests/test_cache.py -v
 ```
 
-预期：12 passed。
+预期：14 passed。
 
 **Step 5: 提交**
 
@@ -5990,7 +6104,7 @@ if __name__ == "__main__":
 uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：17 passed（sandbox 11 + run_eval 6）。
+预期：25 passed（sandbox 13 + run_eval 12）。
 
 然后跑本 Part 全部测试，确认没有互相影响：
 
@@ -5998,7 +6112,7 @@ uv run pytest tests/test_sandbox.py tests/test_run_eval.py -v
 uv run pytest tests/test_akshare_client.py tests/test_cache.py tests/test_wecom.py tests/test_format.py tests/test_strategies.py tests/test_sandbox.py tests/test_run_eval.py -v
 ```
 
-预期：63 passed。
+预期：74 passed。
 
 **Step 5: 手工冒烟（Manual smoke step，需已完成 bootstrap，不触网）**
 
@@ -7198,8 +7312,9 @@ def make_panel(codes, end=PREV, n=25):
 class FakeAk:
     """AkClient 替身。spot() 默认竞价价 10.20（昨收 10.00，+2.00%）；opens 指定个股竞价价，missing 中的代码不出现在快照里。"""
 
-    def __init__(self, spot_fail=False, opens=None, missing=()):
+    def __init__(self, spot_fail=False, opens=None, missing=(), prevs=None):
         self.spot_fail, self.opens, self.missing = spot_fail, dict(opens or {}), set(missing)
+        self.prevs = dict(prevs or {})  # 指定个股快照里的昨收（除权除息日是除权参考价）
         self.calls = []
 
     def universe(self):
@@ -7222,7 +7337,8 @@ class FakeAk:
             raise RuntimeError("spot down")
         codes = [c for c in CODES if c not in self.missing]
         opens = [self.opens.get(c, 10.2) for c in codes]
-        return pd.DataFrame({"code": codes, "name": [f"股{c}" for c in codes], "open": opens, "prev_close": 10.0,
+        return pd.DataFrame({"code": codes, "name": [f"股{c}" for c in codes], "open": opens,
+                             "prev_close": [self.prevs.get(c, 10.0) for c in codes],
                              "last": opens, "pct": [(o / 10.0 - 1) * 100 for o in opens], "volume": 1e4,
                              "amount": 5e6, "high": opens})
 
@@ -7537,11 +7653,33 @@ def test_run_final_fetches_spot_once_saves_both_and_pushes_only_active(store):
     act, act_meta = store.load_recommendation(D, "h:active")
     cand, cand_meta = store.load_recommendation(D, "h:candidate")
     assert [p.code for p in act] == ["600001"] and [p.code for p in cand] == ["600003"]
-    assert act_meta == {"llm_reviewed": True, "market_view": "A观点（竞价确认：A确认）", "playbook_version": 1}
+    assert act_meta == {"llm_reviewed": True, "market_view": "A观点（竞价确认：A确认）", "playbook_version": 1,
+                        "ex_adjusted": True}
     assert cand_meta["llm_reviewed"] is True and cand_meta["market_view"] == "C观点"
     assert sorted(c["purpose"] for c in llm.calls) == ["auction:active", "auction:candidate"]
     assert all(c["timeout"] <= premarket.AUCTION_TIMEOUT for c in llm.calls)
     assert notifier.sent == [format_recommendation(D, act, True, "A观点（竞价确认：A确认）")]
+
+
+def test_run_final_converts_prices_on_ex_date(store):
+    # 600001 今天 10 转 10：快照昨收 5.00（除权参考价），竞价 5.10；盘前计划按除权前的昨收 10.00 写成
+    save_plan(store, "active", plan(pp("600001", conf=0.9, lo=-5.0)))
+    ak = FakeAk(opens={"600001": 5.1}, prevs={"600001": 5.0})
+    premarket.run_final(D, settings(), store, FakeLLM({"auction:active": check({})}), ak, Recorder(), CAL)
+    act, meta = store.load_recommendation(D, "h:active")
+    assert [p.code for p in act] == ["600001"] and meta["ex_adjusted"] is True  # 不换算的话竞价价低于止损 9.60
+    assert (act[0].entry_max, act[0].stop, act[0].target) == pytest.approx((10.25 / 2, 9.6 / 2, 11.2 / 2), abs=0.006)  # 采用计划价位时舍入到分
+    cand, _ = store.load_recommendation(D, "h:candidate")  # 没有计划的一路：量化候选同样换算
+    assert cand[1].stop == pytest.approx(9.3 / 2) and cand[0].stop == pytest.approx(9.3)
+
+
+def test_run_final_fallback_also_converts_on_ex_date(store, monkeypatch):
+    save_plan(store, "active", plan(pp("600001", conf=0.9, lo=-5.0)))
+    monkeypatch.setattr(premarket, "finalize", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("定稿失败")))
+    ak = FakeAk(opens={"600001": 5.1}, prevs={"600001": 5.0})
+    premarket.run_final(D, settings(), store, FakeLLM({}), ak, Recorder(), CAL)
+    act, _ = store.load_recommendation(D, "h:active")
+    assert [p.code for p in act] == ["600001"] and act[0].stop == pytest.approx(4.8, abs=0.006)
 
 
 def test_run_final_kind_without_plan_uses_quant(store):
@@ -7560,6 +7698,7 @@ def test_run_final_without_plans_pushes_quant_without_spot(store):
     assert ak.spot_calls() == 0
     act, meta = store.load_recommendation(D, "h:active")
     assert [p.code for p in act] == CODES[:3] and meta["llm_reviewed"] is False
+    assert meta["ex_adjusted"] is False  # 没有快照：除权换算留给结算按分红记录做
     assert len(notifier.sent) == 1 and "未经 LLM 审核" in notifier.sent[0]
 
 
@@ -7623,6 +7762,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import replace
 from typing import Literal
 
 import pandas as pd
@@ -7965,6 +8105,32 @@ def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | 
     return out
 
 
+def _ex_adjust(cands: list[Pick], plan: PremarketPlan | None, ctx: dict, spot: pd.DataFrame | None
+               ) -> tuple[list[Pick], PremarketPlan | None]:
+    """盘前价位按前一日收盘价写成。除权除息日，竞价快照的昨收是除权参考价，与候选统计里的昨收不同：按两者的
+    比例换算候选和计划的买入上限、止损、目标价（派息时比例换算与精确的减法略有出入，对盘前价位足够）。
+    数据已经按新基准复权时两个昨收相同，不换算。"""
+    stats = ctx.get("stats", {})
+    factor = {}
+    for code, row in _spot_rows(spot, [p.code for p in cands]).items():
+        new, old = _f(row.get("prev_close")), _f(stats.get(code, {}).get("prev_close"))
+        if new and old and new > 0 and old > 0 and abs(new - old) > 0.011:
+            factor[code] = new / old
+    if not factor:
+        return cands, plan
+
+    def scaled(obj, k):
+        return {"entry_max": obj.entry_max * k, "stop": obj.stop * k, "target": obj.target * k}
+
+    cands = [replace(p, **scaled(p, factor[p.code])) if p.code in factor else p for p in cands]
+    if plan is not None:
+        plan = plan.model_copy(update={"picks": [
+            pp.model_copy(update=scaled(pp, factor[pp.code.strip()])) if pp.code.strip() in factor else pp
+            for pp in plan.picks]})
+    log.info("premarket ex-rights price conversion: %s", {c: round(k, 4) for c, k in factor.items()})
+    return cands, plan
+
+
 def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pick],
                  spot: pd.DataFrame | None) -> tuple[list[Pick], bool, str]:
     """不调用 LLM 的确定性结果：无计划用量化；有计划用规则过滤。也是竞价确认失败或超时时的结果。"""
@@ -7983,6 +8149,7 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
     plan = load_plan(store, d, playbook_kind)
     if plan is not None and spot is None:
         spot = _safe(client.spot, None)
+    cands, plan = _ex_adjust(cands, plan, ctx, spot)
     base = _rule_result(settings, plan, cands, spot)
     if plan is None or not base[0]:
         return base
@@ -8019,12 +8186,12 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
               calendar: TradingCalendar) -> None:
     """09:25 定稿：拉一次快照，两路并发 finalize；FINAL_DEADLINE 内没完成的那一路用确定性结果。只推送 h:active。"""
     deadline = time.monotonic() + FINAL_DEADLINE
-    cands, _ = _load_candidates(d, store)  # 没有候选直接抛错，由 run_job 告警
+    cands, ctx = _load_candidates(d, store)  # 没有候选直接抛错，由 run_job 告警
     plans = {k: load_plan(store, d, k) for k in KINDS}
     spot = pd.DataFrame()  # 两路都没有计划时用不到快照
     if any(p is not None for p in plans.values()):
         spot = _fetch_spot(client, min(SPOT_TIMEOUT, max(0.0, deadline - time.monotonic())))
-    fallback = {k: _rule_result(settings, plans[k], cands, spot) for k in KINDS}
+    fallback = {k: _rule_result(settings, *reversed(_ex_adjust(cands, plans[k], ctx, spot)), spot) for k in KINDS}
     timeout = min(AUCTION_TIMEOUT, max(1.0, deadline - time.monotonic()))
     pool = cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="premarket")
     futures = {k: pool.submit(finalize, d, settings, store, llm, client, k, timeout, spot) for k in KINDS}
@@ -8043,7 +8210,9 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
         pool.shutdown(wait=False, cancel_futures=True)  # 超时的线程留在后台跑完，结果丢弃
     for kind, (picks, reviewed, view) in results.items():
         meta = {"llm_reviewed": reviewed, "market_view": view,
-                "playbook_version": int(playbook.load(kind).get("version", 1))}
+                "playbook_version": int(playbook.load(kind).get("version", 1)),
+                # 有竞价快照时价位已按除权参考价换算，结算不再换算；没有快照时由结算按分红记录换算
+                "ex_adjusted": not spot.empty}
         store.save_recommendation(d, f"h:{kind}", picks, meta)
     picks, reviewed, view = results["active"]
     notifier.send_markdown(format_recommendation(d, picks, reviewed, view))
@@ -8057,7 +8226,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：31 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
+预期：33 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
 
 **Step 5: Manual smoke step（真实 Claude 深度分析 + 真实竞价快照，不推送、不写正式库）**
 
@@ -9877,6 +10046,7 @@ import pandas as pd
 from config import Settings
 from engine.calendar import TradingCalendar
 from engine.store import Store
+from engine.types import Bar
 
 CODES = [f"6000{i:02d}" for i in range(1, 11)]
 NAMES = {c: f"测试{c[-2:]}" for c in CODES}
@@ -10010,6 +10180,32 @@ class FakeCache:
         self.updates: list[date] = []
         self.saved_index: dict[str, pd.Series] = {}
         self.divs: dict[str, dict] = {}
+        # 不复权日线：构造时复制一份；测试改 panel 模拟前复权重拉，改 raw 模拟真实成交价
+        self.raw = {c: df.copy() for c, df in panel.items()}
+        self.raw_updates: list[tuple[list[str], date]] = []
+        self.raw_fail: set[str] = set()
+
+    def update_raw(self, codes, end, start_default):
+        self.raw_updates.append((sorted(codes), end))
+        return sorted(set(codes) & self.raw_fail)
+
+    def raw_bars(self, codes, d, names=None):
+        ts, out = pd.Timestamp(d), {}
+        for c in codes:
+            df = self.raw.get(c)
+            if c not in self.raw_fail and df is not None and ts in df.index:
+                r = df.loc[ts]
+                out[c] = Bar(code=c, date=d, open=float(r["open"]), high=float(r["high"]), low=float(r["low"]),
+                             close=float(r["close"]), prev_close=float(r["prev_close"]), volume=float(r["volume"]),
+                             amount=float(r["amount"]), name=(names or {}).get(c, ""))
+        return out
+
+    def last_raw_close(self, code, d):
+        df = self.raw.get(code)
+        if df is None:
+            return None
+        closes = df.loc[:pd.Timestamp(d), "close"].dropna()
+        return (closes.index[-1].date(), float(closes.iloc[-1])) if len(closes) else None
 
     def save_dividends(self, code, df):
         self.divs.setdefault(code, {}).update(
@@ -10592,7 +10788,7 @@ git commit -m "feat: jobs.bootstrap initializes accounts, playbooks, cache, mani
 - Create: `jobs/settle.py`
 - Test: `tests/test_jobs_settle.py`
 
-规则回顾：待结算区间 = `calendar.next_day(min(核心账户 last_nav_date))` 到"已收盘的最近交易日"（今天是交易日且 `now >= 15:10` 才包含今天）。每天用 `run_job("settle", d)` 包裹；某天失败即停止后续补跑（后一天依赖前一天持仓）。每个账户若 `last_nav_date >= d` 则跳过，保证重复执行不会重复成交。除权除息：每个待结算日之前先刷新所有持仓股票和当日盘前推荐股票的分红记录（新浪，单只失败不阻塞，汇总告警，下次结算重试），结算完再刷新一次，供次日盘中监控使用；撮合前对上次结算之后到 d 日（含）除权的持仓调用 `apply_dividend`（只在 d 日尚未撮合时调整，重跑不重复）；盘前推荐是按除权前的收盘价写的，d 日是除权日时把 entry_max、止损、目标价换算到除权后。量化策略在结算时用已经全量重拉的复权数据选股，不需要换算。
+规则回顾（撮合与估值用不复权日线，前复权只给策略算因子，见 Part 3 契约说明）：待结算区间 = `calendar.next_day(min(核心账户 last_nav_date))` 到"已收盘的最近交易日"（今天是交易日且 `now >= 15:10` 才包含今天）。每天用 `run_job("settle", d)` 包裹；某天失败即停止后续补跑（后一天依赖前一天持仓）。每个账户若 `last_nav_date >= d` 则跳过，保证重复执行不会重复成交。除权除息：每个待结算日之前先刷新所有持仓股票和当日盘前推荐股票的分红记录（新浪，单只失败不阻塞，汇总告警，下次结算重试），结算完再刷新一次，供次日盘中监控使用；撮合前对上次结算之后到 d 日（含）除权的持仓调用 `apply_dividend`（只在 d 日尚未撮合时调整，重跑不重复）；盘前推荐是按除权前的收盘价写的：盘前定稿有竞价快照时已经按快照昨收换算（推荐的 meta 记 `ex_adjusted`），否则 d 日是除权日时由结算按分红记录把 entry_max、止损、目标价换算到除权后。量化策略按前复权价格写价位，结算用 d 日前复权与不复权两根 K 线的仿射关系（`_to_raw`）换算后再撮合。持仓估值用 d 日（含）之前最近的不复权收盘价，中间有除权时按除权参考价换算（除权日缺 K 线也不会虚增净值）。不复权日线的参考昨收与上一收盘价不一致、却没有分红记录时：分红接口当天失败就暂停结算（下次重试），否则告警（多半是配股）。
 
 **Step 1: 写失败测试**
 
@@ -10756,7 +10952,7 @@ def test_crash_after_account_saved_records_nav_once(env, monkeypatch):
 
 def test_nan_close_uses_last_valid_close(env):
     dates, store = env["dates"], env["store"]
-    env["cache"].panel["600001"].loc[pd.Timestamp(dates[101]), "close"] = float("nan")
+    env["cache"].raw["600001"].loc[pd.Timestamp(dates[101]), "close"] = float("nan")
     assert settle.main(now=at(dates[101], 16)) == [dates[101]]
     assert store.nav_series("h:active").notna().all()
 
@@ -10802,9 +10998,7 @@ def test_recommendation_prices_adjusted_on_ex_date(env):
     pick = Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=999.0, stop=6.0,
                 target=999.0, hold_days=5, reason="测试")
     store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True})
-    cols = ["open", "high", "low", "close", "prev_close"]
-    panel, ts = env["cache"].panel["600001"], pd.Timestamp(dates[101])
-    panel.loc[ts, cols] = panel.loc[ts, cols] / 2  # 除权日的日线（昨收已按复权换算）
+    _split_from(env, "600001", dates[101])  # 除权日起的不复权日线（参考昨收是除权参考价）
     settle.main(now=at(dates[101], 16))  # 当天推荐的股票也会刷新分红记录
     buys = [f for f in store.load_account("h:active").trades if f.side == "BUY" and f.code == "600001"]
     assert buys and store.load_account("h:active").positions["600001"].stop == pytest.approx(3.0)
@@ -10816,6 +11010,144 @@ def test_dividend_fetch_failure_alerts_but_settles(env):
     env["client"].dividend_data = {"600001": "FAIL"}
     assert settle.main(now=at(dates[102], 16)) == [dates[102]]
     assert any("除权数据获取失败" in str(m) and "600001" in str(m) for m in env["notifier"].sent)
+
+
+def _split_from(env, code, d, k=2.0):
+    """d 日起 10 转 10（k=2）：不复权价格从 d 日起除以 k，d 日的参考昨收就是除权参考价。"""
+    df = env["cache"].raw[code]
+    m = df.index >= pd.Timestamp(d)
+    cols = ["open", "high", "low", "close", "prev_close"]
+    df.loc[m, cols] = df.loc[m, cols] / k
+
+
+def _rec_with_tight_stop(env, d):
+    """d 日推荐 600001，止损设在开盘价下方 10%：除权日不先调整持仓的话一定会记下假止损。"""
+    o = float(env["cache"].raw["600001"].loc[pd.Timestamp(d), "open"])
+    pick = Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=999.0, stop=round(o * 0.9, 2),
+                target=999.0, hold_days=5, reason="测试")
+    env["store"].save_recommendation(d, "h:active", [pick], {"llm_reviewed": True})
+    return pick
+
+
+def test_ex_rights_adjusted_before_matching(env):
+    dates, store = env["dates"], env["store"]
+    pick = _rec_with_tight_stop(env, dates[101])
+    settle.main(now=at(dates[101], 16))
+    env["client"].dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}
+    _split_from(env, "600001", dates[102])
+    settle.main(now=at(dates[102], 16))
+    acc = store.load_account("h:active")
+    assert [f for f in acc.trades if f.side == "SELL"] == []
+    assert acc.positions["600001"].stop == pytest.approx(pick.stop / 2)
+
+
+def test_catch_up_across_ex_date_matches_on_unadjusted_prices(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    env["client"].dividend_data = {"600001": [(dates[102], 0.5, 0.0)]}
+    # 前复权在除权后把此前的价格整体下调 0.5；不复权日线不变
+    m = cache.panel["600001"].index < pd.Timestamp(dates[102])
+    cache.panel["600001"].loc[m, ["open", "high", "low", "close", "prev_close"]] -= 0.5
+    settle.main(now=at(dates[102], 16))  # 一次补跑 101、102
+    acc = store.load_account("h:active")
+    buy = next(f for f in acc.trades if f.side == "BUY" and f.code == "600001")
+    raw_open = float(cache.raw["600001"].loc[pd.Timestamp(dates[101]), "open"])
+    assert buy.price == pytest.approx(raw_open * 1.001)  # 按当天真实价格成交，不是下调后的前复权价
+    assert [a["date"] for a in acc.corporate_actions] == [dates[102].isoformat()]  # 分红只入账一次
+
+
+def test_missing_bar_on_ex_date_values_at_ex_rights_price(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    settle.main(now=at(dates[101], 16))
+    env["client"].dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}
+    _split_from(env, "600001", dates[102])
+    cache.raw["600001"] = cache.raw["600001"].drop(pd.Timestamp(dates[102]))  # 除权日这只股票的日线没取到
+    settle.main(now=at(dates[102], 16))
+    nav = store.nav_series("h:active")
+    assert store.load_account("h:active").positions["600001"].qty % 2 == 0  # 股数已翻倍
+    assert nav.iloc[-1] == pytest.approx(nav.iloc[-2], rel=0.05)  # 估值价同样减半，净值没有虚增
+
+
+def test_dividend_fetch_failure_on_ex_date_pauses_and_retries(env):
+    dates, store = env["dates"], env["store"]
+    pick = _rec_with_tight_stop(env, dates[101])
+    settle.main(now=at(dates[101], 16))
+    _split_from(env, "600001", dates[102])
+    env["client"].dividend_data = {"600001": "FAIL"}
+    assert settle.main(now=at(dates[102], 16)) == []  # 疑似除权却没有分红记录：暂停
+    assert store.last_nav_date("h:active") == dates[101]
+    env["client"].dividend_data = {"600001": [(dates[102], 0.0, 1.0)]}
+    assert settle.main(now=at(dates[102], 17)) == [dates[102]]  # 下次运行重试成功
+    acc = store.load_account("h:active")
+    assert acc.positions["600001"].stop == pytest.approx(pick.stop / 2)
+    assert [f for f in acc.trades if f.side == "SELL"] == []
+
+
+def test_unexplained_ex_without_record_warns(env):
+    dates, store = env["dates"], env["store"]
+    settle.main(now=at(dates[101], 16))
+    _split_from(env, "600001", dates[102], k=1.1)  # 配股之类：参考昨收变了，但没有分红记录
+    assert settle.main(now=at(dates[102], 16)) == [dates[102]]
+    assert any("可能是配股" in str(m) for m in env["notifier"].sent)
+
+
+def test_future_and_past_events_not_applied_again(env):
+    dates, store = env["dates"], env["store"]
+    env["client"].dividend_data = {"600001": [(dates[101], 0.0, 1.0), (dates[104], 0.0, 1.0)]}
+    _split_from(env, "600001", dates[101])  # 101 日除权；h:active 在除权日当天按除权后的价格买入
+    settle.main(now=at(dates[101], 16))
+    qty = store.load_account("h:active").positions["600001"].qty
+    settle.main(now=at(dates[102], 16))
+    acc = store.load_account("h:active")
+    assert acc.positions["600001"].qty == qty and acc.corporate_actions == []  # 101 的事件早于买入，104 的还没到
+
+
+def test_recommendation_already_adjusted_is_not_adjusted_again(env):
+    dates, store = env["dates"], env["store"]
+    env["client"].dividend_data = {"600001": [(dates[101], 0.0, 1.0)]}
+    _split_from(env, "600001", dates[101])
+    o = float(env["cache"].raw["600001"].loc[pd.Timestamp(dates[101]), "open"])
+    pick = Pick(code="600001", name=NAMES["600001"], score=1.0, entry_max=999.0, stop=round(o * 0.9, 2),
+                target=999.0, hold_days=5, reason="测试")
+    store.save_recommendation(dates[101], "h:active", [pick], {"llm_reviewed": True, "ex_adjusted": True})
+    settle.main(now=at(dates[101], 16))
+    assert store.load_account("h:active").positions["600001"].stop == pytest.approx(pick.stop)
+
+
+def test_quant_pick_converted_when_adjusted_history_moved(env, monkeypatch):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    env["client"].dividend_data = {"600001": [(dates[102], 0.5, 0.0)]}
+    m = cache.panel["600001"].index < pd.Timestamp(dates[102])
+    cache.panel["600001"].loc[m, ["open", "high", "low", "close", "prev_close"]] -= 0.5  # 前复权整体下调
+    q_open = float(cache.panel["600001"].loc[pd.Timestamp(dates[101]), "open"])
+
+    class Tight:  # 买入上限只比前复权开盘价高 1 分：不换算的话，真实开盘价高出 0.5 元，买不进
+        name = "tight"
+
+        def select(self, view):
+            return [Pick(code="600001", name="x", score=1.0, entry_max=q_open + 0.01, stop=q_open * 0.8,
+                         target=q_open * 1.5, hold_days=5)]
+
+    monkeypatch.setattr(settle, "load_strategy", lambda name: Tight())
+    settle.main(now=at(dates[102], 16))  # 一次补跑 101、102
+    trades = store.load_account("q:baseline_momo").trades
+    assert any(f.side == "BUY" and f.code == "600001" and f.date == dates[101] for f in trades)
+
+
+def test_quant_pick_prices_converted_to_unadjusted():
+    from engine.types import Bar
+    q = Bar("600001", dates_d := make_dates()[0], 9.5, 10.0, 9.0, 9.8, 9.6, 1e6, 1e7)
+    r = Bar("600001", dates_d, 10.0, 10.5, 9.5, 10.3, 10.1, 1e6, 1e7)  # 前复权 = 不复权 - 0.5
+    pick = Pick(code="600001", name="x", score=1.0, entry_max=10.0, stop=9.0, target=11.0, hold_days=5)
+    out = settle._to_raw(pick, q, r)
+    assert (out.entry_max, out.stop, out.target) == pytest.approx((10.5, 9.5, 11.5))
+    assert settle._to_raw(pick, r, r) is pick and settle._to_raw(pick, None, r) is pick
+
+
+def test_new_positions_get_dividend_records_for_tomorrow(env):
+    dates, store, cache = env["dates"], env["store"], env["cache"]
+    settle.main(now=at(dates[101], 16))
+    held = {c for n in store.list_accounts() for c in store.load_account(n).positions}
+    assert held and held <= set(cache.divs)  # 结算完再刷新一次：供次日盘中监控换算
 
 
 def test_promotion_events_are_notified(env, monkeypatch):
@@ -10905,6 +11237,41 @@ def refresh_dividends(store, client, cache, d: date | None = None) -> list[str]:
     return failed
 
 
+RAW_START_DAYS = 30  # 新代码的不复权日线从结算日前 30 天取起：估值和除权核对只需要最近的收盘价
+
+
+def _to_raw(pick, q, r):
+    """量化策略按前复权价格写价位，结算按不复权日线撮合。两者在 d 日是仿射关系（前复权扣减了 d 日之后的分红
+    送转），用 d 日的两根 K 线换算；没有除权时两者相同，价位不变。"""
+    if q is None or r is None or not (q.close > 0 and r.close > 0):
+        return pick
+    if q.high - q.low > 1e-9 and r.high - r.low > 1e-9:
+        a = (r.high - r.low) / (q.high - q.low)
+    else:
+        a = r.close / q.close
+    b = r.close - a * q.close
+    if a <= 0 or (abs(a - 1.0) < 1e-9 and abs(b) < 1e-9):
+        return pick
+
+    def f(x):
+        return max(a * x + b, 0.01)
+
+    return replace(pick, entry_max=f(pick.entry_max), stop=f(pick.stop), target=f(pick.target))
+
+
+def _valuation(cache, code: str, d: date) -> float | None:
+    """持仓估值：d 日（含）之前最近的不复权收盘价；中间有除权（例如除权日缺 K 线）时换算到除权后，
+    与已经按送转放大的股数一致。"""
+    last = cache.last_raw_close(code, d)
+    if last is None:
+        return None
+    t, price = last
+    for ex, cash, ratio in cache.dividends(code):
+        if t < ex <= d:
+            price = ex_rights_price(price, cash, ratio)
+    return price
+
+
 def _ex_adjust_pick(pick, cache, d: date):
     """盘前推荐的价位按除权前的收盘价写成；d 是这只股票的除权除息日时换算到除权后。"""
     for ex, cash, ratio in cache.dividends(pick.code):
@@ -10929,35 +11296,54 @@ def _settled(store, name: str, d: date) -> bool:
     return last is not None and last >= d
 
 
-def settle_day(d: date, settings, store, cache, calendar) -> list[str]:
-    """结算单个交易日；已记录 d 日净值的账户跳过（幂等）。返回警告列表。"""
+def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()) -> list[str]:
+    """结算单个交易日；已记录 d 日净值的账户跳过（幂等）。返回警告列表。
+
+    前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
+    不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码。"""
     codes = tracked_codes(store)
     panel, names = cache.load_panel(codes, d - timedelta(days=LOOKBACK_CAL_DAYS), d)
-    bars = bars_for_day(panel, names, d)
-    if len(bars) < max(1, int(len(codes) * MIN_COVERAGE)):
-        raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(bars)}/{len(codes)}，数据可能未更新")
+    qfq_bars = bars_for_day(panel, names, d)
+    if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
+        raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(qfq_bars)}/{len(codes)}，数据可能未更新")
     bench_start = date.fromisoformat(store.kv_get("bench_start"))
     index = cache.load_index(common.INDEX_SYMBOL)
     bench_equity = settings.capital * _index_close(index, d) / _index_close(index, bench_start)
 
-    closes = {}
-    for c, df in panel.items():
-        valid = df["close"].dropna()  # 收盘价缺失时沿用上一个有效收盘价，净值不会变成 NaN
-        if len(valid):
-            closes[c] = float(valid.iloc[-1])
     asof = calendar.prev_day(d)
     # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合
     view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items()}, names, asof=asof)
     broker, per_pick, warnings = SimBroker(), settings.capital / settings.max_picks, []
+
+    def raw_bars(codes) -> dict:
+        need = sorted(set(codes))
+        failed = cache.update_raw(need, d, d - timedelta(days=RAW_START_DAYS))
+        if failed:
+            common.log.warning("raw bars failed on %s: %s", d, failed)
+        return cache.raw_bars(need, d, names)
+
+    def check_unexplained_ex(code: str, bar) -> None:
+        """不复权日线的参考昨收与上一个收盘价不一致，说明 d 日除权除息。没有对应的分红记录时：分红接口今天失败
+        就暂停结算（下次重试），否则告警（多半是配股，不建模）。"""
+        prev = cache.last_raw_close(code, calendar.prev_day(d))
+        if bar is None or prev is None or abs(bar.prev_close - prev[1]) <= 0.011:
+            return
+        if any(prev[0] < ex <= d for ex, _, _ in cache.dividends(code)):
+            return
+        if code in div_failed:
+            raise DataError(f"{code} 于 {d.isoformat()} 疑似除权除息，但分红记录获取失败：暂停结算，下次重试")
+        warnings.append(f"{code} 于 {d.isoformat()} 疑似除权除息，但没有分红记录（可能是配股，不建模），持仓未调整")
 
     def run(name: str, picks) -> None:
         acc = store.load_account(name)
         if acc is None:
             acc = Account(name=name, cash=settings.capital)
             store.record_nav(name, calendar.prev_day(d), settings.capital)
+        bars = raw_bars([*acc.positions, *(p.code for p in picks)])
         if acc.last_trade_day is None or acc.last_trade_day < d:  # d 日尚未撮合：重跑时不重复调整
             # 除权除息：上次结算之后到 d 日（含）之间除权的持仓，先换算股数、成本和价位，现金分红入账
             for code in list(acc.positions):
+                check_unexplained_ex(code, bars.get(code))
                 for ex, cash, ratio in cache.dividends(code):
                     if (acc.last_trade_day is None or ex > acc.last_trade_day) and ex <= d:
                         act = acc.apply_dividend(ex, code, cash, ratio)
@@ -10967,7 +11353,8 @@ def settle_day(d: date, settings, store, cache, calendar) -> list[str]:
         broker.execute_day(acc, d, bars, picks, calendar, per_pick)
         # 先存账户再记净值：中途中断时，重跑看到 last_trade_day == d，execute_day 不会重复成交，只补记净值
         store.save_account(acc)
-        store.record_nav(name, d, acc.equity(closes))
+        prices = {c: v for c in acc.positions if (v := _valuation(cache, c, d)) is not None}
+        store.record_nav(name, d, acc.equity(prices))
 
     for status in ("incumbent", "shadow"):
         for strat in store.strategies_with_status(status):
@@ -10980,21 +11367,24 @@ def settle_day(d: date, settings, store, cache, calendar) -> list[str]:
                 common.log.exception("strategy %s failed on %s", strat, d)
                 warnings.append(f"策略 {strat} 选股失败，当日跳过：{type(e).__name__}: {e}")
                 continue
-            run(name, picks)
+            raw = raw_bars(p.code for p in picks)
+            run(name, [_to_raw(p, qfq_bars.get(p.code), raw.get(p.code)) for p in picks])
 
     for name in common.LLM_ACCOUNTS:
         if not _settled(store, name, d):
             rec = store.load_recommendation(d, name)
-            # 量化策略在结算时按已复权的数据选股，只有盘前写好的推荐需要换算
-            run(name, [_ex_adjust_pick(p, cache, d) for p in rec[0]] if rec else [])
+            picks = rec[0] if rec else []
+            if rec and not rec[1].get("ex_adjusted"):  # 盘前定稿已经换算过的不再换算
+                picks = [_ex_adjust_pick(p, cache, d) for p in picks]
+            run(name, picks)
 
     if not _settled(store, common.BENCH_ACCOUNT, d):
         store.record_nav(common.BENCH_ACCOUNT, d, bench_equity)
     return warnings
 
 
-def settle_and_decide(d: date, settings, store, cache, calendar, notifier) -> None:
-    warnings = settle_day(d, settings, store, cache, calendar)
+def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset()) -> None:
+    warnings = settle_day(d, settings, store, cache, calendar, div_failed)
     if warnings:
         notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
     for ev in promotion.decide(store, d, calendar):
@@ -11016,17 +11406,18 @@ def main(now: datetime | None = None) -> list[date]:
         return []
     done, div_failed = [], set()
     for d in days:
-        div_failed.update(refresh_dividends(store, client, cache, d))  # 截至前一日的持仓与 d 日推荐
-        ok = common.run_job("settle", d, lambda d=d: settle_and_decide(
-            d, settings, store, cache, calendar, notifier), store, notifier)
+        failed = frozenset(refresh_dividends(store, client, cache, d))  # 截至前一日的持仓与 d 日推荐
+        div_failed.update(failed)
+        ok = common.run_job("settle", d, lambda d=d, failed=failed: settle_and_decide(
+            d, settings, store, cache, calendar, notifier, failed), store, notifier)
         if not ok:
             break
         done.append(d)
     if done:
         div_failed.update(refresh_dividends(store, client, cache))  # 当天新买入的持仓：供次日盘中监控
     if div_failed:
-        notifier.send_text(format_alert("除权数据获取失败", f"{', '.join(sorted(div_failed))}：这些股票今天没有"
-                                        "按分红送转调整持仓和价位，下次结算会重试"))
+        notifier.send_text(format_alert("除权数据获取失败", f"{', '.join(sorted(div_failed))}：分红记录今天没有"
+                                        "更新；如果持仓当天除权除息，结算会暂停，下次运行时重试"))
     return done
 
 
@@ -11039,7 +11430,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_settle.py -v
 ```
-预期：14 passed。
+预期：24 passed。
 
 **Step 5: 提交**
 
@@ -11536,6 +11927,11 @@ def test_ex_date_uses_adjusted_levels():
     out = check_once(D, store, SpotClient([row("600001", 6.1, 6.6, prev_close=6.6)]), NullNotifier(), cache)
     assert len(out) == 1 and "触发止损" in out[0] and "6.20" in out[0]
     assert len(check_once(D, make_store(("600001", 9.3, 11.0)), client, NullNotifier())) == 1  # 不换算会误报
+    # 前一天除权、结算已经调整过的持仓，今天不再换算
+    yesterday = DivCache({"600001": [(date(2026, 10, 15), 0.0, 0.5)]})
+    out = check_once(D, make_store(("600001", 6.2, 7.3)), SpotClient([row("600001", 6.1, 6.6, prev_close=6.6)]),
+                     NullNotifier(), yesterday)
+    assert len(out) == 1 and "6.20" in out[0]
 
 
 def test_no_positions_skips_spot_call():
@@ -12040,7 +12436,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 57 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 14、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 67 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 5、`test_jobs_settle.py` 24、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 6、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
