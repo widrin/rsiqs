@@ -106,7 +106,7 @@ class Account:
         if pos is None or any(a["code"] == code and a["date"] == d.isoformat() for a in self.corporate_actions):
             return None
         qty0 = pos.qty
-        qty1 = int(qty0 * (1.0 + share_ratio) + 1e-6)  # 1900 * 1.3 must not floor to 2469
+        qty1 = int(qty0 * (1.0 + share_ratio) + 1e-6)  # 100 * 1.15 is 114.99999999999999 in floats
         net = round(qty0 * cash_per_share * (1.0 - tax_rate), 2)
         self.cash += net
         pos.cost = (pos.cost * qty0 - net) / qty1

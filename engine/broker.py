@@ -58,11 +58,11 @@ class SimBroker:
            ``limit_prices(..., d)``, i.e. the rules in force on ``d``. The band is unreliable when
            open, high or low lies outside [limit_down - 0.01, limit_up + 0.01] (e.g. an ex-rights
            day with a stale prev_close); then fill prices are not clipped, and a limit counts as
-           sealed only for a one-price bar (high == low, so the open was also the high and the
-           low). A wrong band can be far too narrow (e.g. later cash dividends subtracted from
-           forward-adjusted prices), so an ordinary day beyond it still trades; a one-price bar
-           beyond it is still sealed. Requiring open == high alone would let the rest of the day
-           decide the buy (a gap-up that fades is skipped, one that keeps rising is bought).
+           sealed for sells only for a one-price bar (high == low): a wrong band can be far too
+           narrow (e.g. later cash dividends subtracted from forward-adjusted prices), so an
+           ordinary down day beyond it still sells. Buys look at the open only: an open at or
+           beyond the computed limit-up is skipped whether or not the band is reliable, because
+           reliability depends on the day's high and low and must not decide the buy.
         1. Open sells. A position whose high is at limit-down (``at_limit_down``) was sealed all
            day and cannot be sold. Otherwise, in priority order: expiry (``d >= exit_date``) sells
            at the open; open <= stop sells at the open (stop-loss); open >= target sells at the
@@ -117,9 +117,8 @@ class SimBroker:
             if not _valid(bar):
                 continue
             band = _band(bar, d)
-            one_price = _cents(bar.high) == _cents(bar.low)
-            if at_limit_up(bar.open, band[0]) and (band[2] or one_price):
-                continue  # 开盘涨停, cannot buy
+            if at_limit_up(bar.open, band[0]):
+                continue  # 开盘涨停 (or beyond the computed limit-up): cannot buy
             if bar.open > pick.entry_max:
                 continue  # gapped above the buy zone
             if bar.open <= pick.stop:

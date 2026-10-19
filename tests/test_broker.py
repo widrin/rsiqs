@@ -282,24 +282,26 @@ def test_unreliable_band_ordinary_day_trades():
     acc4 = held(stop=1.40, target=1.80)
     f4 = run(acc4, [bar(o=1.20, h=1.34, l=1.20, c=1.30, pc=1.50)])[0]
     assert f4.reason == "止损" and f4.price == pytest.approx(1.20 * (1 - SLIP))
-    # a +3.6% open that then traded higher is not limit-up either
+    # buys only look at the open: an open at or beyond the computed limit-up is skipped, whatever
+    # the rest of the day does (conservative; the day's later path must not decide the buy)
     acc2 = Account("t", 100_000.0)
-    f2 = run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
-             [pick(entry_max=1.70, stop=1.55, target=1.90)])[0]
-    assert f2.side == "BUY" and f2.price == pytest.approx(1.66 * (1 + SLIP))
+    assert run(acc2, [bar(o=1.66, h=1.70, l=1.62, c=1.68, pc=1.50)],
+               [pick(entry_max=1.70, stop=1.55, target=1.90)]) == []
     # ex-rights day with a stale prev_close (band [18.00, 22.00]): the expiry sell goes through
     acc3 = held(exit_date=D1)
     f3 = run(acc3, [bar(o=13.4, h=13.6, l=13.3, c=13.5, pc=20.0)])[0]
     assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
 
 
-@pytest.mark.parametrize("h,l,c", [(1.70, 1.62, 1.66), (1.78, 1.68, 1.76)])
-def test_unreliable_band_buy_decision_ignores_the_rest_of_the_day(h, l, c):
-    # same +13% open beyond the computed limit-up 1.65: whether it later fades (open == high) or keeps
-    # rising must not decide the buy, otherwise the day's later path leaks into the decision
+@pytest.mark.parametrize("o,expect_buy", [(1.70, False), (1.65, False), (1.63, True)])
+@pytest.mark.parametrize("path", ["fade", "rise"])
+def test_buy_decision_ignores_the_rest_of_the_day(o, expect_buy, path):
+    # computed limit-up 1.65: the same open gives the same decision whether the day later fades
+    # (open is the high, band looks reliable) or keeps rising (high beyond the band, band unreliable)
+    hi, lo, cl = (o, o - 0.08, o - 0.05) if path == "fade" else (o + 0.08, o - 0.02, o + 0.06)
     acc = Account("t", 100_000.0)
-    f = run(acc, [bar(o=1.70, h=h, l=l, c=c, pc=1.50)], [pick(entry_max=1.75, stop=1.55, target=1.90)])[0]
-    assert f.side == "BUY" and f.price == pytest.approx(1.70 * (1 + SLIP))
+    fills = run(acc, [bar(o=o, h=hi, l=lo, c=cl, pc=1.50)], [pick(entry_max=1.75, stop=1.40, target=1.90)])
+    assert bool(fills) is expect_buy
 
 
 def test_unreliable_band_one_price_open_is_sealed_limit_up():

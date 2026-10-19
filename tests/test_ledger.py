@@ -167,11 +167,24 @@ def test_apply_dividend_is_idempotent_and_ignores_unknown_code():
 def test_bonus_shares_round_down_and_keep_t_plus_1_lock():
     acc = Account("t", 100_000.0)
     acc.buy(D1, "600000", "浦发银行", 10.0, 1900, 9.3, 11.0, EXIT, "test")
-    acc.apply_dividend(D1, "600000", 0.0, 0.3)  # 1900 * 1.3 = 2470（浮点误差不能变成 2469）
+    acc.apply_dividend(D1, "600000", 0.0, 0.3)
     pos = acc.positions["600000"]
     assert pos.qty == 2470 and pos.available == 0
     acc.start_day(D2)
     assert pos.available == 2470
+    acc2 = Account("t", 100_000.0)
+    acc2.buy(D1, "600000", "浦发银行", 10.0, 100, 9.3, 11.0, EXIT, "test")
+    acc2.apply_dividend(D1, "600000", 0.0, 0.15)  # 100 * 1.15 = 114.99999999999999，不能取整成 114
+    assert acc2.positions["600000"].qty == 115
+
+
+def test_apply_dividend_key_is_code_and_date():
+    acc = _bought()
+    acc.buy(D1, "000001", "平安银行", 10.0, 1000, 9.3, 11.0, EXIT, "test")
+    assert acc.apply_dividend(EX, "600000", 0.3, 0.0) is not None
+    assert acc.apply_dividend(EX, "000001", 0.3, 0.0) is not None  # 同一天另一只股票
+    assert acc.apply_dividend(date(2026, 11, 20), "600000", 0.2, 0.0) is not None  # 同一只股票另一次除权
+    assert len(acc.corporate_actions) == 3
 
 
 @pytest.mark.parametrize("cash,ratio", [(-0.1, 0.0), (0.0, -0.1), (float("nan"), 0.0), (0.0, float("inf")),
