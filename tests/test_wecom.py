@@ -144,3 +144,17 @@ def test_split_utf8_does_not_split_emoji_sequences():
     assert "".join(chunks) == "⚠️" * 1000
     assert all(not c.startswith("\ufe0f") for c in chunks)
     assert all(len(c.encode("utf-8")) <= 4000 for c in chunks)
+
+
+def test_failure_during_concurrent_send_is_not_erased(tmp_path):
+    w_ok, s_ok = make(tmp_path)
+    w_bad, _ = make(tmp_path, [Resp(500), Resp(500), Resp(500)])
+    real_post = s_ok.post
+
+    def post_while_other_fails(url, json=None, timeout=None):
+        w_bad.send_text("另一个进程同时推送失败")  # B 的请求还在飞行时，A 失败并写下标记
+        return real_post(url, json=json, timeout=timeout)
+
+    s_ok.post = post_while_other_fails
+    assert w_ok.send_text("盘中告警") is True
+    assert w_ok.failed  # B 成功后不能删掉 A 刚写下的标记

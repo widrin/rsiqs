@@ -74,14 +74,22 @@ class WeCom:
     def send_markdown(self, content: str) -> bool:
         return self._send("markdown", content, MARKDOWN_LIMIT)
 
+    def _pending_mark(self):
+        try:
+            return (self.log_dir / PENDING_FILE).stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+
     def _send(self, msgtype: str, content: str, limit: int) -> bool:
-        body = (FAIL_PREFIX + content) if self.failed else content
+        mark = self._pending_mark()  # 只清除发送前就存在的标记：发送期间别的进程失败写下的新标记要保留
+        body = (FAIL_PREFIX + content) if mark is not None else content
         for chunk in split_utf8(body, limit):
             err = self._post({"msgtype": msgtype, msgtype: {"content": chunk}})
             if err is not None:
                 self._log_failure(msgtype, content, err)
                 return False
-        (self.log_dir / PENDING_FILE).unlink(missing_ok=True)
+        if mark is not None and self._pending_mark() == mark:
+            (self.log_dir / PENDING_FILE).unlink(missing_ok=True)
         return True
 
     def _post(self, payload: dict) -> str | None:
@@ -117,7 +125,8 @@ class WeCom:
 
     def _log_failure(self, msgtype: str, content: str, err: str) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        (self.log_dir / PENDING_FILE).touch()
+        pending = self.log_dir / PENDING_FILE
+        pending.write_text(datetime.now().isoformat(), encoding="utf-8")  # 每次失败都更新 mtime
         rec = {"time": datetime.now().isoformat(timespec="seconds"), "msgtype": msgtype,
                "content": content, "error": _redact(err)}
         with open(self.log_dir / "notify_failed.jsonl", "a", encoding="utf-8") as f:

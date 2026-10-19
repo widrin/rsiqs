@@ -10,6 +10,7 @@ from datetime import date
 
 import akshare as ak
 import pandas as pd
+import requests
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,25 @@ BID_ASK_COLS = {"今开": "open", "昨收": "prev_close", "最新": "last", "涨
                 "金额": "amount", "最高": "high"}
 HTTP_TIMEOUT = 15.0  # 支持 timeout 参数的接口（stock_zh_a_hist）单次请求的超时，秒
 SOCKET_TIMEOUT = 30.0  # 兜底：akshare 多数接口内部用不带 timeout 的 requests.get，连接卡住时会无限阻塞
+CONNECT_TIMEOUT = 5.0
+
+
+def _install_requests_default_timeout() -> None:
+    """给不带 timeout 的 requests 请求补上默认超时（只装一次）。
+
+    socket.setdefaulttimeout 管不到 requests：timeout=None 时 urllib3 会对新建的 socket 显式 settimeout(None)。
+    已经传了 timeout 的调用（企业微信推送、stock_zh_a_hist）不受影响。"""
+    send = requests.adapters.HTTPAdapter.send
+    if getattr(send, "_umberfell_default_timeout", False):
+        return
+
+    def send_with_timeout(self, request, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (CONNECT_TIMEOUT, SOCKET_TIMEOUT)
+        return send(self, request, *args, **kwargs)
+
+    send_with_timeout._umberfell_default_timeout = True
+    requests.adapters.HTTPAdapter.send = send_with_timeout
 
 
 class DataError(Exception):
@@ -84,12 +104,13 @@ def _empty_on_key_error(fn, *args, **kwargs):
 class AkClient:
     """所有方法都经 with_retry；快照与指数日线有备用源。
 
-    构造时设置进程级的 socket 默认超时（SOCKET_TIMEOUT）：akshare 多数接口不设超时，连接卡住时重试和告警都
-    不会触发，任务会一直挂住。"""
+    构造时给不带 timeout 的 requests 请求补上默认超时，并设置进程级的 socket 默认超时（兜住走 urllib 的接口）：
+    akshare 多数接口不设超时，连接卡住时重试和告警都不会触发，任务会一直挂住。"""
 
     def __init__(self, attempts: int = 3, wait: float = 2.0):
         self.attempts = attempts
         self.wait = wait
+        _install_requests_default_timeout()
         if socket.getdefaulttimeout() is None:
             socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
@@ -169,18 +190,34 @@ class AkClient:
         return sorted(codes)
 
     def names(self) -> dict[str, str]:
-        """沪深京全部 A 股的当前简称（交易所列表，含 ST/*ST 前缀）。每天刷新：新纳入的成分股和新戴帽的股票都靠它。"""
-        df = self._call(ak.stock_info_a_code_name)
-        return {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
+        """沪深 A 股的当前简称（交易所列表，含 ST/*ST 前缀）。每天刷新：新纳入的成分股和新戴帽的股票都靠它。
 
-    def spot(self, codes: list[str] | None = None) -> pd.DataFrame:
+        上交所主板、科创板、深交所分别取，取到哪个合并哪个；股票池用不到北交所，不取。全部失败才抛 DataError。"""
+        sources = [(ak.stock_info_sh_name_code, "主板A股", "证券代码", "证券简称"),
+                   (ak.stock_info_sh_name_code, "科创板", "证券代码", "证券简称"),
+                   (ak.stock_info_sz_name_code, "A股列表", "A股代码", "A股简称")]
+        out: dict[str, str] = {}
+        failed = 0
+        for fn, symbol, code_col, name_col in sources:
+            try:
+                df = self._call(fn, symbol=symbol)
+                out.update({str(c).zfill(6): str(n) for c, n in zip(df[code_col], df[name_col])})
+            except Exception as e:  # noqa: BLE001
+                log.warning("股票简称（%s）获取失败: %s", symbol, e)
+                failed += 1
+        if failed == len(sources):
+            raise DataError("交易所股票简称列表全部获取失败")
+        return out
+
+    def spot(self, codes: list[str] | None = None, sink: list | None = None) -> pd.DataFrame:
         """实时快照（竞价时段的"今开"即竞价价）。
 
         给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
-        和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空。
+        和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空；一只都取不到时抛
+        DataError。sink 不为 None 时每取到一只就追加一行（dict），调用方超时后可以用已取到的部分。
         不给 codes 时取全市场：东财失败切新浪。"""
         if codes is not None:
-            return self._spot_codes(codes)
+            return self._spot_codes(codes, sink)
         try:
             out = _pick(self._call(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
         except Exception as e:  # noqa: BLE001
@@ -195,8 +232,8 @@ class AkClient:
         out["name"] = out["name"].astype(str)
         return out[SPOT_COLS].reset_index(drop=True)
 
-    def _spot_codes(self, codes: list[str]) -> pd.DataFrame:
-        rows = []
+    def _spot_codes(self, codes: list[str], sink: list | None = None) -> pd.DataFrame:
+        rows = [] if sink is None else sink
         for code in codes:
             try:
                 df = self._call(ak.stock_bid_ask_em, symbol=code)
@@ -205,12 +242,12 @@ class AkClient:
                 continue
             kv = dict(zip(df["item"], df["value"]))
             row = {"code": str(code).zfill(6), "name": ""}
-            row.update({v: kv.get(k) for k, v in BID_ASK_COLS.items()})
+            # 停牌时报价为 "-"：转成 NaN
+            row.update({v: float(pd.to_numeric(kv.get(k), errors="coerce")) for k, v in BID_ASK_COLS.items()})
             rows.append(row)
-        out = pd.DataFrame(rows, columns=SPOT_COLS)
-        for c in SPOT_COLS[2:]:
-            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)  # 停牌时报价为 "-"
-        return out
+        if codes and not rows:
+            raise DataError(f"个股报价全部获取失败（{len(codes)} 只）")
+        return pd.DataFrame(rows, columns=SPOT_COLS)
 
     def news_global(self, limit: int = 50) -> list[dict]:
         """财联社电报，最新的在前。接口只返回最近 20 条（按时间升序），limit 超过 20 也只有 20 条。"""

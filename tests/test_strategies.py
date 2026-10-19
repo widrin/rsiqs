@@ -120,8 +120,10 @@ def test_non_finite_values_are_skipped():
     nan_close = good.copy()
     nan_close.iloc[-1, nan_close.columns.get_loc("close")] = float("nan")  # asof 当天收盘价缺失
     nan_amount = series(path(0.15, 0.0), amount=float("nan"))           # 成交额缺失：不能当作足够
+    nan_prev = series(path(0.12, 0.01))
+    nan_prev.iloc[-1, nan_prev.columns.get_loc("prev_close")] = float("nan")  # 前一日收盘价缺失
     nan_hist = series(path(0.10, 0.10))
     nan_hist.iloc[-21, nan_hist.columns.get_loc("close")] = float("nan")  # 20 日前收盘价缺失
-    panel = {"600001": good, "600002": nan_close, "600003": nan_amount, "600004": nan_hist}
+    panel = {"600001": good, "600002": nan_close, "600003": nan_amount, "600004": nan_hist, "600005": nan_prev}
     picks = STRATEGY.select(DataView(panel, {c: "股" for c in panel}, asof=ASOF))
     assert [p.code for p in picks] == ["600001"]

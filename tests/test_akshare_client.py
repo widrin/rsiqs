@@ -278,8 +278,23 @@ def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
 
 
 def test_names_from_exchange_lists(monkeypatch):
-    fake_ak(monkeypatch, stock_info_a_code_name=lambda: pd.DataFrame({"code": ["600000", 1], "name": ["浦发银行", "*ST平安"]}))
-    assert AkClient().names() == {"600000": "浦发银行", "000001": "*ST平安"}
+    sh = {"主板A股": pd.DataFrame({"证券代码": ["600000"], "证券简称": ["浦发银行"]}),
+          "科创板": pd.DataFrame({"证券代码": ["688001"], "证券简称": ["华兴源创"]})}
+    fake_ak(monkeypatch, stock_info_sh_name_code=lambda symbol: sh[symbol],
+            stock_info_sz_name_code=lambda symbol: pd.DataFrame({"A股代码": [1], "A股简称": ["*ST平安"]}))
+    assert AkClient().names() == {"600000": "浦发银行", "688001": "华兴源创", "000001": "*ST平安"}
+
+
+def test_names_partial_when_one_exchange_fails(monkeypatch):
+    def sz_down(symbol):
+        raise ConnectionError("szse down")
+
+    fake_ak(monkeypatch, stock_info_sh_name_code=lambda symbol: pd.DataFrame({"证券代码": ["600000"], "证券简称": ["浦发银行"]}),
+            stock_info_sz_name_code=sz_down)
+    assert AkClient(wait=0).names() == {"600000": "浦发银行"}
+    fake_ak(monkeypatch, stock_info_sh_name_code=sz_down, stock_info_sz_name_code=sz_down)
+    with pytest.raises(DataError):
+        AkClient(wait=0).names()
 
 
 def test_index_daily_falls_back_to_eastmoney(monkeypatch):
@@ -307,3 +322,47 @@ def test_client_sets_a_default_socket_timeout():
         assert socket.getdefaulttimeout() == akc.SOCKET_TIMEOUT
     finally:
         socket.setdefaulttimeout(old)
+
+
+def test_spot_for_codes_all_failing_raises(monkeypatch):
+    def down(symbol):
+        raise ConnectionError("push2 down")
+
+    fake_ak(monkeypatch, stock_bid_ask_em=down)
+    with pytest.raises(DataError):  # 一只都取不到：让盘中监控计入失败并告警，而不是当成全部停牌
+        AkClient(wait=0).spot(["600000", "000001"])
+
+
+def test_spot_for_codes_streams_rows_into_sink(monkeypatch):
+    fake_ak(monkeypatch, stock_bid_ask_em=lambda symbol: _bid_ask(BID_ASK))
+    rows = []
+    AkClient().spot(["600000", "000001"], sink=rows)
+    assert [r["code"] for r in rows] == ["600000", "000001"] and rows[0]["open"] == 10.2
+
+
+def test_requests_without_timeout_get_one(monkeypatch):
+    import socket
+    import threading
+
+    import requests
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    conns = []
+    threading.Thread(target=lambda: conns.append(srv.accept()), daemon=True).start()  # 接受连接，从不响应
+    monkeypatch.setattr(akc, "SOCKET_TIMEOUT", 0.5)
+    AkClient()
+    box = []
+
+    def get():  # akshare 内部的 requests.get 都不传 timeout
+        try:
+            requests.get(f"http://127.0.0.1:{srv.getsockname()[1]}/")
+        except requests.exceptions.Timeout as e:
+            box.append(e)
+
+    t = threading.Thread(target=get, daemon=True)
+    t.start()
+    t.join(5)
+    srv.close()
+    assert box, "requests.get 没有在超时内报错"
