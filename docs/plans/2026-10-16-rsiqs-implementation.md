@@ -7620,7 +7620,7 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     log = _git(tmp_path, "log", "-1", "--format=%B")
     assert log.startswith("playbook: 复盘更新")
     assert "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" in log
-    assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
+    assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is None  # 没有变化不是失败
 
 
 def test_git_commit_timeout_kills_process_tree_and_skips_hooks(monkeypatch):
@@ -7898,14 +7898,15 @@ def _git(*args) -> tuple[int, str]:
         return code, out.read().decode("utf-8", "replace")
 
 
-def git_commit(paths: list[str], message: str) -> bool:
-    """git add + commit（附 trailer）。失败或无变化返回 False，不抛异常；失败时记警告日志。"""
+def git_commit(paths: list[str], message: str) -> bool | None:
+    """git add + commit（附 trailer）。提交成功返回 True，没有变化返回 None，失败返回 False（记警告日志），
+    不抛异常。调用方用 `is False` 判断失败：没有变化不是失败。"""
     try:
         code, text = _git("add", "--", *paths)
         if code == 0:
             code, text = _git("diff", "--cached", "--quiet", "--", *paths)
             if code == 0:
-                return False  # 没有变化
+                return None  # 没有变化
             code, text = _git("commit", "-m", f"{message}\n\n{TRAILER}", "--", *paths)
         if code != 0:
             log.warning("git commit failed (exit %s): %s", code, text[-500:])
@@ -9547,13 +9548,31 @@ def test_commit_counts_only_effective_changes(env):
     assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
 
 
-def test_backfilled_day_shows_holdings_at_that_close(env):
-    llm = FakeLLM(ReviewOutput(summary="s", lessons=[]))
-    review.run_review(PREV, settings(), env["store"], llm, env["cache"], env["notifier"], CAL, latest=False,
-                      release=None)
-    user = llm.calls[0]["user"]
-    assert "600009 100 股（按成交回放" in user  # PREV 收盘时持有 600009
-    assert "600001 1000 股" not in user          # D 才买入
+def test_backfilled_day_only_sends_the_report(env, monkeypatch):
+    released = []
+    monkeypatch.setattr(playbook, "maybe_release", lambda *a: released.append(a) or "不该发布")
+    llm = FakeLLM(OUTPUT)
+    before = playbook.load("candidate")
+    review.run_review(PREV, settings(), env["store"], llm, env["cache"], env["notifier"], CAL, backfill=True)
+    assert llm.calls == [] and released == [] and env["commits"] == []  # 不调用 LLM、不发布、不写 lesson
+    assert playbook.load("candidate") == before
+    [report] = env["notifier"].sent
+    assert "回补的日报" in report and "2026-10-15" in report
+
+
+def test_backfilled_day_resets_window_when_premarket_ran_without_playbook(env):
+    env["store"].save_recommendation(PREV, "h:candidate", [], {"llm_reviewed": True, "playbook_version": None})
+    env["store"].kv_set(playbook.RELEASE_KEY, "2026-09-01")
+    review.run_review(PREV, settings(), env["store"], FakeLLM(OUTPUT), env["cache"], env["notifier"], CAL,
+                      backfill=True)
+    assert env["store"].kv_get(playbook.RELEASE_KEY) == PREV.isoformat()
+
+
+def test_no_change_commit_is_not_reported_as_failure(env, monkeypatch):
+    monkeypatch.setattr(playbook, "maybe_release", lambda store, today, calendar: "playbook v2 上线：测试")
+    monkeypatch.setattr(playbook, "git_commit", lambda paths, message: None)  # 没有变化
+    run(env, FakeLLM(ReviewOutput(summary="s", lessons=[])))
+    assert "git 提交失败" not in env["notifier"].sent[0]
 
 
 def test_git_failure_is_noted_in_report(env, monkeypatch):
@@ -9665,24 +9684,13 @@ class ReviewOutput(BaseModel):
     lessons: list[Lesson]
 
 
-def _holdings_at(acc, d: dt.date) -> dict[str, int]:
-    """按成交回放 d 日收盘时的持股（回补较早的日子时用；不计之后的送转）。"""
-    qty: dict[str, int] = {}
-    for t in acc.trades:
-        if t.date <= d:
-            qty[t.code] = qty.get(t.code, 0) + (t.qty if t.side == "BUY" else -t.qty)
-    return {c: q for c, q in qty.items() if q > 0}
-
-
-def _account_section(store: Store, d: dt.date, name: str, latest: bool = True) -> tuple[list[str], set[str]]:
-    """latest=False 表示回补较早的日子：账户已经结算到更晚的日子，收盘持仓按成交回放到 d。"""
+def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], set[str]]:
     rec = store.load_recommendation(d, name)
     acc = store.load_account(name)
     fills = [t for t in acc.trades if t.date == d] if acc else []
-    positions = list(acc.positions.values()) if acc and latest else []
-    held = {} if acc is None or latest else _holdings_at(acc, d)
+    positions = list(acc.positions.values()) if acc else []
     codes = {p.code for p in rec[0]} if rec else set()
-    codes |= {t.code for t in fills} | {p.code for p in positions} | set(held)
+    codes |= {t.code for t in fills} | {p.code for p in positions}
     lines = [f"## 账户 {name}"]
     if rec is None:
         lines.append("推荐：（当日无推荐）")
@@ -9696,11 +9704,8 @@ def _account_section(store: Store, d: dt.date, name: str, latest: bool = True) -
     lines += [f"- {t.side} {t.code} {t.qty} 股 @ {t.price:.2f}，费用 {t.fee:.2f}，{t.reason or '开盘成交'}"
               for t in fills] or ["（无）"]
     lines.append("### 收盘持仓")
-    if latest:
-        lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
-                  f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
-    else:
-        lines += [f"- {c} {q} 股（按成交回放，未计之后的送转）" for c, q in sorted(held.items())] or ["（空仓）"]
+    lines += [f"- {p.code} {p.name} {p.qty} 股，成本 {p.cost:.2f}，止损 {p.stop:.2f}，止盈 {p.target:.2f}，"
+              f"到期 {p.exit_date.isoformat()}" for p in positions] or ["（空仓）"]
     return lines, codes
 
 
@@ -9758,15 +9763,22 @@ def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) ->
                       f"请写当日复盘 summary，并给出不超过 {MAX_LESSONS} 条带证据的 lesson（可以为空）。"])
 
 
+BACKFILL_SUMMARY = "回补的日报：这一天的结算延迟到之后才完成。LLM 复盘、playbook 更新与发布只针对最近一个交易日，这一天不做。"
+
+
 def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: BarCache, notifier,
-               calendar: TradingCalendar, latest: bool = True, release: str | None | bool = True) -> None:
-    """latest=False：回补较早的日子，持仓按成交回放到 d。release=True 时按 d 判断是否发布；
-    传入字符串或 None 时表示调用方已经判断过（回补时先判断发布、再写各天的 lesson），这里直接沿用。"""
+               calendar: TradingCalendar, backfill: bool = False) -> None:
+    """backfill=True：回补较早的日子，只补发日报（各账户当天的净值），不调用 LLM、不写 lesson、不判断发布。
+    回补期间写的规则没有前向模拟过，发布判断和 lesson 都只在最近一个交易日做，顺序与平时相同。"""
+    if backfill:
+        playbook.reset_window_if_degraded(store, d)  # 这一天盘前按空规则运行时，发布窗口从这一天重新开始
+        notifier.send_markdown(format_daily_report(d, _report_rows(store, d), BACKFILL_SUMMARY))
+        return
     sections: list[str] = []
     codes: set[str] = set()
     has_rec = False
     for name in LLM_ACCOUNTS:
-        lines, c = _account_section(store, d, name, latest)
+        lines, c = _account_section(store, d, name)
         sections += lines
         codes |= c
         has_rec = has_rec or store.load_recommendation(d, name) is not None
@@ -9774,8 +9786,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     # playbook 文件损坏时不发布、不写 lesson：load 会退回空规则，写回去就把规则丢了
     bad = playbook.corrupt_kinds()
     # 先按窗口内实际跑过的候选版决定是否发布，再写当天的 lesson：当天新写的规则没有前向模拟过，不能随这次发布上线
-    if release is True:
-        release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
+    release = playbook.maybe_release(store, d, calendar)  # 有损坏时不发布，只把窗口起点移到今天
     parts = [release] if release else []
     if not has_rec and not codes:
         summary = "今日两个 LLM 账户均无推荐、无持仓，未调用 LLM 复盘。"
@@ -9802,7 +9813,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
                 parts += [f"补充证据 {evidence} 条"] if evidence else []
                 parts += [] if changed or evidence else ["复盘整理规则"]
 
-    if parts and not playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts)):
+    if parts and playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts)) is False:
         summary = f"{summary}\n注意：playbook 的 git 提交失败（见日志），请人工提交 playbook/。"
     if release:
         summary = f"{summary}\n{release}"
@@ -9820,7 +9831,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
 uv run pytest tests/test_review.py -v
 ```
 
-预期：21 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
+预期：23 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
 
 ```
 uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py tests/test_review.py -v
@@ -10530,7 +10541,7 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
     report = _last_json_line(proc.stdout)
     if proc.returncode == SETUP_EXIT and report and report.get("stage") == "setup":
         return {"ok": False, "report": None, "error": str(report.get("error", "评估环境出错"))[:EVAL_ERROR_CHARS],
-                "count": False}  # 与策略无关的环境错误不计入试验
+                "count": False, "setup": True}  # 与策略无关的环境错误：不计入试验，会话随即停止
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
             detail = str(report["error"])[:EVAL_ERROR_CHARS]
@@ -10605,6 +10616,7 @@ from notify.wecom import NullNotifier
 from strategies.sandbox import ALLOWED_IMPORTS
 
 PROJECT = Path(__file__).resolve().parents[1]
+REAL_EVALUATE = research.evaluate_strategy  # env 夹具会把它换成用假 runner 的版本
 SOURCES = ["strategies/base.py", "strategies/baseline_momo.py",
            "engine/types.py", "engine/dataview.py", "engine/rules.py"]
 # 提示词里不能出现的措辞（会触发分类器，导致调用失败）
@@ -11012,6 +11024,25 @@ def test_mid_session_mismatch_is_reported_even_if_restored(env, monkeypatch):
     assert "a_one：已作废" in ctx and "a_one：train" not in ctx            # 下次背景里不当作真实失败
 
 
+def test_setup_error_stops_the_session_with_alert(env, monkeypatch):
+    e = env
+
+    def setup_fail(cmd, **kw):
+        e.evals.names.append(cmd[-1])
+        stdout = '{"error": "评估环境出错：RuntimeError: 缓存中没有基准指数", "stage": "setup"}\n'
+        return subprocess.CompletedProcess(cmd, 3, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(research, "evaluate_strategy",
+                        lambda s, st, name, runner=None: REAL_EVALUATE(s, st, name, runner=setup_fail))
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
+    out = run(e, llm)
+    assert out["status"] == "error" and e.evals.names == ["a_one"] and len(llm.calls) == 1  # 不再评估、不再请求 LLM
+    assert set(out) == {"status", "rounds", "written", "results", "cost_cny", "analysis"}
+    assert e.store.trial_count() == 0
+    msg = e.notifier.sent[-1]
+    assert "告警" in msg and "评估环境出错" in msg and "a_one" in msg
+
+
 def test_commit_failure_is_reported(env, monkeypatch):
     e = env
     monkeypatch.setattr(research, "git_commit", lambda paths, message: False)
@@ -11236,6 +11267,11 @@ def _summary(today: date, out: dict, error: str) -> str:
     return f"RSIQS {title}\n" + "\n".join(lines)
 
 
+def res_names(out: dict) -> str:
+    """本次写入、但因评估环境出错没有试验记录的草稿名。"""
+    return "、".join(r["name"] for r in out["results"] if r["saved"] and r.get("setup")) or "无"
+
+
 def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
                    evals: int, out: dict) -> tuple[list[dict], int]:
     """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
@@ -11256,6 +11292,9 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
             out["written"].append(res["name"])
             evals += 1  # 先计数：超时、失败同样消耗一次额度
             res.update(evaluate_strategy(settings, store, res["name"]))
+            if res.get("setup"):  # 评估环境出错：后面的草稿评估了也一样失败，停止会话
+                out["setup_error"] = res["error"]
+                break
             changed = verify(Path(settings.root))
             if changed:
                 out["engine_changed"] = changed
@@ -11309,6 +11348,9 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             history.append({"round": rnd_no, "analysis": rnd.analysis, "results": results,
                             "drafts": rnd.drafts[:MAX_DRAFTS_PER_ROUND],
                             "ignored": max(0, len(rnd.drafts) - MAX_DRAFTS_PER_ROUND)})
+            if out.get("setup_error"):
+                out["status"], error = "error", f"{out['setup_error']}（草稿 {res_names(out)} 已写入但没有评估）"
+                break
             if out.get("engine_changed") or rnd.done or not rnd.drafts or evals >= MAX_EVALS_PER_SESSION:
                 break  # engine/ 被改动：立即停止，不再请求 LLM，也不再评估
     except Exception as e:  # noqa: BLE001 — 写文件、数据库等本地故障：停止，但照常做会后校验与提交
@@ -11316,6 +11358,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         out["status"], error = "error", f"{type(e).__name__}: {e}"
     out["cost_cny"] = _month_cost(store) - cost0
 
+    out.pop("setup_error", None)
     mid = out.pop("engine_changed", None) or []
     bad = verify(root)
     if bad or mid:
@@ -11342,7 +11385,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
     text = _summary(today, out, error)
     if saved:
         paths = [f"strategies/{r['name']}.py" for r in saved]
-        if not git_commit(paths, _commit_message(today, saved)):
+        if git_commit(paths, _commit_message(today, saved)) is False:
             log.warning("research commit failed: %s", paths)
             text += "\n注意：git 提交失败，请人工提交：" + "、".join(paths)
     notifier.send_text(text)
@@ -11363,7 +11406,7 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
 uv run pytest tests/test_research_tools.py tests/test_research_loop.py -v
 ```
 
-预期：70 passed（tools 34 + loop 17）。
+预期：71 passed（tools 34 + loop 17）。
 
 **Step 5: 提交**
 
@@ -11402,7 +11445,7 @@ uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research
 > - 行情缓存 `BarCache` 与 `Store` 共用 `settings.db_path` 同一个 sqlite 文件（不同表），其他部分（如 `engine.run_eval`）按同一路径构造即可读到缓存。
 > - `bootstrap` 若 `kv "playbook_released"` 不存在，则写入锚定日 ISO 字符串（视为 v1 的发布日），保证 `maybe_release` 的 10 个交易日间隔从启动日起算。
 > - `monitor` 去重键持久化在 `kv "monitor_sent:<ISO日期>"`（进程重启不重复告警）；`check_once(d, store, client, notifier, cache=None) -> list[str]`（cache 提供分红送转记录，除权除息日按换算后的价位判断）。
-> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟）；两者同时启动、Settle 还没拿到锁时，再轮询最多 2 分钟，唤醒或开机后同时补跑时不会因为结算还没完成而跳过。最近 3 个交易日里已结算、还没复盘的日子一起回补（按日期顺序，某天失败就停，下次从这一天接着补），例如结算为等分红记录暂停后一次补完多天。回补时先逐日检查发布窗口，再按最近一天决定是否发布，都在写任何一天的 lesson 之前（回补期间新写的规则没有前向模拟过）；较早日子的收盘持仓按成交回放。
+> - `jobs.review` 复盘"不晚于今天、已结算"的最近一个交易日；该日已复盘则跳过。判断之前先等 `settle` 的进程锁（`settle_main`，最多 30 分钟）；两者同时启动、Settle 还没拿到锁时，再轮询最多 2 分钟，唤醒或开机后同时补跑时不会因为结算还没完成而跳过。最近 3 个交易日里已结算、还没复盘的日子一起处理（按日期顺序，某天失败不挡住其余日子，下次重试补上），例如结算为等分红记录暂停后一次补完多天。较早的日子只补发日报：不调用 LLM、不写 lesson、不判断发布，只在盘前按空规则运行时重置发布窗口；LLM 复盘、lesson 与发布只针对最近一个交易日，顺序与平时相同（先按窗口判断发布，再写当天的 lesson）。`playbook.git_commit` 提交成功返回 True、没有变化返回 None、失败返回 False，调用方只把 False 当作失败。研究会话遇到评估环境出错（`run_eval` 退出码 3）时立即停止并告警。
 > - 盘前扫描和结算给策略同样长的历史（`agents.premarket.HISTORY_DAYS` = 550 个自然日，约 370 个交易日），同一现任策略两处选出的股票一致；研究提示词写明上线后可用的历史长度。现任策略一只都没选出来时，`premarket_scan` 推一条"盘前没有候选"。
 > - 盘前分两段。`jobs.premarket_scan`（08:30）在同一个 `run_job("premarket_scan")` 里先跑 `premarket.scan`，再跑 `premarket.run_analyze`（active/candidate 两路深度分析并行，计划存 `kv "plan:<ISO日期>:<kind>"`）。分析失败（包括 `run_analyze` 本身抛异常）不算任务失败：任务照样记 ok，只推一条"盘前分析未完成"告警。启动时已过 09:25（开机补跑）则只扫描、不分析，因为定稿已经开始，计划用不上，不必白花钱。
 > - `jobs.premarket_final` 的计划任务 09:25 触发。入口先判断交易日和是否过时（晚于 09:35 跳过），再等到 09:25:15（竞价快照落定）后定稿；非交易日、过时都不等待。若当日 `premarket_scan` 未完成（开机晚或 08:30 扫描失败），先内联补跑扫描：只扫描不分析，同样记为 `premarket_scan` 完成。此时两路都没有计划，`run_final` 退回量化推荐。补跑扫描在守护线程里跑，最晚到 09:27（09:27 之后才开始时至少给 90 秒，但不晚于 09:33），超时按扫描失败告警；扫描完已过 09:35 时只推"已过时"告警。等到 09:25:15 的秒数扣掉装配依赖花的时间。
@@ -13288,7 +13331,8 @@ def main(now: datetime | None = None) -> list[date]:
     """补跑所有待结算交易日；返回本次结算成功的日期。某日失败即停止（次日依赖前日持仓）。"""
     now = now or datetime.now()
     settings, store, client, cache, calendar, notifier = common.context()
-    with common.job_lock("settle_main") as got:  # 复盘等这把锁：结算跑完再判断是否已结算
+    # 复盘等这把锁：结算跑完再判断是否已结算。复盘轮询时会短暂拿一下锁，这里等几秒，不因此跳过本次结算
+    with common.job_lock("settle_main", wait=10) as got:
         if not got:
             common.log.info("settle: running in another process")
             return []
@@ -13405,12 +13449,12 @@ def env(tmp_path, monkeypatch):
     def fake_final(d, settings, store, llm, client, notifier, calendar):
         calls.append(("final", d, llm))
 
-    def fake_review(d, settings, store, llm, cache, notifier, calendar, latest=True, release=True):
+    def fake_review(d, settings, store, llm, cache, notifier, calendar, backfill=False):
         if d in review_fail:
             review_fail.discard(d)
             raise RuntimeError("复盘失败")
         calls.append(("review", d, llm))
-        review_kw.append((d, latest, release))
+        review_kw.append((d, backfill))
 
     def fake_research(settings, store, notifier, llm=None):
         calls.append(("research", llm))
@@ -13643,28 +13687,23 @@ def test_review_backfills_settled_days_without_review(env):
     assert [c[1] for c in env["calls"]] == dates[8:11]  # 最多 3 天，按日期顺序
 
 
-def test_review_backfill_decides_release_before_any_lesson(env, monkeypatch):
-    import agents.playbook as pb
-
-    dates, order = env["dates"], []
+def test_review_backfill_only_latest_day_is_a_full_review(env):
+    dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
-    monkeypatch.setattr(pb, "reset_window_if_degraded", lambda store, d: order.append(("check", d)) or False)
-    monkeypatch.setattr(pb, "maybe_release", lambda store, d, cal: order.append(("release", d)) or "发布消息")
     assert review.main(now=at(dates[10], 16, 5)) is True
-    assert order == [("check", dates[8]), ("check", dates[9]), ("release", dates[10])]
-    assert env["review_kw"] == [(dates[8], False, None), (dates[9], False, None), (dates[10], True, "发布消息")]
+    assert env["review_kw"] == [(dates[8], True), (dates[9], True), (dates[10], False)]  # 较早的日子只补日报
 
 
-def test_review_backfill_stops_at_failure_and_resumes(env):
+def test_review_failed_day_does_not_block_others_and_is_retried(env):
     dates = env["dates"]
     for d in dates[8:11]:
         env["store"].mark_job("settle", d, "ok")
     env["review_fail"].add(dates[9])
     assert review.main(now=at(dates[10], 16, 5)) is False
-    assert [c[1] for c in env["calls"]] == [dates[8]]  # 按日期顺序：失败就停
-    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试接着补
-    assert [c[1] for c in env["calls"]] == dates[8:11]
+    assert [c[1] for c in env["calls"]] == [dates[8], dates[10]]  # 某天失败不挡住其余日子
+    assert review.main(now=at(dates[10], 16, 25)) is True  # 下次重试补上失败的那天
+    assert [c[1] for c in env["calls"]] == [dates[8], dates[10], dates[9]]
 
 
 def test_review_waits_when_started_together_with_settle(env, monkeypatch, tmp_path):
@@ -13897,7 +13936,6 @@ from __future__ import annotations
 import time as _time
 from datetime import datetime
 
-from agents import playbook
 from agents import review as review_agent
 from jobs import common
 
@@ -13908,7 +13946,8 @@ MAX_BACKFILL = 3        # 最多复盘这么多个交易日（含当天）：结
 
 
 def pending_reviews(store, calendar, last) -> list:
-    """last 及之前共 MAX_BACKFILL 个交易日里已结算、还没复盘的日子（遇到未结算的日子就停），按日期升序。"""
+    """last 及之前共 MAX_BACKFILL 个交易日里已结算、还没复盘的日子（遇到未结算的日子就停），按日期升序。
+    更早漏掉的日子不再补（日报只是记录，LLM 复盘只做最近一天）。"""
     days, d = [], last
     for _ in range(MAX_BACKFILL):
         if not store.job_done("settle", d):
@@ -13945,20 +13984,11 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         common.log.info("skip review %s (already ok)", last)
         return True
     llm = common.make_llm(settings, store)
-    release: str | None | bool = True
-    if len(days) > 1 or days[-1] != last:
-        # 回补：先逐日检查发布窗口、再按最近一天决定是否发布，都在写任何一天的 lesson 之前：
-        # 回补期间新写的规则没有前向模拟过，不能随这次发布上线
-        for d in days[:-1]:
-            playbook.reset_window_if_degraded(store, d)
-        release = playbook.maybe_release(store, days[-1], calendar)
-    for d in days:
-        msg = release if d == days[-1] else None
-        if not common.run_job("review", d, lambda d=d, msg=msg: review_agent.run_review(
-                d, settings, store, llm, cache, notifier, calendar, latest=(d == last), release=msg),
-                store, notifier):
-            return False  # 按日期顺序：这一天失败就停下，下次重试从这一天接着补
-    return True
+    ok = True
+    for d in days:  # 较早的日子只补发日报（不调用 LLM），最近一天照常复盘；某天失败不挡住其余日子
+        ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
+            d, settings, store, llm, cache, notifier, calendar, backfill=(d != last)), store, notifier) and ok
+    return ok
 
 
 if __name__ == "__main__":
@@ -14166,6 +14196,14 @@ def test_unexplained_ex_gap_does_not_alert_stop():
     assert len(out) == 1 and "触发止损" in out[0]
 
 
+def test_ex_rights_on_resumption_after_suspension():
+    store = make_store(("600001", 9.3, 11.0))
+    store.record_nav("h:active", date(2026, 10, 15), 100_000.0)  # 上一交易日已结算：600001 只是停牌
+    stale = RawDivCache({}, (date(2026, 10, 12), 10.0))  # 停牌前最后的收盘；复牌当天 10 转 10，记录还没到
+    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), stale, CAL)
+    assert len(out) == 1 and "疑似除权" in out[0] and "触发止损" not in out[0]
+
+
 def test_stale_raw_close_is_not_taken_for_ex_rights():
     store = make_store(("600001", 9.0, 11.0))
     stale = RawDivCache({}, (date(2026, 10, 14), 10.0))  # 缓存停在前天：昨天正常跌 5% 不能当成除权
@@ -14256,13 +14294,14 @@ def _levels(pos, acc, cache, d: date) -> tuple[float, float]:
     return stop, target
 
 
-def _unexplained_ex(code: str, prev: float, cache, d: date, calendar) -> str:
-    """报价的参考昨收比上一交易日的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
-    缓存里最近的不复权收盘不是上一交易日的（前一天没结算到这只）时不判断：正常的大跌不能当成除权。"""
+def _unexplained_ex(code: str, prev: float, cache, d: date, calendar, settled_prev: bool = False) -> str:
+    """报价的参考昨收比缓存里最近的不复权收盘低 BIG_EX_GAP 以上、又没有对应的分红记录时，返回说明。
+    最近的不复权收盘不是上一交易日的：上一交易日已结算（这只是停牌，复牌当天可能就是除权日）时照常判断；
+    还没结算（数据没更新，正常的大跌不能当成除权）时不判断。"""
     if cache is None or calendar is None or not prev > 0 or not hasattr(cache, "last_raw_close"):
         return ""
     last = cache.last_raw_close(code, d - timedelta(days=1))
-    if last is None or last[0] != calendar.prev_day(d) or prev >= last[1] * (1 - BIG_EX_GAP):
+    if last is None or (last[0] != calendar.prev_day(d) and not settled_prev) or prev >= last[1] * (1 - BIG_EX_GAP):
         return ""
     if any(last[0] < ex <= d for ex, _, _ in cache.dividends(code)):
         return ""
@@ -14281,6 +14320,8 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
     key = f"monitor_sent:{d.isoformat()}"
     sent = set(store.kv_get(key) or [])
     out, dirty = [], False
+    last_nav = store.last_nav_date(ACCOUNT)
+    settled_prev = calendar is not None and last_nav is not None and last_nav >= calendar.prev_day(d)
     for code, pos in acc.positions.items():
         if pos.exit_date <= d:  # 到期的持仓开盘已按到期卖出，盘中不再提醒止损、止盈
             continue
@@ -14296,7 +14337,7 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
             continue
         events = []
         stop, target = _levels(pos, acc, cache, d)
-        unexplained = _unexplained_ex(code, prev, cache, d, calendar)
+        unexplained = _unexplained_ex(code, prev, cache, d, calendar, settled_prev)
         if unexplained:  # 结算在等分红记录（疑似送转）：止损止盈没有换算，按旧价位判断会误报
             events.append(("疑似除权", unexplained))
         elif last <= stop:
@@ -14353,7 +14394,7 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_monitor.py -v
 ```
-预期：11 passed。
+预期：12 passed。
 
 **Manual smoke step（交易时段，联网）：** `uv run python -c "from jobs import common, monitor; s, st, c, _, _, n = common.context(); print(monitor.check_once(common.today(), st, c, n))"`，预期打印列表（无持仓时为 `[]`），且无异常；可再执行 `uv run python -c "from data.akshare_client import AkClient; print(AkClient().spot().columns.tolist())"` 确认 `high` 列存在（缺失时炸板判断自动跳过）。
 
@@ -14740,7 +14781,7 @@ git commit -m "test: end-to-end replay of two trading days, relay outage and log
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 112 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 43、`test_jobs_entrypoints.py` 30、`test_jobs_monitor.py` 11、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 720 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 113 个测试：`test_jobs_common.py` 14、`test_jobs_bootstrap.py` 7、`test_jobs_settle.py` 43、`test_jobs_entrypoints.py` 30、`test_jobs_monitor.py` 12、`test_install_tasks.py` 4、`test_e2e.py` 3；全部测试共 724 个。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
 **Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
