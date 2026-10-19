@@ -89,7 +89,12 @@ def decide(store: Store, today: date, calendar: TradingCalendar) -> list[Event]:
                 worst = (ann, s)
         if worst:
             ann, s = worst
-            store.set_status(inc, "shadow", today)
+            # decide 在当天结算之后运行，当天仍是现任时期：影子期从下一交易日算起
+            try:
+                since = calendar.next_day(today)
+            except ValueError:  # 日历末端
+                since = today
+            store.set_status(inc, "shadow", since)
             store.set_status(s, "incumbent", today)
             return [Event("demote", inc, f"近 {DEMOTE_WINDOW} 日落后 {s} 年化 {-ann:.2%}，降为影子"),
                     Event("promote", s, f"接替被降级的 {inc}")]

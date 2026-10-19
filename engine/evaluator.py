@@ -70,14 +70,15 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
     trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
     if gate_pass:
+        interrupted = False
         try:
             ho = bt("holdout").metrics
             holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
                                 and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
-        except KeyboardInterrupt:
-            raise
-        except BaseException:  # noqa: BLE001 - 含 SystemExit；只记未通过，异常文本可能带出留出期数值，不外传
-            holdout_pass = False
+        except BaseException as e:  # noqa: BLE001 - 任何异常只记未通过：异常文本可能带出留出期数值，不外传
+            holdout_pass, interrupted = False, isinstance(e, KeyboardInterrupt)
         store.set_trial_holdout(trial_id, holdout_pass)
+        if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
+            raise KeyboardInterrupt from None
     return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr, gate_pass=gate_pass,
                       holdout_pass=holdout_pass, n_trials=store.trial_count())

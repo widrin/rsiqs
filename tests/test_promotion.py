@@ -190,3 +190,63 @@ def test_demotion_picks_the_shadow_incumbent_lags_most(monkeypatch):
     _record(store, "q:strong", vals)
     events = pr.decide(store, DAYS[-1], CAL)
     assert [(e.kind, e.strategy) for e in events] == [("demote", "old"), ("promote", "strong")]
+
+
+def test_demoted_incumbent_shadow_period_starts_next_day(monkeypatch):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    cal = TradingCalendar(DAYS + [d.date() for d in pd.bdate_range(IDX[-1] + pd.Timedelta(days=1), periods=5)])
+    store = _setup(cand_daily=0.0005, inc_daily=0.0)
+    assert [e.kind for e in pr.decide(store, DAYS[-1], cal)] == ["demote", "promote"]
+    assert store.status_since("old") == cal.next_day(DAYS[-1])
+    nav = pr._shadow_nav(store, "old", DAYS[-1], cal)
+    assert list(nav.index) == [IDX[-1]]  # 只有基线，还没有影子期的收益日
+
+
+def _steady(store, name, excess_daily, noise, status="shadow"):
+    """现任 q:old 为 0 收益加交替噪声；name 在其上叠加每日 excess_daily 和独立的交替噪声 noise。"""
+    if store.get_status("old") is None:
+        store.set_status("old", "incumbent", DAYS[0])
+        _record(store, "q:old", _nav(0.0, noise=0.002))
+    store.set_status(name, status, DAYS[0])
+    base = _nav(0.0, noise=0.002)
+    rets = [base[0] / 100 - 1] + [base[i] / base[i - 1] - 1 for i in range(1, len(base))]
+    v, vals = 100.0, []
+    for i, r in enumerate(rets):
+        v *= 1 + r + excess_daily + (noise if i % 3 == 0 else -noise / 2)
+        vals.append(v)
+    _record(store, f"q:{name}", vals)
+
+
+@pytest.mark.parametrize("excess,noise,promoted", [
+    (0.0003, 0.0, True),      # 年化约 7.6%，t 很大
+    (0.00016, 0.0, False),    # 年化约 4%：不到 5%，t 再大也不晋升
+    (0.00024, 0.0, True),     # 年化约 6%
+    (0.0003, 0.02, False),    # 同样的超额、噪声很大：t < 1.5，不晋升
+])
+def test_promotion_needs_both_excess_and_significance(excess, noise, promoted):
+    store = Store(":memory:")
+    _steady(store, "new", excess, noise)
+    events = pr.decide(store, DAYS[-1], CAL)
+    assert any(e.kind == "promote" and e.strategy == "new" for e in events) is promoted
+
+
+@pytest.mark.parametrize("lag,demoted", [(-0.00016, False), (-0.00024, True)])
+def test_demotion_excess_threshold(monkeypatch, lag, demoted):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    # 现任落后影子：影子每日比现任多 -lag
+    _steady(store, "new", -lag, 0.0001)
+    kinds = [e.kind for e in pr.decide(store, DAYS[-1], CAL)]
+    assert (kinds[:1] == ["demote"]) is demoted
+
+
+@pytest.mark.parametrize("points,demoted", [(40, False), (41, True)])
+def test_demotion_window_boundary(monkeypatch, points, demoted):
+    monkeypatch.setattr(pr, "PROMOTE_T", 1e9)
+    store = Store(":memory:")
+    store.set_status("old", "incumbent", DAYS[0])
+    _record(store, "q:old", _nav(0.0, noise=0.0002))
+    store.set_status("new", "shadow", DAYS[len(DAYS) - points + 1])  # 影子期净值点数 = points
+    _record(store, "q:new", _nav(0.001, noise=0.0004))  # 噪声不同：超额不恒定，t 值有限
+    assert len(pr._shadow_nav(store, "new", DAYS[-1], CAL)) == points
+    assert bool(pr.decide(store, DAYS[-1], CAL)) is demoted

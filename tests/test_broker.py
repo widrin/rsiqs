@@ -293,10 +293,18 @@ def test_unreliable_band_ordinary_day_trades():
     assert f3.reason == "到期" and f3.price == pytest.approx(13.4 * (1 - SLIP))
 
 
-def test_unreliable_band_open_at_high_counts_as_sealed_limit_up():
-    # the open beyond the computed limit-up is also the day's high: treated as opening sealed
+@pytest.mark.parametrize("h,l,c", [(1.70, 1.62, 1.66), (1.78, 1.68, 1.76)])
+def test_unreliable_band_buy_decision_ignores_the_rest_of_the_day(h, l, c):
+    # same +13% open beyond the computed limit-up 1.65: whether it later fades (open == high) or keeps
+    # rising must not decide the buy, otherwise the day's later path leaks into the decision
     acc = Account("t", 100_000.0)
-    assert run(acc, [bar(o=1.70, h=1.70, l=1.62, c=1.66, pc=1.50)],
+    f = run(acc, [bar(o=1.70, h=h, l=l, c=c, pc=1.50)], [pick(entry_max=1.75, stop=1.55, target=1.90)])[0]
+    assert f.side == "BUY" and f.price == pytest.approx(1.70 * (1 + SLIP))
+
+
+def test_unreliable_band_one_price_open_is_sealed_limit_up():
+    acc = Account("t", 100_000.0)
+    assert run(acc, [bar(o=1.70, h=1.70, l=1.70, c=1.70, pc=1.50)],
                [pick(entry_max=1.75, stop=1.55, target=1.90)]) == []
 
 

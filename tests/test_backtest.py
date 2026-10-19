@@ -189,6 +189,22 @@ def test_strategy_never_receives_data_after_segment_end():
 def test_day_bars_matches_bars_for_day():
     panel = _panel()
     panel["600002"] = panel["600002"].drop(IDX[4])
+    for i, (code, df) in enumerate(panel.items()):  # 开高低收、量、额各不相同，列序错了才测得出来
+        df = df.copy()
+        df["open"] = df["close"] * (1 + 0.003 * (i + 1))
+        df["high"] = df[["open", "close"]].max(axis=1) * 1.02
+        df["low"] = df[["open", "close"]].min(axis=1) * 0.98
+        df["volume"] = range(1000, 1000 + len(df))
+        df["amount"] = df["volume"] * 7.0
+        panel[code] = df
     index = DayBars(panel, NAMES)
     for d in DAYS + [date(2030, 1, 1)]:
         assert index.get(d) == bars_for_day(panel, NAMES, d)
+
+
+def test_benchmark_counts_first_day():
+    bench = pd.Series(100.0, index=IDX)
+    bench[IDX[2]:] = 110.0  # 基准只在 start 当天上涨 10%，之后横盘
+    res = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[10], bench, capital=100_000, max_picks=1)
+    flat = run_backtest(BuyOnce(), _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH, capital=100_000, max_picks=1)
+    assert res.metrics["excess_ann"] == pytest.approx(flat.metrics["excess_ann"] - 0.1 / 9 * 252)

@@ -153,3 +153,10 @@ def test_trial_holdout_update_and_last_trial(store):
     t = store.last_trial("a")
     assert t["id"] == tid and t["gate_pass"] is True and t["holdout_pass"] is True
     assert store.recent_trials(2)[1]["holdout_pass"] is True
+
+
+def test_void_trial(store):
+    tid = store.add_trial("a", {}, 1.0, 1.2, True, True)
+    store.void_trial(tid)
+    t = store.last_trial("a")
+    assert t["gate_pass"] is False and t["holdout_pass"] is False and store.trial_count() == 1

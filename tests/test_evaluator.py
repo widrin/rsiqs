@@ -158,10 +158,17 @@ def test_holdout_gate_conditions(monkeypatch, over, passed):
     assert rep.gate_pass is True and rep.holdout_pass is passed
 
 
-@pytest.mark.parametrize("exc", [RuntimeError("holdout_return=0.4451"), SystemExit(0), KeyError("x")])
+@pytest.mark.parametrize("exc", [RuntimeError("holdout_return=0.4451"), SystemExit(0), KeyError("x"),
+                                 KeyboardInterrupt("holdout_return=0.4451")])
 def test_holdout_failure_is_a_counted_fail_without_details(monkeypatch, exc):
     _patched(monkeypatch, holdout_raises=exc)
     store = Store(":memory:")
+    if isinstance(exc, KeyboardInterrupt):  # 真正的 Ctrl+C 照样中断，但抛出的是不带消息的新异常
+        with pytest.raises(KeyboardInterrupt) as info:
+            ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
+        assert str(info.value) == "" and info.value.__context__ is None and info.value.__cause__ is None
+        assert store.last_trial("winner")["holdout_pass"] is False
+        return
     rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
     assert rep.gate_pass is True and rep.holdout_pass is False
     assert store.trial_count() == 1 and store.last_trial("winner")["holdout_pass"] is False
@@ -175,10 +182,15 @@ class Crasher:
         raise ValueError("boom")
 
 
-def test_failed_train_val_run_still_counts_as_trial():
+@pytest.mark.parametrize("exc", [ValueError("boom"), SystemExit(0), KeyboardInterrupt()])
+def test_failed_train_val_run_still_counts_as_trial(exc):
+    class Raiser(Crasher):
+        def select(self, view):
+            raise exc
+
     store = Store(":memory:")
-    with pytest.raises(ValueError, match="boom"):
-        ev.evaluate(Crasher(), "crasher", _panel(), NAMES, CAL, BENCH, store, {"p": 2}, splits=SPL)
+    with pytest.raises(type(exc)):
+        ev.evaluate(Raiser(), "crasher", _panel(), NAMES, CAL, BENCH, store, {"p": 2}, splits=SPL)
     t = store.last_trial("crasher")
     assert store.trial_count() == 1
     assert t["gate_pass"] is False and t["holdout_pass"] is None and t["params"] == {"p": 2}
