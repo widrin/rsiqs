@@ -3,7 +3,8 @@ from datetime import date
 
 import pytest
 
-from engine.ledger import Account, InsufficientCash, NotAvailable
+from engine.ledger import Account, InsufficientCash, NotAvailable, ex_rights_price
+from engine.rules import DIVIDEND_TAX_RATE
 
 D1, D2, EXIT = date(2026, 10, 15), date(2026, 10, 16), date(2026, 10, 22)
 
@@ -127,3 +128,65 @@ def test_fees_follow_trade_date():
     assert acc.trades[-1].fee == 63.0  # 50000: 12.5 + 0.5 + stamp 0.1%
     acc.sell(date(2023, 8, 28), "600000", 10.0, 5_000, "x")
     assert acc.trades[-1].fee == 38.0  # 50000: 12.5 + 0.5 + stamp 0.05%
+
+
+EX = date(2026, 10, 19)
+
+
+def test_ex_rights_price():
+    assert ex_rights_price(20.0, 0.0, 0.5) == pytest.approx(13.3333333)  # 10 转 5
+    assert ex_rights_price(10.0, 0.3, 0.0) == pytest.approx(9.7)           # 10 派 3
+    assert ex_rights_price(10.0, 0.3, 0.2) == pytest.approx(9.7 / 1.2)
+    assert ex_rights_price(0.2, 0.5, 0.0) == 0.01  # 价格不会变成负数
+
+
+def test_apply_cash_dividend_and_bonus_shares():
+    acc = _bought()  # 1000 股，成本含费，止损 9.3，止盈 11.0
+    cash0, cost0 = acc.cash, acc.positions["600000"].cost
+    act = acc.apply_dividend(EX, "600000", cash_per_share=0.3, share_ratio=0.5)
+    pos = acc.positions["600000"]
+    net = round(1000 * 0.3 * (1 - DIVIDEND_TAX_RATE), 2)
+    assert act == {"date": EX.isoformat(), "code": "600000", "cash_per_share": 0.3, "share_ratio": 0.5,
+                   "qty_before": 1000, "qty_after": 1500, "cash": net}
+    assert acc.cash == pytest.approx(cash0 + net) and net == 240.0
+    assert pos.qty == 1500
+    assert pos.stop == pytest.approx((9.3 - 0.3) / 1.5) and pos.target == pytest.approx((11.0 - 0.3) / 1.5)
+    assert pos.cost == pytest.approx((cost0 * 1000 - net) / 1500)
+    assert acc.corporate_actions == [act]
+
+
+def test_apply_dividend_is_idempotent_and_ignores_unknown_code():
+    acc = _bought()
+    assert acc.apply_dividend(EX, "000001", 0.3, 0.0) is None
+    acc.apply_dividend(EX, "600000", 0.3, 0.0)
+    snapshot = acc.to_dict()
+    assert acc.apply_dividend(EX, "600000", 0.3, 0.0) is None  # 同一事件不重复调整
+    assert acc.to_dict() == snapshot
+
+
+def test_bonus_shares_round_down_and_keep_t_plus_1_lock():
+    acc = Account("t", 100_000.0)
+    acc.buy(D1, "600000", "浦发银行", 10.0, 1900, 9.3, 11.0, EXIT, "test")
+    acc.apply_dividend(D1, "600000", 0.0, 0.3)  # 1900 * 1.3 = 2470（浮点误差不能变成 2469）
+    pos = acc.positions["600000"]
+    assert pos.qty == 2470 and pos.available == 0
+    acc.start_day(D2)
+    assert pos.available == 2470
+
+
+@pytest.mark.parametrize("cash,ratio", [(-0.1, 0.0), (0.0, -0.1), (float("nan"), 0.0), (0.0, float("inf")),
+                                        (0.0, 0.0)])
+def test_apply_dividend_rejects_bad_values(cash, ratio):
+    acc = _bought()
+    with pytest.raises(ValueError):
+        acc.apply_dividend(EX, "600000", cash, ratio)
+
+
+def test_corporate_actions_roundtrip_and_old_data():
+    acc = _bought()
+    acc.apply_dividend(EX, "600000", 0.3, 0.5)
+    restored = Account.from_dict(json.loads(json.dumps(acc.to_dict())))
+    assert restored == acc
+    d = _bought().to_dict()
+    del d["corporate_actions"]
+    assert Account.from_dict(d).corporate_actions == []

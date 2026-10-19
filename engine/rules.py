@@ -110,6 +110,8 @@ TRANSFER_RATE = 0.00001  # from TRANSFER_CUT_FROM
 TRANSFER_RATE_OLD = 0.00002
 STAMP_RATE = 0.0005  # from STAMP_CUT_FROM, sell side only
 STAMP_RATE_OLD = 0.001
+# 财税〔2015〕101 号：持股 1 个月以内，股息红利所得全额计税，税率 20%。模拟盘持仓都很短，一律按此扣税
+DIVIDEND_TAX_RATE = 0.20
 
 
 def calc_fee(side: str, amount: float, d: date | None = None) -> float:
