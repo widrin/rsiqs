@@ -13,7 +13,7 @@ from dataclasses import replace
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from agents import playbook
 from agents.llm import LLM
@@ -41,6 +41,8 @@ SPOT_TIMEOUT = 40.0      # run_final 等待竞价快照的上限（秒），超�
 KINDS = ("active", "candidate")
 NOTE_UNCONFIRMED = "（竞价二次确认未完成，按盘前条件过滤）"
 NOTE_NONE_PASSED = "（竞价条件均未满足，今日不推荐）"
+NOTE_ALL_VETOED = "（盘前分析全部否决，今日不推荐）"
+MIN_ANALYZE_SECONDS = 120.0  # 离截止不到这么多秒就不再发起深度分析
 SPOT_MISSING = "（竞价数据缺失：未取到竞价快照，以下股票未经竞价条件检查，请依据盘前分析判断，并在 note 中注明）"
 
 
@@ -54,6 +56,15 @@ class PlannedPick(BaseModel):
     min_gap_pct: float
     max_gap_pct: float
     reason: str
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _unit_interval(cls, v):
+        """提示词要求 0~1；模型偶尔写成百分数（85）或越界：统一换算并截断，免得排序被打乱。"""
+        v = float(v)
+        if 1.0 < v <= 100.0:
+            v /= 100.0
+        return min(max(v, 0.0), 1.0)
 
 
 class PremarketPlan(BaseModel):
@@ -288,6 +299,9 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
     """为每只候选给出 keep/veto、价位与竞价条件，存入 kv。任何异常都记录日志并返回 None。"""
     try:
         cands, ctx = _load_candidates(d, store)
+        if not cands:  # 策略当天一只都没选出来：不花深度分析的钱
+            log.info("premarket analyze %s: no candidates", playbook_kind)
+            return None
         raw = llm.parse(purpose=f"analyze:{playbook_kind}", system=playbook.load_prompt("premarket"),
                         user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx), schema=PremarketPlan,
                         effort="high", timeout=timeout, max_budget_usd=1.5, essential=True)
@@ -310,10 +324,20 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
     return plan
 
 
-def run_analyze(d: dt.date, settings: Settings, store: Store, llm: LLM) -> dict[str, bool]:
-    """两套 playbook 各一个线程并发分析，返回 {"active": ok, "candidate": ok}。"""
+def run_analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, deadline: dt.datetime | None = None,
+                now: dt.datetime | None = None) -> dict[str, bool]:
+    """两套 playbook 各一个线程并发分析，返回 {"active": ok, "candidate": ok}。
+
+    deadline（墙钟时刻）给出时，单次超时取 ANALYZE_TIMEOUT 与剩余秒数的较小者，剩余不到 MIN_ANALYZE_SECONDS
+    就不发起：开机晚、补跑扫描时，分析不能拖到 09:25 定稿之后。"""
+    timeout = ANALYZE_TIMEOUT
+    if deadline is not None:
+        timeout = min(ANALYZE_TIMEOUT, (deadline - (now or dt.datetime.now())).total_seconds())
+        if timeout < MIN_ANALYZE_SECONDS:
+            log.warning("premarket analyze skipped: only %.0fs left before %s", timeout, deadline.time())
+            return {k: False for k in KINDS}
     with cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="analyze") as pool:
-        futures = {k: pool.submit(analyze, d, settings, store, llm, k) for k in KINDS}
+        futures = {k: pool.submit(analyze, d, settings, store, llm, k, timeout) for k in KINDS}
         return {k: fut.result() is not None for k, fut in futures.items()}
 
 
@@ -366,8 +390,9 @@ def _ex_adjust(cands: list[Pick], plan: PremarketPlan | None, ctx: dict, spot: p
     if not factor:
         return cands, plan
 
-    def scaled(obj, k):
-        return {"entry_max": obj.entry_max * k, "stop": obj.stop * k, "target": obj.target * k}
+    def scaled(obj, k):  # 舍入到分：推送显示的价位与过滤、撮合用的价位一致
+        return {"entry_max": round(obj.entry_max * k, 2), "stop": round(obj.stop * k, 2),
+                "target": round(obj.target * k, 2)}
 
     cands = [replace(p, **scaled(p, factor[p.code])) if p.code in factor else p for p in cands]
     if plan is not None:
@@ -397,7 +422,8 @@ def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pic
         return cands[: settings.max_picks], False, ""
     prelim = auction_filter(plan, cands, spot)[: settings.max_picks]
     if not prelim:
-        return [], True, plan.market_view + NOTE_NONE_PASSED
+        vetoed_all = not any(pp.action == "keep" for pp in plan.picks)
+        return [], True, plan.market_view + (NOTE_ALL_VETOED if vetoed_all else NOTE_NONE_PASSED)
     return prelim, True, plan.market_view + NOTE_UNCONFIRMED
 
 
@@ -426,6 +452,14 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
         log.info("premarket auction %s vetoed %s", playbook_kind, [p.code for p in prelim if p.code in vetoed])
     note = check.note.strip()
     return picks, True, plan.market_view + (f"（竞价确认：{note}）" if note else "")
+
+
+def _playbook_version(kind: str) -> int | None:
+    try:  # 只为记录版本号：playbook 文件出问题也不能耽误 09:28 前推送
+        return int(playbook.load(kind).get("version", 1))
+    except Exception:  # noqa: BLE001
+        log.exception("playbook %s unreadable", kind)
+        return None
 
 
 def _fetch_spot(client: AkClient, timeout: float, codes: list[str]) -> pd.DataFrame:
@@ -475,7 +509,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
         pool.shutdown(wait=False, cancel_futures=True)  # 超时的线程留在后台跑完，结果丢弃
     for kind, (picks, reviewed, view) in results.items():
         meta = {"llm_reviewed": reviewed, "market_view": view,
-                "playbook_version": int(playbook.load(kind).get("version", 1)),
+                "playbook_version": _playbook_version(kind),
                 "ref_close": _ref_close(picks, ctx, spot)}  # 结算据此判断价位是否需要按除权换算
         store.save_recommendation(d, f"h:{kind}", picks, meta)
     picks, reviewed, view = results["active"]

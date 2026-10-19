@@ -74,10 +74,10 @@ def test_caps_drop_oldest():
     assert "r1" not in [r["id"] for r in pb["rules"]]
     assert pb["rules"][-1]["text"] == "新规则"
 
-    big = [L("add", "长" * 2500, evidence="e") for _ in range(3)]
+    big = [L("add", "长" * playbook.MAX_RULE_CHARS, evidence="e") for _ in range(20)]  # 20 × 301 字 > 6000
     pb = playbook.apply_lessons({"version": 1, "created": "x", "rules": []}, big, TODAY)
     assert sum(len(r["text"]) + len(r["evidence"]) for r in pb["rules"]) <= playbook.MAX_CHARS
-    assert [r["id"] for r in pb["rules"]] == ["r2", "r3"]
+    assert [r["id"] for r in pb["rules"]] == [f"r{i}" for i in range(2, 21)]
 
 
 def _rules(*texts):
@@ -101,6 +101,28 @@ def test_maybe_release_first_call_starts_window(pbdir, cal):
     store = Store(":memory:")
     assert playbook.maybe_release(store, TODAY, cal) is None
     assert store.kv_get("playbook_released") == TODAY.isoformat()
+
+
+@pytest.mark.parametrize("gap,released", [(playbook.MIN_DAYS_BETWEEN_RELEASES - 1, False),
+                                          (playbook.MIN_DAYS_BETWEEN_RELEASES, True)])
+def test_maybe_release_window_boundary(pbdir, cal, gap, released):
+    start = cal.between(dt.date(2026, 8, 3), TODAY)[-(gap + 1)]  # 从 start 到 TODAY 相隔 gap 个交易日
+    store = _setup_release(pbdir, cal, 1.05, 1.01, start=start)
+    assert bool(playbook.maybe_release(store, TODAY, cal)) is released
+
+
+def test_save_is_atomic_and_load_survives_corruption(pbdir):
+    playbook.save("candidate", {"version": 3, "created": "x", "rules": _rules("a")})
+    assert not list(pbdir.glob("*.tmp"))
+    (pbdir / "candidate.json").write_text('{"version": 1, "rules": [', encoding="utf-8")
+    pb = playbook.load("candidate")  # 损坏时退回空 playbook，不让盘前和复盘整体失败
+    assert pb["rules"] == []
+
+
+def test_long_lesson_is_truncated_not_wiping_rules():
+    pb = {"version": 1, "rules": [{"id": f"r{i}", "text": "旧" * 10, "evidence": "e", "created": "x"} for i in range(10)]}
+    out = playbook.apply_lessons(pb, [L("add", text="长" * 6001)], TODAY)
+    assert len(out["rules"]) == 11 and len(out["rules"][-1]["text"]) == playbook.MAX_RULE_CHARS
 
 
 def test_maybe_release_too_early(pbdir, cal):

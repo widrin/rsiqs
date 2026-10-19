@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -13,12 +15,15 @@ import pandas as pd
 from engine.calendar import TradingCalendar
 from engine.store import Store
 
+log = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parent.parent
 PLAYBOOK_DIR = ROOT / "playbook"
 KINDS = ("active", "candidate")
 MAX_RULES = 30
 MAX_CHARS = 6000
 MIN_DAYS_BETWEEN_RELEASES = 10
+MAX_RULE_CHARS = 300  # 单条规则的 text、evidence 各自的上限：一条超长规则不能挤掉其余规则
 RELEASE_KEY = "playbook_released"
 TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
@@ -30,16 +35,32 @@ def _path(kind: str) -> Path:
 
 
 def load(kind: str) -> dict:
+    """读取 playbook；文件缺失或损坏（写到一半断电、手工编辑出错）时退回空 playbook 并记日志，
+    盘前和复盘照常运行，只是不带规则。"""
     p = _path(kind)
+    empty = {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
     if not p.exists():
-        return {"version": 1, "created": dt.date.today().isoformat(), "rules": []}
-    return json.loads(p.read_text(encoding="utf-8"))
+        return empty
+    try:
+        pb = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(pb, dict) or not isinstance(pb.get("rules", []), list):
+            raise ValueError("playbook 格式不对")
+        return pb
+    except (ValueError, OSError):
+        log.exception("playbook %s 损坏，按空 playbook 处理：%s", kind, p)
+        return empty
 
 
 def save(kind: str, pb: dict) -> None:
+    """先写临时文件再原子替换：写到一半中断时，原文件保持完整。"""
     p = _path(kind)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(pb, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(pb, ensure_ascii=False, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
 
 
 def load_prompt(name: str) -> str:
@@ -67,8 +88,8 @@ def apply_lessons(pb: dict, lessons: list, today: dt.date) -> dict:
     out = copy.deepcopy(pb)
     rules: list[dict] = out.setdefault("rules", [])
     for les in lessons:
-        evidence = (les.evidence or "").strip()
-        text = (les.text or "").strip()
+        evidence = (les.evidence or "").strip()[:MAX_RULE_CHARS]
+        text = (les.text or "").strip()[:MAX_RULE_CHARS]
         if not evidence:
             continue
         idx = next((i for i, r in enumerate(rules) if r["id"] == les.rule_id), None)

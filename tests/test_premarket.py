@@ -261,6 +261,70 @@ def test_run_analyze_runs_both_kinds_concurrently(store):
     assert "ACTIVE规则" in users["analyze:active"] and "CANDIDATE规则" in users["analyze:candidate"]
 
 
+def test_analyze_skips_llm_when_no_candidates():
+    s = Store(":memory:")
+    s.save_candidates(D, [], CTX)
+    llm = FakeLLM({})
+    assert premarket.run_analyze(D, settings(), s, llm) == {"active": False, "candidate": False}
+    assert llm.calls == []  # 没有候选就不花深度分析的钱
+
+
+def test_run_analyze_timeout_capped_by_deadline(store):
+    llm = FakeLLM({"analyze:active": plan(pp("600001")), "analyze:candidate": plan(pp("600002"))})
+    now = dt.datetime.combine(D, dt.time(9, 15))
+    premarket.run_analyze(D, settings(), store, llm, deadline=dt.datetime.combine(D, dt.time(9, 22)), now=now)
+    assert {c["timeout"] for c in llm.calls} == {420.0}  # 离截止还有 7 分钟，不再给满 900 秒
+    llm2 = FakeLLM({})
+    late = dt.datetime.combine(D, dt.time(9, 21, 30))
+    assert premarket.run_analyze(D, settings(), store, llm2, deadline=dt.datetime.combine(D, dt.time(9, 22)),
+                                 now=late) == {"active": False, "candidate": False}
+    assert llm2.calls == []  # 剩余时间不够一次分析：不发起
+
+
+def test_confidence_normalized_to_unit_interval():
+    assert pp("600001", conf=85).confidence == pytest.approx(0.85)  # 百分数
+    assert pp("600001", conf=-1).confidence == 0.0 and pp("600001", conf=1.0).confidence == 1.0
+
+
+def test_all_vetoed_note_differs_from_auction_failure(store):
+    p = plan(pp("600001", "veto", 0.0), pp("600002", "veto", 0.0))
+    picks, reviewed, view = premarket._rule_result(settings(), p, CANDS, FakeAk().spot())
+    assert picks == [] and reviewed is True and view.endswith(premarket.NOTE_ALL_VETOED)
+
+
+def test_ex_adjusted_prices_rounded_to_cents(store):
+    cands, _ = premarket._ex_adjust(CANDS, None, {"stats": {c: {"prev_close": 10.0} for c in CODES}},
+                                    FakeAk(prevs={"600001": 9.80}).spot())
+    p = next(x for x in cands if x.code == "600001")
+    assert (p.entry_max, p.stop, p.target) == (round(10.3 * 0.98, 2), round(9.3 * 0.98, 2), round(11.0 * 0.98, 2))
+
+
+def test_small_dividend_triggers_conversion_but_one_cent_does_not():
+    ctx = {"stats": {c: {"prev_close": 10.0} for c in CODES}}
+    small, _ = premarket._ex_adjust(CANDS, None, ctx, FakeAk(prevs={"600001": 9.70}).spot())  # 派息 0.30
+    tiny, _ = premarket._ex_adjust(CANDS, None, ctx, FakeAk(prevs={"600001": 9.99}).spot())   # 舍入差异
+    assert next(x for x in small if x.code == "600001").stop == round(9.3 * 0.97, 2)
+    assert next(x for x in tiny if x.code == "600001").stop == 9.3
+
+
+def test_run_final_time_limits(store, monkeypatch):
+    save_plan(store, "active", plan(pp("600001")))
+    seen = {}
+    monkeypatch.setattr(premarket, "_fetch_spot", lambda client, timeout, codes: seen.setdefault("spot", timeout)
+                        and FakeAk().spot(codes))
+    llm = FakeLLM({"auction:active": check({})})
+    premarket.run_final(D, settings(), store, llm, FakeAk(), Recorder(), CAL)
+    assert seen["spot"] == premarket.SPOT_TIMEOUT
+    assert all(c["timeout"] <= premarket.AUCTION_TIMEOUT for c in llm.calls)
+
+
+def test_run_final_survives_corrupt_playbook(store, pbdir):
+    (pbdir / "candidate.json").write_text("", encoding="utf-8")  # 写到一半时断电
+    n = Recorder()
+    premarket.run_final(D, settings(), store, FakeLLM({}), FakeAk(), n, CAL)
+    assert len(n.sent) == 1 and store.load_recommendation(D, "h:candidate") is not None
+
+
 def test_run_analyze_reports_each_kind(store):
     llm = FakeLLM({"analyze:active": plan(pp("600001")), "analyze:candidate": LLMError("refused")})
     assert premarket.run_analyze(D, settings(), store, llm) == {"active": True, "candidate": False}

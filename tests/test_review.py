@@ -175,6 +175,30 @@ def test_review_release_message_is_pushed_and_committed(env, monkeypatch):
                                "playbook: 2026-10-16 playbook v2 上线：测试")]
 
 
+def test_release_happens_before_todays_lessons(env, monkeypatch):
+    order = []
+    monkeypatch.setattr(playbook, "maybe_release", lambda store, today, calendar: order.append("release"))
+    real = playbook.apply_lessons
+    monkeypatch.setattr(playbook, "apply_lessons", lambda *a, **k: order.append("lessons") or real(*a, **k))
+    run(env, FakeLLM(OUTPUT))
+    assert order == ["release", "lessons"]  # 当天新写的规则没有前向模拟过，不能随这次发布上线
+
+
+def test_commit_counts_only_effective_changes(env):
+    from agents.review import Lesson
+    out = ReviewOutput(summary="s", lessons=[Lesson(action="add", rule_id="", text="新", evidence="2026-10-16 600001"),
+                                             Lesson(action="remove", rule_id="r99", text="", evidence="e")])
+    run(env, FakeLLM(out))
+    assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
+
+
+def test_report_marks_accounts_without_todays_nav(env):
+    env["store"].record_nav("q:late", PREV, 500_000.0)
+    env["store"].save_account(Account(name="q:late", cash=500_000.0))
+    run(env, FakeLLM(ReviewOutput(summary="s", lessons=[])))
+    assert "q:late（今日未结算）" in env["notifier"].sent[0]
+
+
 def test_review_without_recommendations_skips_llm(env):
     store = Store(":memory:")
     for name in ACCOUNTS:
