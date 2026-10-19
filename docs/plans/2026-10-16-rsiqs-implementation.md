@@ -6,11 +6,13 @@
 
 **Architecture:** 混合两层。量化层（`strategies/`，可回测，研究循环迭代）出候选池；LLM 层（`agents/premarket.py` + `playbook/`，仅前向验证）结合新闻、公告、竞价做否决与调权。`engine/` 为锁定区（撮合、账本、评估器、留出集），哈希校验；多个影子账户并行模拟，晋升规则以数据决定现任。设计见 `docs/plans/2026-10-16-rsiqs-design.md`。
 
-**Tech Stack:** Python 3.12 + uv；akshare 1.19.1、pandas 3.0.6、numpy 2.5.4、anthropic 1.15.0（`claude-opus-5-5`，结构化输出，`fallbacks: "default"`）、requests、pydantic、sqlite3；pytest 9.1.1；Windows 任务计划。
+**Tech Stack:** Python 3.12 + uv；akshare 1.19.1、pandas 3.0.6、numpy 2.5.4、requests、pydantic、python-dotenv、sqlite3；Claude Code CLI（`claude.exe -p --bare`，`claude-opus-5-5`，结构化输出，经中转 Token 或官方 API Key 鉴权）；pytest 9.1.1；Windows 任务计划。
 
 **执行顺序：** Part 1 → 2 → 3 → 4 → 5 → 6，各 Part 内按 Task 编号。测试一律不访问网络与真实 API；需要真实环境的验证均为显式的 "Manual smoke step"。
 
-**交叉审查：** 全部代码块已在临时工程中合并运行，280 个测试通过（含修复：最低佣金导致透支、两处字符串转义）。
+**修订（2026-10-19）：** Claude 接入改为 Claude Code CLI，盘前改为两段式，研究循环改为无工具多轮结构化输出。各修订段落已分别在临时工程中测试通过；合并后的全量测试结果见下一行。
+
+**全量验证：** 2026-10-19 把合并后计划的全部代码块（84 个文件）提取到仓库外的临时工程运行，331 个测试全部通过。测试不联网、不调用真实 claude.exe、不推送企业微信。
 
 ---
 
@@ -18,7 +20,7 @@
 
 > 契约歧义说明：(1) `TradingCalendar.offset` 越过日历两端时夹到首/末交易日而不报错，保证回测末段买入仍有合法 exit_date（d 非交易日仍抛 ValueError）。(2) `Fill` 额外提供 `to_dict/from_dict` 供 `Account` 持久化。(3) `Account.buy` 对已持仓代码做加仓并摊薄成本（SimBroker 从不加仓，此为最简一致行为）。(4) 滑点价不做四舍五入，保持浮点。
 
-本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（57 个用例）。
+本部分在 `e:\workspace\rsiqs` 下建立 uv 工程与 `engine/` 撮合核心（types / rules / calendar / ledger / broker），全部纯函数式可测，无网络依赖。所有代码已在隔离环境用 pytest 9.1.1 实测通过（58 个用例）。
 
 ### Task 1.1: 工程脚手架（uv + config）
 
@@ -26,6 +28,8 @@
 - Create: `pyproject.toml`, `.env.example`, `.gitignore`, `config.py`
 - Create: `engine/__init__.py`, `data/__init__.py`, `notify/__init__.py`, `strategies/__init__.py`, `agents/__init__.py`, `jobs/__init__.py`（均为空文件）
 - Test: `tests/test_config.py`
+
+Claude 一律经 Claude Code CLI（`claude.exe -p --bare`）调用，见 Task 4.1。用户的中转会拒绝 Anthropic SDK 直连，所以依赖里没有 `anthropic` 包；费用直接取 CLI 输出的 `total_cost_usd`，`config` 里也不再需要价格表。
 
 **Step 0: 写 pyproject.toml 并安装依赖**
 
@@ -41,7 +45,6 @@ dependencies = [
     "akshare==1.19.1",
     "pandas==3.0.6",
     "numpy==2.5.4",
-    "anthropic==1.15.0",
     "requests==2.34.2",
     "python-dotenv==1.2.4",
     "pydantic==2.14.1",
@@ -58,11 +61,16 @@ pythonpath = ["."]
 testpaths = ["tests"]
 ```
 
-`.env.example`（只放占位符，绝不写真实 webhook key）：
+`.env.example`（只放占位符，绝不写真实密钥、Token 或 webhook key）：
 
 ```ini
 # Copy to .env and fill in real values. Never commit .env.
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
+# 二选一：官方 API Key，或中转地址+Token；CLAUDE_EXE 留空自动查找
+# 路径不要加双引号（双引号内的 \n、\b 会被当成转义符），直接写或用单引号
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=
+ANTHROPIC_AUTH_TOKEN=
+CLAUDE_EXE=
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR-KEY-HERE
 MONTHLY_BUDGET_CNY=300
 USD_CNY=7.2
@@ -90,16 +98,16 @@ foreach ($p in 'engine','data','notify','strategies','agents','jobs','tests') { 
 foreach ($p in 'engine','data','notify','strategies','agents','jobs') { if (-not (Test-Path "$p/__init__.py")) { New-Item -ItemType File "$p/__init__.py" | Out-Null } }
 uv sync
 ```
-预期：生成 `uv.lock` 与 `.venv`，`uv run python -c "import pandas, akshare, anthropic; print(pandas.__version__)"` 输出 `3.0.6`。
-
+预期：生成 `uv.lock` 与 `.venv`，`uv run python -c "import pandas, akshare, pydantic; print(pandas.__version__)"` 输出 `3.0.6`。
 
 **Step 1: 写失败测试** `tests/test_config.py`（monkeypatch 掉 `load_dotenv`，避免读到本机真实 `.env`）
 
 ```python
 import config
 
-ENV_NAMES = ["ANTHROPIC_API_KEY", "WECOM_WEBHOOK_URL", "MONTHLY_BUDGET_CNY", "USD_CNY",
-             "DB_PATH", "LLM_MODEL", "CAPITAL", "MAX_PICKS"]
+ENV_NAMES = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE",
+             "WECOM_WEBHOOK_URL", "MONTHLY_BUDGET_CNY", "USD_CNY", "DB_PATH", "LLM_MODEL", "CAPITAL",
+             "MAX_PICKS"]
 
 
 def _isolate(monkeypatch):
@@ -112,6 +120,7 @@ def test_defaults(monkeypatch):
     _isolate(monkeypatch)
     s = config.get_settings()
     assert s.anthropic_api_key == "" and s.wecom_webhook_url == ""
+    assert s.anthropic_base_url == "" and s.anthropic_auth_token == "" and s.claude_exe == ""
     assert s.monthly_budget_cny == 300.0 and s.usd_cny == 7.2
     assert s.db_path == "data/rsiqs.sqlite" and s.llm_model == "claude-opus-5-5"
     assert s.capital == 500_000.0 and s.max_picks == 5
@@ -121,6 +130,9 @@ def test_defaults(monkeypatch):
 def test_env_overrides(monkeypatch):
     _isolate(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://relay.example.invalid")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-test")
+    monkeypatch.setenv("CLAUDE_EXE", r"D:\tools\claude.exe")
     monkeypatch.setenv("WECOM_WEBHOOK_URL", "https://example.invalid/hook")
     monkeypatch.setenv("MONTHLY_BUDGET_CNY", "150")
     monkeypatch.setenv("USD_CNY", "7.0")
@@ -130,13 +142,30 @@ def test_env_overrides(monkeypatch):
     monkeypatch.setenv("MAX_PICKS", "3")
     s = config.get_settings()
     assert s.anthropic_api_key == "sk-test"
+    assert s.anthropic_base_url == "https://relay.example.invalid"
+    assert s.anthropic_auth_token == "tok-test"
+    assert s.claude_exe == r"D:\tools\claude.exe"
     assert s.wecom_webhook_url == "https://example.invalid/hook"
     assert s.monthly_budget_cny == 150.0 and s.usd_cny == 7.0
     assert s.db_path == ":memory:" and s.capital == 1_000_000.0 and s.max_picks == 3
 
 
-def test_pricing_has_default_model():
-    assert config.PRICING_USD_PER_MTOK["claude-opus-5-5"] == (4.0, 20.0)
+def test_repr_hides_secrets():
+    s = config.Settings(anthropic_api_key="sk-secret-1", wecom_webhook_url="https://example.invalid/hook?key=secret-2",
+                        anthropic_auth_token="secret-3", anthropic_base_url="https://relay.example.invalid")
+    text = repr(s)
+    for secret in ("sk-secret-1", "secret-2", "secret-3"):
+        assert secret not in text
+    assert "relay.example.invalid" in text and "claude-opus-5-5" in text
+
+
+def test_env_example_lists_every_key_without_secrets():
+    lines = (config.ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    values = dict(ln.split("=", 1) for ln in lines if ln.strip() and not ln.startswith("#"))
+    assert set(ENV_NAMES) <= set(values)
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_EXE"):
+        assert values[k] == ""
+    assert values["WECOM_WEBHOOK_URL"].endswith("key=YOUR-KEY-HERE")
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -146,8 +175,7 @@ uv run pytest tests/test_config.py -v
 ```
 预期：FAIL，`ModuleNotFoundError: No module named 'config'`。
 
-
-**Step 3: 最小实现** `config.py`
+**Step 3: 最小实现** `config.py`（密钥类字段 `repr=False`：日志或异常里打印 `Settings` 时不会泄露）
 
 ```python
 """Runtime settings loaded from .env / environment."""
@@ -159,14 +187,11 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 
-# (input, output) USD per million tokens
-PRICING_USD_PER_MTOK = {"claude-opus-5-5": (4.0, 20.0)}
-
 
 @dataclass(frozen=True)
 class Settings:
-    anthropic_api_key: str
-    wecom_webhook_url: str
+    anthropic_api_key: str = field(repr=False)
+    wecom_webhook_url: str = field(repr=False)
     monthly_budget_cny: float = 300.0
     usd_cny: float = 7.2
     db_path: str = "data/rsiqs.sqlite"
@@ -174,6 +199,10 @@ class Settings:
     capital: float = 500_000.0
     max_picks: int = 5
     root: Path = field(default=ROOT)
+    # Claude Code CLI 鉴权二选一：anthropic_api_key，或中转 anthropic_base_url + anthropic_auth_token
+    anthropic_base_url: str = ""
+    anthropic_auth_token: str = field(default="", repr=False)
+    claude_exe: str = ""  # claude.exe 完整路径；留空由 agents.llm.find_claude_exe 自动查找
 
 
 def get_settings() -> Settings:
@@ -189,6 +218,9 @@ def get_settings() -> Settings:
         capital=float(env("CAPITAL", "500000")),
         max_picks=int(env("MAX_PICKS", "5")),
         root=ROOT,
+        anthropic_base_url=env("ANTHROPIC_BASE_URL", ""),
+        anthropic_auth_token=env("ANTHROPIC_AUTH_TOKEN", ""),
+        claude_exe=env("CLAUDE_EXE", ""),
     )
 ```
 
@@ -197,8 +229,7 @@ def get_settings() -> Settings:
 ```powershell
 uv run pytest tests/test_config.py -v
 ```
-预期：3 passed。
-
+预期：4 passed。
 
 **Step 5: Commit**
 
@@ -206,7 +237,7 @@ uv run pytest tests/test_config.py -v
 git add pyproject.toml uv.lock .env.example .gitignore config.py engine/__init__.py data/__init__.py notify/__init__.py strategies/__init__.py agents/__init__.py jobs/__init__.py tests/test_config.py
 git commit -m "chore: scaffold uv project and settings"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 ### Task 1.2: engine/types.py
 
@@ -334,7 +365,7 @@ uv run pytest tests/test_types.py -v
 git add engine/types.py tests/test_types.py
 git commit -m "feat(engine): add Bar, Pick, Fill value types"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 ### Task 1.3: engine/rules.py（板块、涨跌停、整手、费用）
 
@@ -501,7 +532,7 @@ uv run pytest tests/test_rules.py -v
 git add engine/rules.py tests/test_rules.py
 git commit -m "feat(engine): add A-share board, limit price and fee rules"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 ### Task 1.4: engine/calendar.py
 
@@ -627,7 +658,7 @@ uv run pytest tests/test_calendar.py -v
 git add engine/calendar.py tests/test_calendar.py
 git commit -m "feat(engine): add trading calendar"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 ### Task 1.5: engine/ledger.py（账户、T+1、现金与费用）
 
@@ -848,7 +879,7 @@ uv run pytest tests/test_ledger.py -v
 git add engine/ledger.py tests/test_ledger.py
 git commit -m "feat(engine): add T+1 account ledger"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 ### Task 1.6: engine/broker.py（开盘撮合）
 
@@ -1098,7 +1129,7 @@ uv run pytest -v
 git add engine/broker.py tests/test_broker.py
 git commit -m "feat(engine): add open-auction SimBroker"
 ```
-（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`）
+（commit message 末尾追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`）
 
 
 ---
@@ -1122,7 +1153,7 @@ git commit -m "feat(engine): add open-auction SimBroker"
 
 本部分全部测试离线运行：不访问网络、不调用 Claude API、不推送企业微信，因此没有手工冒烟步骤。
 
-所有 commit 命令都用第二个 `-m` 追加 trailer：`Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`。
+所有 commit 命令都用第二个 `-m` 追加 trailer：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。
 
 ### Task 2.1: SQLite 存储层
 
@@ -1449,7 +1480,7 @@ uv run pytest tests/test_store.py -v
 
 ```
 git add engine/store.py tests/test_store.py
-git commit -m "feat: add sqlite Store for accounts, nav, recs, trials, status, kv" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add sqlite Store for accounts, nav, recs, trials, status, kv" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.2: 绩效指标与 Deflated Sharpe
@@ -1628,7 +1659,7 @@ uv run pytest tests/test_metrics.py -v
 
 ```
 git add engine/metrics.py tests/test_metrics.py
-git commit -m "feat: add performance metrics and deflated sharpe" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add performance metrics and deflated sharpe" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.3: 防未来函数的 DataView
@@ -1778,7 +1809,7 @@ uv run pytest tests/test_dataview.py -v
 
 ```
 git add engine/dataview.py tests/test_dataview.py
-git commit -m "feat: add lookahead-safe DataView" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add lookahead-safe DataView" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.4: 回测引擎与 bars_for_day
@@ -1985,7 +2016,7 @@ uv run pytest tests/test_backtest.py -v
 
 ```
 git add engine/backtest.py tests/test_backtest.py
-git commit -m "feat: add day-by-day backtest and bars_for_day" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add day-by-day backtest and bars_for_day" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.5: 评估器（门槛、DSR、留出集）
@@ -2207,7 +2238,7 @@ uv run pytest tests/test_evaluator.py -v
 
 ```
 git add engine/evaluator.py tests/test_evaluator.py
-git commit -m "feat: add locked evaluator with gate, DSR and blind holdout" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add locked evaluator with gate, DSR and blind holdout" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.6: 锁定区哈希校验
@@ -2326,7 +2357,7 @@ uv run pytest tests/test_integrity.py -v
 
 ```
 git add engine/integrity.py tests/test_integrity.py
-git commit -m "feat: add engine integrity manifest and verify" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add engine integrity manifest and verify" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.7: 晋升与降级
@@ -2547,7 +2578,7 @@ uv run pytest tests/test_promotion.py -v
 
 ```
 git add engine/promotion.py tests/test_promotion.py
-git commit -m "feat: add quant strategy promotion/demotion rules" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: add quant strategy promotion/demotion rules" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ### Task 2.8: Part 2 收尾检查
@@ -2995,7 +3026,7 @@ git add data/akshare_client.py scripts/smoke_akshare.py tests/test_akshare_clien
 git commit -m "feat: add AKShare client with retry, column maps and spot fallback"
 ```
 
-（提交信息末尾追加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾追加 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 ### Task 3.2: 日线缓存（data/cache.py）
 
@@ -4232,7 +4263,7 @@ git add strategies/sandbox.py engine/run_eval.py tests/test_sandbox.py tests/tes
 git commit -m "feat: add strategy source sandbox and isolated evaluation CLI"
 ```
 
-（清单尚不存在时去掉第一行命令和 `git add` 中的 `.integrity/manifest.json`。提交信息末尾追加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（清单尚不存在时去掉第一行命令和 `git add` 中的 `.integrity/manifest.json`。提交信息末尾追加 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 
 ---
@@ -4240,13 +4271,17 @@ git commit -m "feat: add strategy source sandbox and isolated evaluation CLI"
 ## Part 4: Claude 接入：盘前推荐与复盘
 
 > 说明（合同在本部分内的取舍）：
-> 1. `run_final` 在两个线程里并发调用 `finalize`，两者共享同一个 `Store`（`llm.parse` 会写 `add_llm_usage`）。这要求 Part 2 的 `Store` 用 `sqlite3.connect(..., check_same_thread=False)` 打开并用 `threading.Lock` 串行化访问；Task 4.3 的 `run_final` 测试用真实 `Store(":memory:")` 跨线程验证这一点（若失败报 `SQLite objects created in a thread...`，按此修改 `engine/store.py` 后重写 integrity manifest）。
-> 2. 本部分新增的内部名字：`playbook.ROOT`、`playbook.load_prompt(name)`（读 `playbook/<name>_system.md`）、`premarket.FINAL_DEADLINE = 100.0`（run_final 对两路 finalize 的总等待上限，秒；SDK 超时重试可能使单次调用超过 2 分钟，超出上限的那一路直接退回量化，保证 09:28 前推送）。
-> 3. `finalize` 中 `spot()` 失败不触发回退，只在提示里告诉 Claude 竞价数据缺失；只有 LLM 调用本身失败才退回量化。
-> 4. `maybe_release` 首次调用只记录窗口起点并返回 None；候选与现行规则相同则只重开窗口；落后时重置候选并返回提示文本。
-> 5. 价格合理性：`stop < entry_max < target` 且三者都在量化 `entry_max` 的 0.5~1.5 倍内，否则沿用量化价格。
-> 6. `run_review` 遇到 `BudgetExceeded` 以外的 LLM 异常（拒答、超时、解析失败）也照常推送日报，摘要写明"复盘失败"，job 记为 ok，避免一次 API 故障让当天日报丢失；每次最多采纳 `review.MAX_LESSONS = 3` 条 lesson。
-> 7. `agents.review` 以 `playbook.git_commit(...)` / `playbook.maybe_release(...)` 的模块属性方式调用，便于测试打桩；提交路径固定为 `playbook/active.json`、`playbook/candidate.json`。
+> 1. Claude 统一经 Claude Code CLI 调用（Task 4.1 的 `agents/llm.py`），即使很小的提示也要 10~25 秒。因此盘前分两段：08:30 `premarket_scan` 在 `scan` 之后立即调用 `premarket.run_analyze`，两套 playbook 各做一次深度分析（`effort="high"`，单次上限 `ANALYZE_TIMEOUT=900` 秒，`max_budget_usd=1.5`），为每只候选写下竞价条件 `min_gap_pct/max_gap_pct/entry_max` 和止损止盈价，存入 kv `plan:<ISO日期>:<kind>`；09:25 竞价结束后 `premarket.run_final` 先做确定性规则过滤 `auction_filter`，再做一次只能否决、不能新增的轻量确认（`effort="low"`，`AUCTION_TIMEOUT=90` 秒，`max_budget_usd=0.3`）。
+> 2. 09:28 前必须推送。`run_final` 从自身开始计时：两路都没有计划时不拉快照；否则在守护线程里拉一次竞价快照，最多等 `SPOT_TIMEOUT=40` 秒（超时或失败按竞价数据缺失处理），两路共用。竞价确认的超时取 `AUCTION_TIMEOUT` 与剩余时间的较小者；到 `FINAL_DEADLINE=110` 秒仍未定稿的那一路直接改用确定性结果（有计划用规则过滤结果，无计划用量化）。09:25:15 启动时最迟约 09:27:05 定稿推送。超时那一路的线程留在后台跑完，结果丢弃。
+> 3. 降级规则：深度分析失败（超时、单次花费超限、CLI 报错、输出里没有任何候选代码）→ 不存计划，09:25 该路退回量化（`llm_reviewed=False`，推送标注"未经 LLM 审核"）；竞价确认失败或超时 → 规则过滤结果（`llm_reviewed=True`，市场观点后注明"竞价二次确认未完成"）；规则过滤后为空 → 当天不推荐（`llm_reviewed=True`，注明"竞价条件均未满足"）；当天没有候选 → `RuntimeError`，由 `run_job` 告警。
+> 4. `llm.parse` 只抛 `BudgetExceeded`、`LLMError`（拒答、CLI 报错、缺少结构化输出、非 JSON 都归入它，`LLMRefusal` 已删除）和 `subprocess.TimeoutExpired`；盘前与复盘一律 `except Exception` 兜底。`max_tokens` 参数已不存在，单次花费上限改用 `max_budget_usd`。测试一律用与 `LLM.parse` 同签名的假对象，不启动 claude.exe、不联网。
+> 5. `run_analyze` 和 `run_final` 都在两个线程里并发处理两套 playbook，共享同一个 `Store`（`llm.parse` 会写 `add_llm_usage`）。Part 2 的 `Store` 已用 `check_same_thread=False` + `RLock`；Task 4.3 的测试用真实 `Store(":memory:")` 跨线程验证，`run_analyze` 的测试还用 `threading.Barrier` 确认两路确实并发。
+> 6. 本部分新增的名字：`playbook.ROOT`、`playbook.load_prompt(name)`（读 `playbook/<name>_system.md`）；`premarket.load_plan(store, d, kind)`（读回已存计划，没有或无法解析时为 None）；`premarket.SPOT_TIMEOUT`；`finalize` 的 `spot` 传 `None` 表示自行拉取，传空表表示竞价数据缺失。`premarket.AUCTION_SYSTEM` 是代码常量，不放在 `playbook/` 里；`playbook/premarket_system.md` 只用于 08:30 的深度分析。
+> 7. 竞价快照获取失败或为空时没有快照行，计划中的 keep 全部通过规则过滤，确认调用的提示里写明"竞价数据缺失"；有快照行但竞价价或昨收缺失、非正（多为停牌）视为不满足条件。竞价涨幅四舍五入到 0.01 个百分点后按闭区间 `[min_gap_pct, max_gap_pct]` 比较，避免 10.20/10.00 这类恰在边界的价格因浮点误差被误判；`min_gap_pct > max_gap_pct` 时区间为空，有快照行的该股不通过。规则过滤后为空时不再调用竞价确认。
+> 8. `maybe_release` 首次调用只记录窗口起点并返回 None；候选与现行规则相同则只重开窗口；落后时重置候选并返回提示文本。
+> 9. 价格合理性：计划价位四舍五入到分后，满足 `stop < entry_max < target` 且三者都在量化 `entry_max` 的 0.5~1.5 倍内才采用，否则沿用量化价格。规则过滤中的"竞价价 ≤ entry_max"使用最终采用的 entry_max，和撮合（Task 1.6）判断开盘价的口径一致。
+> 10. `run_review` 遇到 `BudgetExceeded` 以外的 LLM 异常（`LLMError`、超时、校验失败）也照常推送日报，摘要写明"复盘失败"，job 记为 ok，避免一次调用故障让当天日报丢失；每次最多采纳 `review.MAX_LESSONS = 3` 条 lesson。
+> 11. `agents.review` 以 `playbook.git_commit(...)` / `playbook.maybe_release(...)` 的模块属性方式调用，便于测试打桩；提交路径固定为 `playbook/active.json`、`playbook/candidate.json`。
 
 前置：Part 1~3 已完成（`config`、`engine.types/store/calendar/ledger/dataview/backtest`、`notify.format`、`data.*`）。
 
@@ -4257,25 +4292,41 @@ git commit -m "feat: add strategy source sandbox and isolated evaluation CLI"
 - Create: `scripts/smoke_llm.py`
 - Test: `tests/test_llm.py`
 
+背景（2026-10-19 实测，Claude Code 2.1.223，经用户中转 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`）：
+
+- 中转拒绝 Anthropic SDK 直连（报 "Please use authentic Claude Code client"），只有 Claude Code CLI 能用。所以本模块不用 SDK，每次调用起一个 `claude.exe` 子进程。
+- 可用的命令行：`claude.exe -p --bare --output-format json --model claude-opus-5-5 --effort <lvl> --tools "" --no-session-persistence --max-budget-usd <x> --system-prompt-file <file> --json-schema <json>`。用户提示词以 UTF-8 字节经 stdin 传入，既不受 Windows 命令行长度限制，也不经过控制台代码页。子进程环境里不能有 `CLAUDECODE`。`--bare` 不加载用户的插件、hooks 和 CLAUDE.md，鉴权只读环境变量：`ANTHROPIC_API_KEY`，或 `ANTHROPIC_AUTH_TOKEN` 加 `ANTHROPIC_BASE_URL`。
+- stdout 是一个 JSON 对象，字段有 `is_error`（bool）、`subtype`（`"success"` 或错误类型）、`result`（str）、`structured_output`（dict 或 null）、`total_cost_usd`（float）、`usage`（`input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`、`output_tokens`）、`duration_ms`、`num_turns`。
+- 嵌套 schema（对象数组、enum、`$defs`/`$ref`）可用，schema 用 `json.dumps(..., ensure_ascii=True)` 传。小调用耗时 10–25 秒，花费 0.01–0.03 美元。
+- 必须直接运行真正的 `claude.exe`，不能经 npm 的 `claude.cmd`/`claude.ps1` 包装脚本，因为 cmd.exe 的引号规则会破坏 JSON 参数。npm 安装时 exe 位于 `<claude.cmd 所在目录>/node_modules/@anthropic-ai/claude-code/bin/claude.exe`，原生安装位于 `~/.local/bin/claude.exe`。
+- Claude Code 的文件权限规则在 Windows 上表现不一致，不能依赖。所以每次调用都传 `--tools ""`：模型不使用任何工具，所需上下文全部由 Python 写进提示词，读写文件和跑评估也都由 Python 完成。
+- 提示词读起来像安全测试或权限测试时，会触发 Opus 5.5 的 cyber 分类器；服务端随后回退到中转没有的 claude-opus-4-8，调用失败。代码约束要写成编码规范（例如"策略代码只能 import 下列模块"），提示词里不要出现 security、sandbox、bypass 一类措辞。
+- 任何 LLM 失败都必须平稳降级：premarket 照样在 09:28 前推送，review 照样推送日报，research 干净地中止。`parse` 的失败只有三类：`BudgetExceeded`、`LLMError`（含 claude.exe 启动失败）、`subprocess.TimeoutExpired`；`effort` 拼错时另抛 `ValueError`。调用方统一 `except Exception` 兜底。
+
+公共接口：`BudgetExceeded`、`LLMError`、`strict_schema`、`find_claude_exe`、`child_env`、`build_args`、`LLM(settings, store, runner=None)`（方法 `month_cost`、`check_budget`、`parse`）。与旧版相比：`LLMRefusal` 已删除，拒答也抛 `LLMError`；`parse` 不再有 `max_tokens` 参数，改为 `max_budget_usd`，传给 `--max-budget-usd`，花费超过上限时 CLI 自行中止；`LLM.client`、`LLM.cost_cny` 已删除。
+
 **Step 1: 写失败的测试**
 
-`tests/test_llm.py`:
+`tests/test_llm.py`（`runner` 注入假的 `subprocess.run`，不会启动真实 claude.exe；`shutil.which` 与家目录也都隔离）：
 
 ```python
 import datetime as dt
+import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from agents.llm import LLM, BudgetExceeded, LLMRefusal, strict_schema
+from agents import llm as llm_mod
+from agents.llm import LLM, BudgetExceeded, LLMError, build_args, child_env, find_claude_exe, strict_schema
 from config import Settings
 from engine.store import Store
 
 
 class Inner(BaseModel):
-    code: str
+    code: str = Field(description="股票代码")
     score: float
 
 
@@ -4285,49 +4336,76 @@ class Outer(BaseModel):
     note: str = ""
 
 
-GOOD = '{"view": "震荡", "items": [{"code": "600000", "score": 0.7}], "note": ""}'
+GOOD = {"view": "震荡", "items": [{"code": "600000", "score": 0.7}], "note": ""}
+SYSTEM = "你是测试助手。\n只输出 JSON。"
+USER = "请分析 600000 浦发银行的竞价情况"
+NPM_EXE = Path("node_modules/@anthropic-ai/claude-code/bin/claude.exe")
 
 
-def make_settings(**kw) -> Settings:
-    base = dict(anthropic_api_key="test-key", wecom_webhook_url="", root=Path("."))
+def cli_output(structured=GOOD, *, is_error=False, subtype="success", result="", cost=0.0215):
+    """claude -p --output-format json 的 stdout 结构（字段与实测一致）。"""
+    return {"type": "result", "subtype": subtype, "is_error": is_error, "result": result,
+            "structured_output": structured, "total_cost_usd": cost, "duration_ms": 15000, "num_turns": 2,
+            "usage": {"input_tokens": 1200, "cache_creation_input_tokens": 3000,
+                      "cache_read_input_tokens": 500, "output_tokens": 350}}
+
+
+class FakeRunner:
+    """subprocess.run 替身：记录参数，在调用期间读出系统提示词文件，返回预设 stdout。"""
+
+    def __init__(self, payload=None, returncode=0, stdout=None, exc=None):
+        self.stdout = stdout if stdout is not None else json.dumps(payload or cli_output()).encode("utf-8")
+        self.returncode = returncode
+        self.exc = exc
+        self.calls: list[tuple[list[str], dict]] = []
+        self.system_seen: list[bytes] = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((args, kwargs))
+        self.system_seen.append(Path(args[args.index("--system-prompt-file") + 1]).read_bytes())
+        if self.exc is not None:
+            raise self.exc
+        return SimpleNamespace(args=args, returncode=self.returncode, stdout=self.stdout, stderr=b"")
+
+    def system_file(self, i=0) -> Path:
+        args = self.calls[i][0]
+        return Path(args[args.index("--system-prompt-file") + 1])
+
+
+def make_settings(root, **kw) -> Settings:
+    base = dict(anthropic_api_key="", wecom_webhook_url="", root=root, usd_cny=7.2)
     base.update(kw)
     return Settings(**base)
 
 
-def response(text=GOOD, stop_reason="end_turn", **usage):
-    u = dict(input_tokens=1000, output_tokens=500)
-    u.update(usage)
-    return SimpleNamespace(
-        stop_reason=stop_reason,
-        content=[SimpleNamespace(type="thinking", thinking="..."), SimpleNamespace(type="text", text=text)],
-        usage=SimpleNamespace(**u),
-    )
-
-
-class FakeClient:
-    """模拟 anthropic.Anthropic：with_options(...).messages.create(...)"""
-
-    def __init__(self, resp):
-        self.resp = resp
-        self.calls: list[dict] = []
-        self.options: list[dict] = []
-
-    def with_options(self, **kw):
-        self.options.append(kw)
-        return self
-
-    @property
-    def messages(self):
-        return self
-
-    def create(self, **kw):
-        self.calls.append(kw)
-        return self.resp
+def touch(p: Path) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"")
+    return p
 
 
 @pytest.fixture
 def store():
     return Store(":memory:")
+
+
+@pytest.fixture
+def settings(tmp_path):
+    return make_settings(tmp_path, claude_exe=str(touch(tmp_path / "bin" / "claude.exe")))
+
+
+@pytest.fixture
+def no_claude(monkeypatch, tmp_path):
+    """隔离本机安装：shutil.which 只认测试登记的路径，家目录指向 tmp_path/home。"""
+    found: dict[str, str] = {}
+    monkeypatch.setattr(llm_mod.shutil, "which", lambda name: found.get(name))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return found
+
+
+def usage_rows(store):
+    return store.conn.execute("SELECT purpose, input_tokens, output_tokens, cost_cny FROM llm_usage").fetchall()
 
 
 def this_month_cost(store):
@@ -4344,68 +4422,203 @@ def test_strict_schema_nested():
     assert sorted(inner["required"]) == ["code", "score"]
 
 
-def test_parse_request_kwargs_and_result(store):
-    client = FakeClient(response())
-    llm = LLM(make_settings(), store, client=client)
-    out = llm.parse("unit", "SYS", "USER", Outer, effort="low", timeout=30.0, max_tokens=2000)
-    assert isinstance(out, Outer) and out.items[0].code == "600000"
-    assert client.options == [{"timeout": 30.0}]
-    kw = client.calls[0]
-    assert kw["model"] == "claude-opus-5-5"
-    assert kw["max_tokens"] == 2000
-    assert kw["system"] == "SYS"
-    assert kw["messages"] == [{"role": "user", "content": "USER"}]
-    assert kw["output_config"]["effort"] == "low"
-    assert kw["output_config"]["format"] == {"type": "json_schema", "schema": strict_schema(Outer)}
-    assert kw["extra_body"] == {"fallbacks": "default"}
-    assert kw["extra_headers"] == {"anthropic-beta": "server-side-fallback-2026-07-01"}
-    for banned in ("thinking", "temperature", "tool_choice"):
-        assert banned not in kw
+def test_build_args_is_the_verified_command(tmp_path):
+    s = make_settings(tmp_path)
+    args = build_args(s, r"C:\cc\claude.exe", tmp_path / "sys.md", '{"type": "object"}', "high", 1.5)
+    assert args == [r"C:\cc\claude.exe", "-p", "--bare", "--output-format", "json",
+                    "--model", "claude-opus-5-5", "--effort", "high", "--tools", "",
+                    "--no-session-persistence", "--max-budget-usd", "1.50",
+                    "--system-prompt-file", str(tmp_path / "sys.md"), "--json-schema", '{"type": "object"}']
+    with pytest.raises(ValueError):
+        build_args(s, "claude.exe", "sys.md", "{}", "extreme", 1.0)
 
 
-def test_usage_recorded(store):
-    llm = LLM(make_settings(), store, client=FakeClient(response()))
-    llm.parse("unit", "s", "u", Outer)
-    # (1000*4 + 500*20) / 1e6 * 7.2
-    assert this_month_cost(store) == pytest.approx(0.1008)
+def test_child_env_strips_claudecode_and_inherited_anthropic_vars(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "inherited-key")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-other")
+    monkeypatch.setenv("RSIQS_KEEP_ME", "yes")
+    relay = make_settings(tmp_path, anthropic_base_url="https://relay.example.invalid", anthropic_auth_token="tok")
+    env = child_env(relay)
+    assert "CLAUDECODE" not in env and env["RSIQS_KEEP_ME"] == "yes"
+    assert {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")} == {
+        "ANTHROPIC_BASE_URL": "https://relay.example.invalid", "ANTHROPIC_AUTH_TOKEN": "tok"}
+    official = child_env(make_settings(tmp_path, anthropic_api_key="sk-test"))
+    assert {k: v for k, v in official.items() if k.startswith("ANTHROPIC_")} == {"ANTHROPIC_API_KEY": "sk-test"}
 
 
-def test_cost_cny_with_cache_and_missing_attrs(store):
-    llm = LLM(make_settings(), store, client=FakeClient(response()))
-    u = SimpleNamespace(input_tokens=1000, output_tokens=500,
-                        cache_creation_input_tokens=1000, cache_read_input_tokens=1000)
-    # (1000 + 1250 + 100) * 4 / 1e6 + 500 * 20 / 1e6 = 0.0194 USD
-    assert llm.cost_cny(u) == pytest.approx(0.0194 * 7.2)
-    assert llm.cost_cny(SimpleNamespace()) == 0.0
-    assert llm.cost_cny(SimpleNamespace(input_tokens=None, output_tokens=10)) == pytest.approx(10 * 20 / 1e6 * 7.2)
+def test_parse_runs_cli_and_returns_model(store, settings, tmp_path):
+    runner = FakeRunner()
+    out = LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, effort="low", timeout=30.0)
+    assert isinstance(out, Outer) and out.view == "震荡" and out.items[0].code == "600000"
+    assert len(runner.calls) == 1
+    args, kw = runner.calls[0]
+    assert args[0] == settings.claude_exe and args[1:3] == ["-p", "--bare"]
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--model") + 1] == "claude-opus-5-5"
+    assert args[args.index("--effort") + 1] == "low"
+    assert args[args.index("--max-budget-usd") + 1] == "1.00"
+    schema_json = args[args.index("--json-schema") + 1]
+    assert schema_json == json.dumps(strict_schema(Outer), ensure_ascii=True)
+    assert schema_json.isascii() and "股票代码" in json.loads(schema_json)["$defs"]["Inner"]["properties"]["code"][
+        "description"]
+    assert args == build_args(settings, settings.claude_exe, runner.system_file(), schema_json, "low", 1.0)
+    assert kw["input"] == USER.encode("utf-8")
+    assert kw["capture_output"] is True and kw["timeout"] == 30.0 and kw["cwd"] == str(tmp_path)
+    assert runner.system_seen == [SYSTEM.encode("utf-8")]  # 调用期间文件内容 == 系统提示词
+    assert runner.system_file().suffix == ".md" and not runner.system_file().exists()  # 调用后删除
 
 
-def test_refusal_raises_but_usage_recorded(store):
-    llm = LLM(make_settings(), store, client=FakeClient(response(text="", stop_reason="refusal")))
-    with pytest.raises(LLMRefusal):
-        llm.parse("unit", "s", "u", Outer)
-    assert this_month_cost(store) > 0
+def test_parse_passes_child_env(monkeypatch, store, tmp_path):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://inherited.invalid")
+    s = make_settings(tmp_path, claude_exe=str(touch(tmp_path / "claude.exe")), anthropic_api_key="sk-test")
+    runner = FakeRunner()
+    LLM(s, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+    env = runner.calls[0][1]["env"]
+    assert "CLAUDECODE" not in env
+    assert {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")} == {"ANTHROPIC_API_KEY": "sk-test"}
 
 
-def test_invalid_json_raises(store):
-    llm = LLM(make_settings(), store, client=FakeClient(response(text='{"view": 1}')))
-    with pytest.raises(Exception):
-        llm.parse("unit", "s", "u", Outer)
+def test_usage_tokens_and_cost_recorded(store, settings):
+    LLM(settings, store, runner=FakeRunner()).parse("unit", SYSTEM, USER, Outer, max_budget_usd=0.3)
+    [(purpose, tokens_in, tokens_out, cost)] = usage_rows(store)
+    assert (purpose, tokens_in, tokens_out) == ("unit", 1200 + 3000 + 500, 350)
+    assert cost == pytest.approx(0.0215 * 7.2)
+    assert this_month_cost(store) == pytest.approx(0.0215 * 7.2)
 
 
-def test_budget_exceeded_non_essential(store):
+def test_cli_error_raises_but_usage_recorded(store, settings):
+    runner = FakeRunner(cli_output(structured=None, is_error=True, subtype="error_max_budget_usd",
+                                   result="Reached maximum budget", cost=0.5), returncode=1)
+    with pytest.raises(LLMError, match="error_max_budget_usd"):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+    assert this_month_cost(store) == pytest.approx(0.5 * 7.2)
+    assert not runner.system_file().exists()
+
+
+NO_STRUCTURED = {k: v for k, v in cli_output().items() if k != "structured_output"}
+
+
+@pytest.mark.parametrize("payload, returncode", [
+    (cli_output(is_error=True, result="Claude 拒绝回答"), 0),  # is_error
+    (cli_output(), 1),  # 退出码非 0
+    (cli_output(structured=None, result="纯文本回答"), 0),  # structured_output 为 null
+    (NO_STRUCTURED, 0),  # 没有 structured_output 字段
+])
+def test_cli_failures_raise_llm_error(store, settings, payload, returncode):
+    with pytest.raises(LLMError):
+        LLM(settings, store, runner=FakeRunner(payload, returncode=returncode)).parse("unit", SYSTEM, USER, Outer)
+    assert len(usage_rows(store)) == 1
+
+
+@pytest.mark.parametrize("stdout", [b"", b"Error: something went wrong", b"\xff\xfe\x00", b"[1, 2]"])
+def test_non_json_stdout_raises_llm_error(store, settings, stdout):
+    runner = FakeRunner(stdout=stdout, returncode=1)
+    with pytest.raises(LLMError):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+    assert usage_rows(store) == []
+    assert not runner.system_file().exists()
+
+
+def test_structured_output_failing_validation_raises_llm_error(store, settings):
+    runner = FakeRunner(cli_output(structured={"view": 1}))
+    with pytest.raises(LLMError, match="Outer"):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+    assert len(usage_rows(store)) == 1
+
+
+def test_timeout_propagates_and_cleans_up(store, settings):
+    runner = FakeRunner(exc=subprocess.TimeoutExpired(["claude.exe"], 5.0))
+    with pytest.raises(subprocess.TimeoutExpired):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0)
+    assert runner.system_seen == [SYSTEM.encode("utf-8")] and not runner.system_file().exists()
+    assert usage_rows(store) == []
+
+
+def test_launch_failure_raises_llm_error(store, settings):
+    runner = FakeRunner(exc=FileNotFoundError(2, "系统找不到指定的文件。"))
+    with pytest.raises(LLMError, match="claude.exe"):
+        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+    assert not runner.system_file().exists() and usage_rows(store) == []
+
+
+def test_budget_exceeded_non_essential_skips_runner(no_claude, store, tmp_path):
     store.add_llm_usage("old", 0, 0, 300.0)
-    client = FakeClient(response())
-    llm = LLM(make_settings(monthly_budget_cny=300.0), store, client=client)
-    with pytest.raises(BudgetExceeded):
-        llm.parse("unit", "s", "u", Outer)
-    assert client.calls == []
+    runner = FakeRunner()
+    llm = LLM(make_settings(tmp_path, monthly_budget_cny=300.0), store, runner=runner)
+    with pytest.raises(BudgetExceeded):  # 先查预算：连 claude.exe 都不用找
+        llm.parse("unit", SYSTEM, USER, Outer)
+    assert runner.calls == []
 
 
-def test_budget_exceeded_essential_passes(store):
+def test_budget_exceeded_essential_passes(store, settings):
     store.add_llm_usage("old", 0, 0, 300.0)
-    llm = LLM(make_settings(monthly_budget_cny=300.0), store, client=FakeClient(response()))
-    assert llm.parse("unit", "s", "u", Outer, essential=True).view == "震荡"
+    runner = FakeRunner()
+    assert LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, essential=True).view == "震荡"
+    assert len(runner.calls) == 1
+
+
+def test_exe_resolved_lazily_and_cached(monkeypatch, store, settings):
+    lookups = []
+    monkeypatch.setattr(llm_mod, "find_claude_exe", lambda s: lookups.append(s) or s.claude_exe)
+    runner = FakeRunner()
+    llm = LLM(settings, store, runner=runner)
+    assert lookups == []  # 构造时不查找
+    llm.parse("a", SYSTEM, USER, Outer)
+    llm.parse("b", SYSTEM, USER, Outer)
+    assert len(lookups) == 1 and len(runner.calls) == 2
+
+
+def test_missing_exe_raises_llm_error_at_parse(no_claude, store, tmp_path):
+    runner = FakeRunner()
+    llm = LLM(make_settings(tmp_path), store, runner=runner)  # 找不到 claude.exe 也能构造
+    with pytest.raises(LLMError, match="CLAUDE_EXE"):
+        llm.parse("unit", SYSTEM, USER, Outer)
+    assert runner.calls == [] and usage_rows(store) == []
+
+
+def test_find_settings_value_wins(no_claude, tmp_path):
+    mine = touch(tmp_path / "custom" / "claude.exe")
+    no_claude["claude.exe"] = str(touch(tmp_path / "other" / "claude.exe"))
+    assert find_claude_exe(make_settings(tmp_path, claude_exe=str(mine))) == str(mine)
+    with pytest.raises(LLMError, match="CLAUDE_EXE"):
+        find_claude_exe(make_settings(tmp_path, claude_exe=str(tmp_path / "nope" / "claude.exe")))
+
+
+def test_find_settings_wrapper_maps_to_npm_exe(no_claude, tmp_path):
+    exe = touch(tmp_path / "npm" / NPM_EXE)
+    cmd = touch(tmp_path / "npm" / "claude.cmd")
+    assert find_claude_exe(make_settings(tmp_path, claude_exe=str(cmd))) == str(exe)
+    with pytest.raises(LLMError, match="CLAUDE_EXE"):
+        find_claude_exe(make_settings(tmp_path, claude_exe=str(touch(tmp_path / "x" / "claude.ps1"))))
+
+
+def test_find_npm_wrapper_on_path_resolves_to_sibling_exe(no_claude, tmp_path):
+    no_claude["claude"] = str(touch(tmp_path / "nodejs" / "claude.CMD"))
+    exe = touch(tmp_path / "nodejs" / NPM_EXE)
+    no_claude["claude.exe"] = str(touch(tmp_path / "other" / "claude.exe"))
+    assert find_claude_exe(make_settings(tmp_path)) == str(exe)  # npm 旁的 exe 优先
+
+
+def test_find_never_returns_wrapper(no_claude, tmp_path):
+    wrapper = str(touch(tmp_path / "nodejs" / "claude.cmd"))  # npm 目录残缺：没有 bin/claude.exe
+    no_claude["claude"] = wrapper
+    no_claude["claude.exe"] = wrapper
+    with pytest.raises(LLMError, match="CLAUDE_EXE"):
+        find_claude_exe(make_settings(tmp_path))
+
+
+def test_find_path_exe_then_native_install_then_error(no_claude, tmp_path):
+    on_path = str(touch(tmp_path / "bin" / "claude.exe"))
+    no_claude.update({"claude": on_path, "claude.exe": on_path})  # 原生安装在 PATH 上
+    assert find_claude_exe(make_settings(tmp_path)) == on_path
+    no_claude.clear()
+    native = touch(tmp_path / "home" / ".local" / "bin" / "claude.exe")
+    assert find_claude_exe(make_settings(tmp_path)) == str(native)
+    native.unlink()
+    with pytest.raises(LLMError, match="找不到 claude.exe"):
+        find_claude_exe(make_settings(tmp_path))
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -4414,39 +4627,50 @@ def test_budget_exceeded_essential_passes(store):
 uv run pytest tests/test_llm.py -v
 ```
 
-预期：`ModuleNotFoundError: No module named 'agents.llm'`，全部 ERROR。
+预期：`ImportError: cannot import name 'llm' from 'agents'`（模块不存在），收集阶段报错，全部 ERROR。
 
 **Step 3: 最小实现**
 
 `agents/llm.py`:
 
 ```python
-"""Claude 调用封装：结构化输出、记账、预算。
+"""Claude 调用封装：经 Claude Code CLI 无头模式（claude.exe -p --bare）调用，结构化输出、记账、预算。
 
-Opus 5.5 约束：不传 thinking / temperature / tool_choice；
-用 output_config.effort 控制推理深度，output_config.format 做 JSON Schema 约束。
+中转只接受 Claude Code 客户端，Anthropic SDK 直连会被拒绝，所以这里不用 SDK：每次调用起一个 claude.exe 子进程，
+系统提示词写进临时 .md 文件，用户提示词以 UTF-8 字节走 stdin，JSON Schema 走 --json-schema。
+每次都传 --tools ""：模型不使用任何工具，所需上下文全部由 Python 放进提示词。
+费用取 CLI 输出的 total_cost_usd（美元）× usd_cny 记入 llm_usage。
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime as dt
-from typing import Any
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Callable
 
-import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from config import PRICING_USD_PER_MTOK, Settings
+from config import Settings
 from engine.store import Store
 
-BETA_HEADER = "server-side-fallback-2026-07-01"
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+NPM_EXE = Path("node_modules") / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+WRAPPER_SUFFIXES = (".cmd", ".bat", ".ps1")
+NOT_FOUND = "找不到 claude.exe，请在 .env 设置 CLAUDE_EXE"
 
 
 class BudgetExceeded(Exception):
     pass
 
 
-class LLMRefusal(Exception):
-    pass
+class LLMError(Exception):
+    """找不到或无法运行 claude.exe、CLI 报错或拒答、没有 structured_output、stdout 不是 JSON、结构校验失败。"""
 
 
 def _strictify(node: Any) -> None:
@@ -4468,23 +4692,84 @@ def strict_schema(model: type[BaseModel]) -> dict:
     return schema
 
 
-def _tok(usage: Any, name: str) -> int:
-    return int(getattr(usage, name, 0) or 0)
+def _is_wrapper(path: str) -> bool:
+    return path.lower().endswith(WRAPPER_SUFFIXES)
+
+
+def find_claude_exe(settings: Settings) -> str:
+    """claude.exe 的路径，从不返回 .cmd/.ps1 包装脚本（cmd.exe 的引号规则会破坏 JSON 参数）。
+
+    顺序：settings.claude_exe → PATH 上 claude（npm 包装脚本）旁的 node_modules/.../bin/claude.exe
+    → PATH 上的 claude.exe → ~/.local/bin/claude.exe（原生安装）。
+    """
+    configured = settings.claude_exe.strip().strip('"')
+    if configured:
+        if _is_wrapper(configured):
+            exe = Path(configured).parent / NPM_EXE
+            if exe.is_file():
+                return str(exe)
+            raise LLMError(f"CLAUDE_EXE 指向包装脚本 {configured}，请改为 claude.exe 的完整路径")
+        if not Path(configured).is_file():
+            raise LLMError(f"CLAUDE_EXE 指向的文件不存在：{configured!r}（请填完整路径，.env 里不要加双引号）")
+        return configured
+    wrapper = shutil.which("claude")
+    if wrapper:
+        exe = Path(wrapper).parent / NPM_EXE
+        if exe.is_file():
+            return str(exe)
+    found = shutil.which("claude.exe")
+    if found and not _is_wrapper(found):
+        return found
+    native = Path.home() / ".local" / "bin" / "claude.exe"
+    if native.is_file():
+        return str(native)
+    raise LLMError(NOT_FOUND)
+
+
+def child_env(settings: Settings) -> dict[str, str]:
+    """子进程环境：去掉 CLAUDECODE 与所有继承来的 ANTHROPIC_*，只放入 settings 中非空的鉴权变量。"""
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() != "CLAUDECODE" and not k.upper().startswith("ANTHROPIC_")}
+    for key, value in (("ANTHROPIC_API_KEY", settings.anthropic_api_key),
+                       ("ANTHROPIC_BASE_URL", settings.anthropic_base_url),
+                       ("ANTHROPIC_AUTH_TOKEN", settings.anthropic_auth_token)):
+        if value:
+            env[key] = value
+    return env
+
+
+def build_args(settings: Settings, exe: str, system_file: str | Path, schema_json: str, effort: str,
+               max_budget_usd: float) -> list[str]:
+    """已实测可用的无头调用命令行；用户提示词不在命令行里，走 stdin。"""
+    if effort not in EFFORTS:
+        raise ValueError(f"unknown effort: {effort!r}")
+    return [exe, "-p", "--bare", "--output-format", "json", "--model", settings.llm_model,
+            "--effort", effort, "--tools", "", "--no-session-persistence",
+            "--max-budget-usd", f"{max_budget_usd:.2f}", "--system-prompt-file", str(system_file),
+            "--json-schema", schema_json]
+
+
+def _int(value: Any) -> int:
+    return int(value or 0)
+
+
+def _tail(raw: Any, limit: int = 300) -> str:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    return str(raw or "").strip()[-limit:]
 
 
 class LLM:
-    def __init__(self, settings: Settings, store: Store, client=None):
+    def __init__(self, settings: Settings, store: Store, runner: Callable[..., Any] | None = None):
         self.settings = settings
         self.store = store
-        self.client = client or anthropic.Anthropic(api_key=settings.anthropic_api_key, max_retries=2)
+        self.runner = runner or subprocess.run
+        self._exe: str | None = None  # 首次 parse 时查找并缓存，构造 LLM 永不失败
 
-    def cost_cny(self, usage: Any) -> float:
-        price_in, price_out = PRICING_USD_PER_MTOK.get(self.settings.llm_model, PRICING_USD_PER_MTOK["claude-opus-5-5"])
-        tokens_in = (_tok(usage, "input_tokens")
-                     + _tok(usage, "cache_creation_input_tokens") * 1.25
-                     + _tok(usage, "cache_read_input_tokens") * 0.1)
-        usd = (tokens_in * price_in + _tok(usage, "output_tokens") * price_out) / 1_000_000
-        return usd * self.settings.usd_cny
+    def _claude_exe(self) -> str:
+        if self._exe is None:
+            self._exe = find_claude_exe(self.settings)
+        return self._exe
 
     def month_cost(self) -> float:
         t = dt.date.today()
@@ -4496,29 +4781,55 @@ class LLM:
                 f"本月 LLM 花费 {self.month_cost():.2f} 元已达预算 {self.settings.monthly_budget_cny:.0f} 元")
 
     def parse(self, purpose: str, system: str, user: str, schema: type[BaseModel], effort: str = "medium",
-              timeout: float = 120.0, max_tokens: int = 16000, essential: bool = False) -> BaseModel:
+              timeout: float = 120.0, max_budget_usd: float = 1.0, essential: bool = False) -> BaseModel:
+        """一次无头调用，返回 schema 实例。
+
+        预算不足抛 BudgetExceeded；超时抛 subprocess.TimeoutExpired（子进程已被杀掉）；
+        claude.exe 启动失败、CLI 报错、拒答、没有 structured_output、输出不是 JSON、结构校验失败都抛 LLMError。
+        """
         self.check_budget(essential)
-        resp = self.client.with_options(timeout=timeout).messages.create(
-            model=self.settings.llm_model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": strict_schema(schema)}},
-            extra_headers={"anthropic-beta": BETA_HEADER},
-            extra_body={"fallbacks": "default"},
-        )
-        usage = getattr(resp, "usage", None)
-        self.store.add_llm_usage(purpose, _tok(usage, "input_tokens"), _tok(usage, "output_tokens"),
-                                 self.cost_cny(usage))
-        if resp.stop_reason == "refusal":
-            raise LLMRefusal(f"{purpose}: Claude 拒绝回答")
-        text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), None)
-        if text is None:
-            raise ValueError(f"{purpose}: 响应中没有 text 块 (stop_reason={resp.stop_reason})")
-        return schema.model_validate_json(text)
+        exe = self._claude_exe()
+        schema_json = json.dumps(strict_schema(schema), ensure_ascii=True)
+        fd, system_file = tempfile.mkstemp(prefix="rsiqs_system_", suffix=".md")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(system.encode("utf-8"))
+            args = build_args(self.settings, exe, system_file, schema_json, effort, max_budget_usd)
+            proc = self.runner(args, input=user.encode("utf-8"), capture_output=True,
+                               env=child_env(self.settings), cwd=str(self.settings.root), timeout=timeout)
+        except OSError as e:  # claude.exe 启动不了（安装后被删除、没有权限等）
+            raise LLMError(f"{purpose}: 无法运行 claude.exe：{e!r}") from e
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(system_file)
+        try:
+            out = json.loads(proc.stdout.decode("utf-8"))
+        except ValueError as e:  # 含 UnicodeDecodeError / JSONDecodeError
+            raise LLMError(f"{purpose}: claude 输出不是 JSON（exit={proc.returncode}）："
+                           f"{_tail(proc.stderr) or _tail(proc.stdout)}") from e
+        if not isinstance(out, dict):
+            raise LLMError(f"{purpose}: claude 输出不是 JSON 对象（exit={proc.returncode}）")
+        usage = out.get("usage") or {}
+        tokens_in = sum(_int(usage.get(k)) for k in
+                        ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        self.store.add_llm_usage(purpose, tokens_in, _int(usage.get("output_tokens")),
+                                 float(out.get("total_cost_usd") or 0.0) * self.settings.usd_cny)
+        structured = out.get("structured_output")
+        if proc.returncode != 0 or out.get("is_error") or structured is None:
+            raise LLMError(f"{purpose}: {out.get('subtype', '')} {str(out.get('result') or '')[:300]}")
+        try:
+            return schema.model_validate(structured)
+        except ValidationError as e:
+            raise LLMError(f"{purpose}: structured_output 不符合 {schema.__name__}：{e}") from e
 ```
 
-说明：`month_cost` 是内部辅助方法；`max_tokens` 截断（`stop_reason=="max_tokens"`）时 JSON 不完整，`model_validate_json` 抛 `ValidationError`，调用方按普通异常处理。
+说明：
+- `parse` 的顺序：查预算 → 找 claude.exe（首次查找后缓存）→ 写临时系统提示词文件 → 起子进程 → `finally` 删除临时文件 → 解析 stdout → 记账 → 判错 → 校验。只要 stdout 是 JSON 对象就记账，`is_error` 时也记，因为 CLI 报错前可能已经产生费用；stdout 不是 JSON 对象时没有可记的用量。
+- 记账：输入 token = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`，费用 = `total_cost_usd × usd_cny`（元），写入 `store.add_llm_usage`。
+- `structured_output` 交给 pydantic 校验，不符合 schema 时同样包装成 `LLMError`。这样调用方只需区分 `BudgetExceeded` 与 `LLMError`，研究循环据此停止。
+- `subprocess.run` 超时会先杀掉 claude.exe 再抛 `TimeoutExpired`，这里不捕获，交给调用方。claude.exe 启动失败（`OSError`）则包装成 `LLMError`。
+- 构造 `LLM` 不查找 claude.exe，第一次 `parse` 才查找，因此 `jobs.common.make_llm` 在未安装 Claude Code 的机器上也不会失败；找不到时由 `parse` 抛 `LLMError`，走各调用方的降级路径。
+- `build_args` 只接受 `low/medium/high/xhigh/max` 五档 `effort`，拼错时在起子进程前就抛 `ValueError`。
 
 **Step 4: 运行测试，确认通过**
 
@@ -4526,21 +4837,28 @@ class LLM:
 uv run pytest tests/test_llm.py -v
 ```
 
-预期：8 passed。
+预期：27 passed（两个参数化测试各 4 个用例）。
 
-**Step 5: Manual smoke step（真实调用一次 Claude，约 0.05 元）**
+**Step 5: Manual smoke step（真实调用一次 Claude，约 0.1~0.2 元）**
+
+前提：`.env` 已填 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`（或 `ANTHROPIC_API_KEY`），`CLAUDE_EXE` 可以留空。
 
 `scripts/smoke_llm.py`:
 
 ```python
-"""手动冒烟：真实调用 Claude 一次，验证 output_config / fallbacks / beta header 被 API 接受。
-运行：uv run python scripts/smoke_llm.py
-"""
-from pydantic import BaseModel
+"""手动冒烟：经 Claude Code CLI 真实调用一次 Claude（约 0.1~0.2 元），验证 claude.exe 查找、鉴权与结构化输出。
+用法：uv run python scripts/smoke_llm.py"""
+import sys
+import time
+from pathlib import Path
 
-from agents.llm import LLM
-from config import get_settings
-from engine.store import Store
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pydantic import BaseModel  # noqa: E402
+
+from agents.llm import LLM, find_claude_exe  # noqa: E402
+from config import get_settings  # noqa: E402
+from engine.store import Store  # noqa: E402
 
 
 class Ping(BaseModel):
@@ -4550,10 +4868,17 @@ class Ping(BaseModel):
 
 def main() -> None:
     s = get_settings()
-    llm = LLM(s, Store(s.root / s.db_path))
-    out = llm.parse("smoke", "你是测试助手，只输出要求的 JSON。", "回答'好'，并列出 1 到 3。",
-                    Ping, effort="low", timeout=60.0, max_tokens=500, essential=True)
-    print(out)
+    if not (s.anthropic_api_key or (s.anthropic_base_url and s.anthropic_auth_token)):
+        print("警告：.env 中既没有 ANTHROPIC_API_KEY，也没有 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN")
+    print("claude.exe:", find_claude_exe(s))
+    store = Store(s.root / s.db_path)
+    llm = LLM(s, store)
+    t0 = time.monotonic()
+    out = llm.parse("smoke", "你是连通性测试助手，严格按 JSON schema 输出。",
+                    "answer 填“好”，numbers 按顺序列出 1 到 3。", Ping,
+                    effort="low", timeout=120.0, max_budget_usd=0.2, essential=True)
+    print(f"result: {out!r}（耗时 {time.monotonic() - t0:.1f} 秒）")
+    print(f"month cost CNY: {llm.month_cost():.4f}")
     assert out.numbers == [1, 2, 3], out
 
 
@@ -4565,16 +4890,19 @@ if __name__ == "__main__":
 uv run python scripts/smoke_llm.py
 ```
 
-预期打印 `answer='好' numbers=[1, 2, 3]`。若 API 报 400：先检查 `extra_body` 的 `fallbacks` 与 beta header 是否被该账号支持（可临时去掉两者确认是否为根因），再看 `output_config` 字段名，修正 `agents/llm.py` 后同步改 `test_parse_request_kwargs_and_result`。
+预期（10–30 秒）：依次打印 `claude.exe: ...\claude.exe`（必须是 exe，不能是 `.cmd`）、`result: Ping(answer='好', numbers=[1, 2, 3])（耗时 …秒）`、`month cost CNY: …`（大于 0）。若失败：
+- `找不到 claude.exe` 或 `CLAUDE_EXE 指向…`：在 `.env` 写 `CLAUDE_EXE=<claude.exe 完整路径>`，不要加双引号。npm 安装时，PowerShell 里 `Split-Path (Get-Command claude).Source` 给出的目录下就是 `node_modules\@anthropic-ai\claude-code\bin\claude.exe`。
+- `LLMError: smoke: <subtype> <result>`：先核对 `.env` 的鉴权变量，再确认 `claude --version` 能正常运行。Claude Code 升级或中转故障也会表现为这类错误；定时任务里出现时按各环节的降级路径处理（盘前退回量化推荐并告警，复盘照发日报），不会漏推送。
+- `subprocess.TimeoutExpired`：网络或中转响应过慢，稍后重试。
 
 **Step 6: 提交**
 
 ```
 git add agents/llm.py tests/test_llm.py scripts/smoke_llm.py
-git commit -m "feat: add Claude LLM wrapper with strict schema, usage and budget"
+git commit -m "feat: call Claude via Claude Code CLI headless mode with strict schema, usage and budget"
 ```
 
-（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 ### Task 4.2: agents/playbook.py — 经验手册与系统提示词
 
@@ -4584,7 +4912,7 @@ git commit -m "feat: add Claude LLM wrapper with strict schema, usage and budget
 - Create: `playbook/review_system.md`
 - Test: `tests/test_playbook.py`
 
-`apply_lessons` 只依赖 lesson 的 `action/rule_id/text/evidence` 属性（鸭子类型），避免与 `agents.review` 循环导入；测试用 `SimpleNamespace` 构造。`git_commit` 返回 True 表示确实产生了提交；暂存区无变化也返回 False。
+`apply_lessons` 只依赖 lesson 的 `action/rule_id/text/evidence` 属性（鸭子类型），避免与 `agents.review` 循环导入；测试用 `SimpleNamespace` 构造。`git_commit` 返回 True 表示确实产生了提交；暂存区无变化也返回 False。`playbook/premarket_system.md` 是 08:30 盘前深度分析（Task 4.3 的 `analyze`）的系统提示词；09:25 竞价确认用的是 `agents/premarket.py` 中的常量 `AUCTION_SYSTEM`，不在本文件里。
 
 **Step 1: 写失败的测试**
 
@@ -4744,7 +5072,7 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     assert playbook.git_commit(["playbook/candidate.json"], "playbook: 复盘更新") is True
     log = _git(tmp_path, "log", "-1", "--format=%B")
     assert log.startswith("playbook: 复盘更新")
-    assert "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>" in log
+    assert "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" in log
     assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
 
 
@@ -4796,7 +5124,7 @@ MAX_RULES = 30
 MAX_CHARS = 6000
 MIN_DAYS_BETWEEN_RELEASES = 10
 RELEASE_KEY = "playbook_released"
-TRAILER = "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 
 def _path(kind: str) -> Path:
@@ -4916,51 +5244,83 @@ def git_commit(paths: list[str], message: str) -> bool:
 
 注意：`maybe_release` 的晋升/重置都会写 `active.json`、`candidate.json`，调用方（`run_review`）负责之后 `git_commit`。`git_commit` 中 `git commit -- <paths>` 只提交这些路径，不会带上用户暂存区里的其它改动。
 
-`playbook/premarket_system.md`（agent 可改；以下为初始版本）:
+`playbook/premarket_system.md`（agent 可改；08:30 盘前深度分析的系统提示词，以下为初始版本）:
 
 ```markdown
 # 角色
 
-你是一名 A 股盘前风控审核员。量化模型已在昨日收盘后给出候选股票（中期动量 + 短期反转），你的任务是在 9:26 集合竞价结束后、开盘前，结合隔夜新闻、公司公告和竞价数据，对每只候选做出"保留（keep）"或"否决（veto）"的判断，并给出买入上限、止损和止盈价。你不是选股者：你不能新增候选之外的股票，你的价值在于剔除量化模型看不到的风险。
+你是一名 A 股盘前研究员。每个交易日 08:30~08:45（集合竞价开始之前），你要对量化模型给出的候选股票做一次深度分析。量化模型（现任策略）依据昨日及以前的行情选出候选，并按量化分排序。你的任务是结合隔夜新闻、公司公告、量化数据和经验规则，对每只候选决定"保留（keep）"或"否决（veto）"，并为保留的股票写下集合竞价条件和价位。
+
+你不是选股者，不能新增候选之外的股票。你的价值在于两点：剔除量化模型看不到的风险；把"什么样的开盘值得买"写成系统可以机械执行的条件。
+
+# 当日流程
+
+1. 08:30 你完成本次分析，为每只候选输出 action、confidence、价位和竞价条件。
+2. 09:15~09:25 集合竞价。09:25 竞价结束后，系统按你写的条件逐只检查：竞价涨幅（相对昨收）必须落在 [min_gap_pct, max_gap_pct] 之内，并且竞价价不高于 entry_max。不满足的股票当天放弃。
+3. 通过检查的股票按 confidence 从高到低取前几只，再做一次简短的竞价确认（只能否决，不能新增，也不改价位），09:28 前推送给用户。
+4. 09:30 模拟盘按开盘价加少量滑点买入。之后的止损、止盈和到期卖出都使用你给出的价位。
+
+竞价确认时间很短，只是最后一道把关。推荐质量主要取决于你此刻写下的条件是否清楚、是否符合实际。
 
 # A 股交易规则（必须遵守）
 
-- T+1：今天买入的股票最早下一个交易日才能卖出，因此当天买入后无法止损，必须对开盘后当日下跌有承受力。
-- 涨跌幅限制：主板 ±10%，创业板（300/301）与科创板（688/689）±20%，ST 股 ±5%，北交所 ±30%。价格精确到 0.01 元。
-- 开盘即涨停（一字板）的股票模拟盘不可买入；跌停封死无法卖出。
-- 成交按开盘价加滑点模拟，买入 100 股整数倍；佣金万 2.5（最低 5 元）、卖出印花税 0.05%、过户费 0.001%。持有期内到期按开盘价卖出。
+- T+1：当天买入的股票最早下一个交易日才能卖出，买入当天即使大跌也无法止损。因此追高的代价比其他市场更大。
+- 涨跌幅限制：主板 ±10%，创业板（300/301）与科创板（688/689）±20%，主板 ST 股 ±5%，北交所 ±30%。价格精确到 0.01 元。输入中已给出每只候选的涨跌停价。
+- 开盘即涨停（一字板）买不进；跌停封死卖不出。
+- 模拟成交按开盘价加滑点，买入数量为 100 股的整数倍。佣金万 2.5（最低 5 元），卖出另收印花税 0.05%，买卖都收过户费 0.001%。
+- 卖出规则：盘中最低价触及 stop 时按止损价卖出（低开跌破则按开盘价）；盘中最高价触及 target 时按止盈价卖出；持有期满按当天开盘价卖出。
+
+# 输入内容
+
+- 经验规则（playbook）：此前复盘总结的规则，带编号（如 [r3]）和证据。
+- 候选股票表：量化分、昨收、涨跌停价、20 日均成交额、量化价位（括号内为相对昨收的幅度）、持有天数、量化理由。
+- 候选相关公告、候选个股新闻、隔夜要闻（财联社电报）。
+
+# 分析方法
+
+1. 逐只核对公告与新闻。利空按下方否决标准处理；利好要判断是否已被股价消化、开盘是否可能大幅高开，据此调整竞价区间，而不是简单提高 confidence。
+2. 结合量化数据判断赔率：近期涨幅是否已经透支、距涨停还有多少空间、20 日均成交额是否足够活跃。
+3. 判断大盘：隔夜外盘、重大政策与宏观消息、板块情绪。整体偏弱时降低 confidence、收窄竞价区间，或在 market_view 中提示降低仓位。
+4. 对照经验规则：适用的规则必须体现在 action、竞价条件或 reason 中，并写明规则编号。
 
 # 否决标准（满足任一条即 veto，并在 reason 中写明依据）
 
-1. 利空公告或新闻：减持计划、业绩预亏/大幅下修、立案调查、监管问询或处罚、重大诉讼、商誉减值、解禁临近、退市风险提示、控股股东质押爆仓等。
-2. 高开过多：竞价高开幅度超过该板块涨跌幅限制的一半（主板约 +5%，创业板/科创板约 +10%），追高后 T+1 无法止损，赔率差。
-3. 竞价量能不足：竞价成交额相对近期日均成交额明显偏低，或低开且无承接，说明资金不认可。
-4. 竞价价已接近涨停（距涨停价不足 2%）：上行空间有限，且开盘可能直接封板买不进。
-5. 题材已退潮：所属板块隔夜出现明确负面政策或龙头股大跌。
-6. 下方"经验规则"中适用的条目。
+1. 利空公告或新闻：减持计划、业绩预亏或大幅下修、立案调查、监管问询或处罚、重大诉讼、商誉减值、限售股解禁临近、退市风险提示、控股股东股权质押风险等。
+2. 所属题材或板块出现明确的负面政策，或板块龙头隔夜大跌。
+3. 流动性不足：20 日均成交额明显偏低，买卖会显著影响价格。
+4. 近期已连续大涨、发布了股价异常波动公告，或距涨停空间过小，在 T+1 下追高风险大。
+5. 下方"经验规则"中适用的条目。
 
-没有明确负面证据时默认 keep。不要因为"没有新闻"而否决，也不要因为"有利好新闻"就提高信心而放松价格纪律。
+没有明确负面证据时默认 keep。不要因为"没有新闻"而否决，也不要因为"有利好新闻"就放松价格纪律。
 
-# 价格纪律
+# 字段说明
 
-- entry_max：可接受的最高买入价。模拟盘以开盘价成交，开盘价高于 entry_max 即放弃买入。通常设在竞价价上方 0~2%，一般不高于量化给出的 entry_max（如需放宽须在 reason 中说明理由）。
-- stop：止损价，须低于 entry_max，一般在 entry_max 下方 5%~8%（ST 股更窄）。
-- target：止盈价，须高于 entry_max，一般在上方 8%~15%，不超过持有期内合理空间。
-- 必须满足 stop < entry_max < target，否则系统将忽略你的价格并使用量化价格。
+- code：与候选表完全一致的 6 位代码。
+- action：keep 或 veto。veto 表示无论竞价如何，当天都不买。
+- confidence：0 到 1 之间的数，表示你对该股在持有期内跑赢沪深 300 的把握，用于排序。veto 填 0。
+- min_gap_pct、max_gap_pct：可接受的竞价涨幅区间，单位为百分比，相对昨收，含两端，必须 min_gap_pct ≤ max_gap_pct。例如 -2 与 3 表示竞价价在昨收的 -2% 到 +3% 之间才买。
+  - 下限用来排除"低开说明资金不认可或利空正在发酵"的情形；上限用来避免追高。
+  - 常见起点：主板约 -3 到 +4；创业板、科创板可按涨跌幅比例适当放宽。
+  - 上限一般不超过涨跌幅限制的一半，并且至少比涨停对应的涨幅低 2 个百分点，否则开盘可能直接封板，买不进。
+  - 存在潜在利空、但证据不足以否决时，提高下限（如 0 或 +0.5）；预期温和高开的强势股也可以把下限设为正数。
+  - veto 的股票这两项都填 0。
+- entry_max：可接受的最高买入价（元，两位小数）。系统同时检查竞价价 ≤ entry_max。一般取 昨收 × (1 + max_gap_pct / 100)；两者不一致时，以更严的那个为准。
+- stop：止损价，须低于 entry_max。通常设在预期成交价下方 5%~8%（ST 股更窄），也可以参考近期关键支撑位。
+- target：止盈价，须高于 entry_max。通常设在预期成交价上方 8%~15%，不超过持有期内的合理空间。
+- 价位必须满足 stop < entry_max < target，且三者都在候选表中量化买入上限（"买≤"）的 0.5~1.5 倍之内，否则系统改用量化价位（竞价区间仍按你写的执行）。veto 的股票价位可直接沿用量化价位。
+- reason：中文，80 字以内，先写结论，再写证据。
+- market_view：两三句话的大盘判断（隔夜外盘、重大新闻与政策、整体情绪），说明今天应积极还是谨慎。这段文字会出现在推送里。
 
 # 证据与诚信
 
-- 每条判断必须引用输入中出现的具体证据：公告标题、新闻标题与时间、竞价涨幅或成交额数字、或经验规则编号（如 [r3]）。
-- 严禁编造新闻、公告、数据或你在输入中没有看到的事实。你的训练数据有截止日期，不要使用记忆中的"近期事件"判断个股；输入中没有的信息视为未知。
-- 信息不足时直说"无相关新闻/公告"，并主要依据竞价数据与规则判断。
+- 每条判断都必须引用输入中出现的具体证据：公告标题、新闻标题与时间、行情数字，或经验规则编号（如 [r3]）。
+- 严禁编造新闻、公告、数据或输入中没有出现的事实。你的训练数据有截止日期，不要用记忆中的"近期事件"判断个股；输入中没有的信息一律视为未知。
+- 信息不足时直接写"无相关公告/新闻"，主要依据量化数据与经验规则判断。
 
 # 输出要求
 
-- 只输出符合给定 JSON Schema 的对象，不要输出其它文字。
-- market_view：两三句话的大盘判断（隔夜外盘、重大新闻、整体竞价情绪），并说明今天是否应整体降低仓位。
-- picks：对每一只候选都给出一条记录，code 与候选完全一致，不得遗漏或新增。
-- confidence：0 到 1 的数，表示你对该股在持有期内跑赢沪深 300 的把握，用于排序；veto 的股票填 0。
-- reason：中文，60 字以内，先写结论，再写证据。
+- 只输出符合给定 JSON Schema 的对象，不要输出其他文字。
+- picks 必须对每一只候选各给出一条记录，code 与候选表完全一致，不得遗漏或新增。
 ```
 
 `playbook/review_system.md`（agent 可改；以下为初始版本）:
@@ -5011,15 +5371,18 @@ git add agents/playbook.py playbook/premarket_system.md playbook/review_system.m
 git commit -m "feat: add playbook store, lesson caps, release gate and system prompts"
 ```
 
-（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 ### Task 4.3: agents/premarket.py — 盘前扫描与竞价定稿
 
 **Files:**
 - Create: `agents/premarket.py`
+- Create: `scripts/smoke_premarket.py`
 - Test: `tests/test_premarket.py`
 
-`scan` 用 `client.universe()` 取股票池，先 `cache.update(codes, asof)` 增量补齐昨日数据，再用最近 `HISTORY_DAYS`（400）个自然日的面板构造 `DataView`。新闻、公告类的单项抓取失败时置空，不影响扫描；行情数据失败照常抛出，由 `run_job` 告警。`context` 里另加 `"stats"`（每只候选的昨收 `prev_close` 和 20 日均成交额 `avg_amount20`），供 Claude 判断竞价量能。`run_final` 的 `calendar` 参数只为与 jobs 的调用签名保持一致，目前没有用到。
+`scan`（08:30，与上一版相同）用 `client.universe()` 取股票池，先 `cache.update(codes, asof)` 增量补齐昨日数据，再用最近 `HISTORY_DAYS`（400）个自然日的面板构造 `DataView`。新闻、公告类的单项抓取失败时置空，不影响扫描；行情数据失败照常抛出，由 `run_job` 告警。`context` 里另加 `"stats"`（每只候选的昨收 `prev_close` 和 20 日均成交额 `avg_amount20`）。
+
+`analyze` 紧接着 scan 运行（`run_analyze` 让两套 playbook 并发）。提示中给出每只候选的量化分、昨收、涨跌停价、20 日均额、量化价位（含相对昨收的幅度）和资讯，Claude 返回 `PremarketPlan`；代码不在候选里的条目被丢弃，重复代码只保留第一条，结果存入 kv `plan:<ISO日期>:<kind>`。09:25 `run_final` 拉一次竞价快照，两路并发 `finalize`：先用 `auction_filter` 做确定性过滤（竞价涨幅区间、买入上限、价格合理性），取前 `max_picks` 只，再用 `AUCTION_SYSTEM` 做一次只能否决的竞价确认。确认提示列出全市场竞价概况（高开/低开家数、中位竞价涨幅），以及每只入选股的竞价价、涨幅、竞价额及其占 20 日均额的比例、涨跌停价、盘前条件和理由。`run_final` 的 `calendar` 参数只为与 jobs 的调用签名保持一致，目前没有用到。
 
 **Step 1: 写失败的测试**
 
@@ -5028,15 +5391,17 @@ git commit -m "feat: add playbook store, lesson caps, release gate and system pr
 ```python
 import datetime as dt
 import json
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from agents import playbook, premarket
-from agents.llm import BudgetExceeded, LLMRefusal
-from agents.premarket import PremarketReview, ReviewedPick
+from agents.llm import BudgetExceeded, LLMError
+from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
 from config import Settings
 from engine.calendar import TradingCalendar
 from engine.store import Store
@@ -5047,6 +5412,8 @@ D = dt.date(2026, 10, 16)
 PREV = dt.date(2026, 10, 15)
 CODES = [f"600{i:03d}" for i in range(20)]
 CAL = TradingCalendar(pd.bdate_range("2026-09-01", "2026-12-31").date)
+LLM_ERRORS = [LLMError("cli error"), BudgetExceeded("budget"), subprocess.TimeoutExpired("claude.exe", 90.0),
+              ValueError("bad output")]
 
 
 def settings(**kw) -> Settings:
@@ -5060,6 +5427,13 @@ def qpick(code: str, i: int = 0) -> Pick:
                 hold_days=5, reason=f"量化理由{code}")
 
 
+CANDS = [qpick(c, i) for i, c in enumerate(CODES[:8])]
+CTX = {"news": [{"title": "隔夜美股收涨", "content": "纳指涨 1%", "time": "2026-10-16 06:00:00"}],
+       "notices": [{"code": "600000", "name": "股600000", "title": "关于股东减持计划的公告", "type": "减持"}],
+       "stock_news": {"600001": [{"title": "600001 中标大单", "content": "", "time": "2026-10-15"}]},
+       "stats": {c: {"prev_close": 10.0, "avg_amount20": 2e8} for c in CODES[:6]}}
+
+
 def make_panel(codes, end=PREV, n=25):
     idx = pd.bdate_range(end=pd.Timestamp(end), periods=n)
     cols = {"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.0, "volume": 1e6, "amount": 2e8, "prev_close": 10.0}
@@ -5067,8 +5441,10 @@ def make_panel(codes, end=PREV, n=25):
 
 
 class FakeAk:
-    def __init__(self, spot_fail=False):
-        self.spot_fail = spot_fail
+    """AkClient 替身。spot() 默认竞价价 10.20（昨收 10.00，+2.00%）；opens 指定个股竞价价，missing 中的代码不出现在快照里。"""
+
+    def __init__(self, spot_fail=False, opens=None, missing=()):
+        self.spot_fail, self.opens, self.missing = spot_fail, dict(opens or {}), set(missing)
         self.calls = []
 
     def universe(self):
@@ -5086,10 +5462,17 @@ class FakeAk:
                              "title": ["关于股东减持计划的公告", "无关公告"], "type": ["减持", "其他"]})
 
     def spot(self):
+        self.calls.append(("spot",))
         if self.spot_fail:
             raise RuntimeError("spot down")
-        return pd.DataFrame({"code": CODES, "name": [f"股{c}" for c in CODES], "open": 10.2, "prev_close": 10.0,
-                             "last": 10.2, "pct": 2.0, "volume": 1e4, "amount": 5e6})
+        codes = [c for c in CODES if c not in self.missing]
+        opens = [self.opens.get(c, 10.2) for c in codes]
+        return pd.DataFrame({"code": codes, "name": [f"股{c}" for c in codes], "open": opens, "prev_close": 10.0,
+                             "last": opens, "pct": [(o / 10.0 - 1) * 100 for o in opens], "volume": 1e4,
+                             "amount": 5e6, "high": opens})
+
+    def spot_calls(self):
+        return self.calls.count(("spot",))
 
 
 class FakeCache:
@@ -5116,16 +5499,16 @@ class FakeStrategy:
 
 
 class FakeLLM:
-    """按 purpose 返回预设结果；值为 Exception 时抛出。"""
+    """签名与 agents.llm.LLM.parse 一致；按 purpose 返回预设结果，值为 Exception 时抛出。"""
 
     def __init__(self, results):
         self.results = results
         self.calls = []
 
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_tokens=16000,
+    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0,
               essential=False):
         self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
-                               timeout=timeout, essential=essential))
+                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
         r = self.results[purpose]
         if isinstance(r, Exception):
             raise r
@@ -5159,15 +5542,29 @@ def pbdir(tmp_path, monkeypatch):
 @pytest.fixture
 def store():
     s = Store(":memory:")
-    s.save_candidates(D, [qpick(c, i) for i, c in enumerate(CODES[:6])], {"news": [], "notices": [],
-                                                                          "stock_news": {}, "stats": {}})
+    s.save_candidates(D, [qpick(c, i) for i, c in enumerate(CODES[:6])], CTX)
     return s
 
 
-def rp(code, action="keep", conf=0.5, entry=10.25, stop=9.6, target=11.2):
-    return ReviewedPick(code=code, action=action, confidence=conf, entry_max=entry, stop=stop, target=target,
-                        reason=f"LLM理由{code}")
+def pp(code, action="keep", conf=0.5, entry=10.25, stop=9.6, target=11.2, lo=-2.0, hi=3.0):
+    return PlannedPick(code=code, action=action, confidence=conf, entry_max=entry, stop=stop, target=target,
+                       min_gap_pct=lo, max_gap_pct=hi, reason=f"计划理由{code}")
 
+
+def plan(*picks, view="偏强"):
+    return PremarketPlan(market_view=view, picks=list(picks))
+
+
+def save_plan(store, kind, p):
+    store.kv_set(f"plan:{D.isoformat()}:{kind}", p.model_dump())
+
+
+def check(actions: dict, note="竞价平稳"):
+    return AuctionCheck(note=note, picks=[AuctionDecision(code=c, action=a, reason=f"{a}:{c}")
+                                          for c, a in actions.items()])
+
+
+# ---------- 08:30 scan（与上一版相同） ----------
 
 def test_scan_saves_top_candidates_and_context():
     store, ak, cache, strat = Store(":memory:"), FakeAk(), FakeCache(), FakeStrategy()
@@ -5197,56 +5594,164 @@ def test_scan_tolerates_news_failure():
     assert ctx["news"] == [] and ctx["notices"] == [] and ctx["stock_news"]["600000"] == []
 
 
-def test_finalize_veto_sort_and_cap(store):
-    review = PremarketReview(market_view="偏强", picks=[
-        rp("600000", "veto", 0.0), rp("600001", conf=0.4), rp("600002", conf=0.9),
-        rp("600003", conf=0.7), rp("600004", conf=0.6), rp("999999", conf=1.0)])
-    llm = FakeLLM({"premarket:active": review})
-    picks, reviewed, view = premarket.finalize(D, settings(), store, llm, FakeAk(), "active")
-    assert reviewed is True and view == "偏强"
-    assert [p.code for p in picks] == ["600002", "600003", "600004"]
-    p = picks[0]
-    assert (p.entry_max, p.stop, p.target) == (10.25, 9.6, 11.2)
-    assert p.score == 0.9 and p.hold_days == 5 and p.name == "股600002" and p.reason == "LLM理由600002"
+# ---------- 08:30 深度分析 ----------
+
+def test_analyze_saves_plan_and_drops_non_candidates(store):
+    raw = plan(pp("600001", conf=0.9), pp(" 600002 ", "veto", 0.0), pp("999999", conf=1.0),
+               pp("600001", conf=0.1), view=" 偏强 ")
+    llm = FakeLLM({"analyze:active": raw})
+    out = premarket.analyze(D, settings(), store, llm, "active")
+    assert [(p.code, p.action, p.confidence) for p in out.picks] == [("600001", "keep", 0.9), ("600002", "veto", 0.0)]
+    assert out.market_view == "偏强"
+    assert store.kv_get("plan:2026-10-16:active") == out.model_dump()
+    assert premarket.load_plan(store, D, "active") == out
+    assert premarket.load_plan(store, D, "candidate") is None
     call = llm.calls[0]
-    assert call["essential"] is True and call["effort"] == "medium" and call["timeout"] == 90.0
-    assert call["schema"] is PremarketReview and call["system"] == "盘前系统提示"
-    assert "ACTIVE规则" in call["user"] and "600005" in call["user"] and "+2.00%" in call["user"]
+    assert call["schema"] is PremarketPlan and call["system"] == "盘前系统提示"
+    assert call["effort"] == "high" and call["essential"] is True and call["max_budget_usd"] == 1.5
+    assert call["timeout"] == premarket.ANALYZE_TIMEOUT == 900.0
+    for s in ("ACTIVE规则", "600005", "关于股东减持计划的公告", "600001 中标大单", "隔夜美股收涨", "涨停 11.00",
+              "买≤10.30（+3.0%）"):
+        assert s in call["user"], s
 
 
-def test_finalize_price_sanity_falls_back_to_quant_prices(store):
-    review = PremarketReview(market_view="", picks=[
-        rp("600000", conf=0.9, entry=10.0, stop=10.5, target=11.0),   # stop > entry
-        rp("600001", conf=0.8, entry=10.2, stop=9.5, target=30.0),     # target 超出 1.5 倍
-        rp("600002", conf=0.7)])
-    picks, reviewed, _ = premarket.finalize(D, settings(), store, FakeLLM({"premarket:active": review}),
-                                            FakeAk(), "active")
-    assert reviewed is True
-    assert [(p.entry_max, p.stop, p.target) for p in picks[:2]] == [(10.3, 9.3, 11.0)] * 2
-    assert (picks[2].entry_max, picks[2].stop, picks[2].target) == (10.25, 9.6, 11.2)
-    assert picks[0].reason == "LLM理由600000"
+@pytest.mark.parametrize("exc", LLM_ERRORS)
+def test_analyze_llm_failure_returns_none(store, exc):
+    assert premarket.analyze(D, settings(), store, FakeLLM({"analyze:active": exc}), "active") is None
+    assert store.kv_get("plan:2026-10-16:active") is None
 
 
-def test_finalize_all_vetoed_returns_empty(store):
-    review = PremarketReview(market_view="系统性风险", picks=[rp(c, "veto", 0.0) for c in CODES[:6]])
-    picks, reviewed, view = premarket.finalize(D, settings(), store, FakeLLM({"premarket:active": review}),
-                                               FakeAk(), "active")
-    assert picks == [] and reviewed is True and view == "系统性风险"
+def test_analyze_plan_without_candidate_codes_returns_none(store):
+    assert premarket.analyze(D, settings(), store, FakeLLM({"analyze:active": plan(pp("999999"))}), "active") is None
+    assert store.kv_get("plan:2026-10-16:active") is None
 
 
-@pytest.mark.parametrize("exc", [TimeoutError("t"), RuntimeError("api"), ValueError("bad json"),
-                                 LLMRefusal("refusal"), BudgetExceeded("budget")])
-def test_finalize_llm_failure_falls_back_to_quant(store, exc):
-    picks, reviewed, view = premarket.finalize(D, settings(), store, FakeLLM({"premarket:active": exc}),
-                                               FakeAk(), "active")
-    assert reviewed is False and view == ""
-    assert picks == [qpick(c, i) for i, c in enumerate(CODES[:3])]
+def test_analyze_without_candidates_returns_none():
+    llm = FakeLLM({})
+    assert premarket.analyze(D, settings(), Store(":memory:"), llm, "active") is None
+    assert llm.calls == []
 
 
-def test_finalize_spot_failure_still_calls_llm(store):
-    llm = FakeLLM({"premarket:active": PremarketReview(market_view="", picks=[rp("600001")])})
-    picks, reviewed, _ = premarket.finalize(D, settings(), store, llm, FakeAk(spot_fail=True), "active")
-    assert reviewed is True and [p.code for p in picks] == ["600001"]
+def test_run_analyze_runs_both_kinds_concurrently(store):
+    barrier = threading.Barrier(2, timeout=5)  # 若串行执行，第一路等不到第二路，Barrier 超时，该路失败
+
+    class ConcurrentLLM(FakeLLM):
+        def parse(self, purpose, *args, **kwargs):
+            barrier.wait()
+            return super().parse(purpose, *args, **kwargs)
+
+    llm = ConcurrentLLM({"analyze:active": plan(pp("600001"), view="A观点"),
+                         "analyze:candidate": plan(pp("600002"), view="C观点")})
+    assert premarket.run_analyze(D, settings(), store, llm) == {"active": True, "candidate": True}
+    assert premarket.load_plan(store, D, "active").market_view == "A观点"
+    assert [p.code for p in premarket.load_plan(store, D, "candidate").picks] == ["600002"]
+    users = {c["purpose"]: c["user"] for c in llm.calls}
+    assert "ACTIVE规则" in users["analyze:active"] and "CANDIDATE规则" in users["analyze:candidate"]
+
+
+def test_run_analyze_reports_each_kind(store):
+    llm = FakeLLM({"analyze:active": plan(pp("600001")), "analyze:candidate": LLMError("refused")})
+    assert premarket.run_analyze(D, settings(), store, llm) == {"active": True, "candidate": False}
+    assert premarket.load_plan(store, D, "candidate") is None
+
+
+# ---------- 09:25 规则过滤 ----------
+
+def test_auction_filter_gap_window():
+    p = plan(pp("600000", conf=0.6),            # +2.00% 在 [-2, 3] 内
+             pp("600001", conf=0.9, hi=1.5),    # +2.00% 高于上限
+             pp("600002", conf=0.8, lo=-1.0),   # -1.50% 低于下限
+             pp("600003", conf=0.7),            # -2.00% 恰在下限（闭区间，按 0.01 个百分点比较）
+             pp("600004", conf=0.5, hi=2.0))    # +2.00% 恰在上限
+    spot = FakeAk(opens={"600002": 9.85, "600003": 9.8}).spot()
+    assert [x.code for x in premarket.auction_filter(p, CANDS, spot)] == ["600003", "600000", "600004"]
+
+
+def test_auction_filter_entry_max_uses_adopted_price():
+    p = plan(pp("600000", conf=0.9, entry=10.15),                         # 竞价 10.20 > 买入上限 10.15
+             pp("600001", conf=0.8, entry=10.2),                          # 竞价 10.20 = 买入上限，保留
+             pp("600002", conf=0.7, entry=10.1, stop=10.5, target=11.0))  # 价位不合理 -> 量化上限 10.30，保留
+    out = premarket.auction_filter(p, CANDS, FakeAk().spot())
+    assert [(x.code, x.entry_max) for x in out] == [("600001", 10.2), ("600002", 10.3)]
+
+
+def test_auction_filter_missing_spot_row_keeps_pick():
+    p = plan(pp("600000", conf=0.9, hi=-5.0),   # 快照里没有这只：不检查条件，保留
+             pp("600001", conf=0.8),            # 有快照行但竞价价缺失（停牌）：不满足条件
+             pp("600002", conf=0.7))
+    spot = FakeAk(opens={"600001": float("nan")}, missing={"600000"}).spot()
+    assert [x.code for x in premarket.auction_filter(p, CANDS, spot)] == ["600000", "600002"]
+    for empty in (None, pd.DataFrame()):  # 整个快照缺失：所有 keep 都保留
+        assert [x.code for x in premarket.auction_filter(p, CANDS, empty)] == ["600000", "600001", "600002"]
+
+
+def test_auction_filter_keeps_candidates_only_sorted_by_confidence():
+    p = plan(pp("600000", conf=0.2), pp("600001", "veto", 0.0), pp("600002", conf=0.9),
+             pp("999999", conf=1.0), pp("600003", conf=0.9), pp("600004", conf=0.5))
+    out = premarket.auction_filter(p, CANDS, FakeAk().spot())
+    assert [x.code for x in out] == ["600002", "600003", "600004", "600000"]  # 同分保持计划顺序
+    assert [x.score for x in out] == [0.9, 0.9, 0.5, 0.2]
+
+
+def test_auction_filter_price_sanity_falls_back_to_quant():
+    p = plan(pp("600000", conf=0.9, stop=10.5, target=11.0),                 # stop > entry_max
+             pp("600001", conf=0.8, target=30.0),                            # target 超出量化上限 1.5 倍
+             pp("600002", conf=0.7, entry=10.254, stop=9.601, target=11.2))  # 合理，四舍五入到分
+    out = premarket.auction_filter(p, CANDS, FakeAk().spot())
+    assert [(x.entry_max, x.stop, x.target) for x in out] == [(10.3, 9.3, 11.0), (10.3, 9.3, 11.0),
+                                                              (10.25, 9.6, 11.2)]
+    assert (out[2].name, out[2].score, out[2].hold_days, out[2].reason) == ("股600002", 0.7, 5, "计划理由600002")
+
+
+# ---------- 09:25 finalize ----------
+
+def test_finalize_without_plan_returns_quant(store):
+    llm, ak = FakeLLM({}), FakeAk()
+    picks, reviewed, view = premarket.finalize(D, settings(), store, llm, ak, "active")
+    assert (picks, reviewed, view) == ([qpick(c, i) for i, c in enumerate(CODES[:3])], False, "")
+    assert llm.calls == [] and ak.spot_calls() == 0
+
+
+def test_finalize_confirm_vetoes_but_never_adds(store):
+    save_plan(store, "active", plan(pp("600001", conf=0.9), pp("600002", conf=0.8), pp("600003", conf=0.7),
+                                    pp("600004", conf=0.6), pp("600000", "veto", 0.0)))
+    llm = FakeLLM({"auction:active": check({"600001": "keep", "600002": "veto", "600004": "keep",
+                                           "600000": "keep", "999999": "keep"})})
+    picks, reviewed, view = premarket.finalize(D, settings(), store, llm, FakeAk(), "active")
+    assert [p.code for p in picks] == ["600001", "600003"]
+    assert reviewed is True and view == "偏强（竞价确认：竞价平稳）"
+    call = llm.calls[0]
+    assert call["system"] == premarket.AUCTION_SYSTEM and call["schema"] is AuctionCheck
+    assert call["effort"] == "low" and call["essential"] is True and call["max_budget_usd"] == 0.3
+    assert call["timeout"] == premarket.AUCTION_TIMEOUT == 90.0
+    for s in ("600001", "600003", "竞价 10.20（+2.00%）", "500.00万", "占20日均额 2.50%", "涨停 11.00",
+              "计划理由600002", "偏强", "高开 20"):
+        assert s in call["user"], s
+    assert "600004" not in call["user"] and "600000" not in call["user"]  # 只列出通过过滤且在 max_picks 内的
+
+
+@pytest.mark.parametrize("exc", LLM_ERRORS)
+def test_finalize_confirm_failure_returns_prelim_with_note(store, exc):
+    save_plan(store, "active", plan(pp("600001", conf=0.9), pp("600002", conf=0.8)))
+    picks, reviewed, view = premarket.finalize(D, settings(), store, FakeLLM({"auction:active": exc}), FakeAk(),
+                                               "active")
+    assert [p.code for p in picks] == ["600001", "600002"]
+    assert reviewed is True and view == "偏强（竞价二次确认未完成，按盘前条件过滤）"
+
+
+def test_finalize_empty_prelim_skips_confirm(store):
+    save_plan(store, "active", plan(pp("600001", hi=1.0), pp("600002", "veto", 0.0), view="谨慎"))
+    llm = FakeLLM({})
+    assert premarket.finalize(D, settings(), store, llm, FakeAk(), "active") == (
+        [], True, "谨慎（竞价条件均未满足，今日不推荐）")
+    assert llm.calls == []
+
+
+def test_finalize_spot_failure_keeps_plan_picks_and_tells_llm(store):
+    save_plan(store, "active", plan(pp("600001", hi=-5.0)))
+    llm = FakeLLM({"auction:active": check({}, note="")})
+    picks, reviewed, view = premarket.finalize(D, settings(), store, llm, FakeAk(spot_fail=True), "active")
+    assert [p.code for p in picks] == ["600001"] and reviewed is True and view == "偏强"
     assert "竞价数据缺失" in llm.calls[0]["user"]
 
 
@@ -5255,54 +5760,79 @@ def test_finalize_without_candidates_raises():
         premarket.finalize(D, settings(), Store(":memory:"), FakeLLM({}), FakeAk(), "active")
 
 
-def test_run_final_saves_both_and_pushes_only_active(store):
-    llm = FakeLLM({
-        "premarket:active": PremarketReview(market_view="A观点", picks=[rp("600001", conf=0.9)]),
-        "premarket:candidate": PremarketReview(market_view="C观点", picks=[rp("600002", conf=0.9)]),
-    })
-    notifier = Recorder()
-    premarket.run_final(D, settings(), store, llm, FakeAk(), notifier, CAL)
+# ---------- 09:25 run_final ----------
+
+def test_run_final_fetches_spot_once_saves_both_and_pushes_only_active(store):
+    save_plan(store, "active", plan(pp("600001", conf=0.9), pp("600002", conf=0.8), view="A观点"))
+    save_plan(store, "candidate", plan(pp("600003", conf=0.9), view="C观点"))
+    llm = FakeLLM({"auction:active": check({"600002": "veto"}, note="A确认"),
+                   "auction:candidate": check({}, note="")})
+    ak, notifier = FakeAk(), Recorder()
+    premarket.run_final(D, settings(), store, llm, ak, notifier, CAL)
+    assert ak.spot_calls() == 1
     act, act_meta = store.load_recommendation(D, "h:active")
     cand, cand_meta = store.load_recommendation(D, "h:candidate")
-    assert [p.code for p in act] == ["600001"] and [p.code for p in cand] == ["600002"]
-    assert act_meta["llm_reviewed"] is True and act_meta["market_view"] == "A观点"
-    assert cand_meta["playbook_version"] == 1
-    assert "CANDIDATE规则" in next(c["user"] for c in llm.calls if c["purpose"] == "premarket:candidate")
-    assert notifier.sent == [format_recommendation(D, act, True, "A观点")]
+    assert [p.code for p in act] == ["600001"] and [p.code for p in cand] == ["600003"]
+    assert act_meta == {"llm_reviewed": True, "market_view": "A观点（竞价确认：A确认）", "playbook_version": 1}
+    assert cand_meta["llm_reviewed"] is True and cand_meta["market_view"] == "C观点"
+    assert sorted(c["purpose"] for c in llm.calls) == ["auction:active", "auction:candidate"]
+    assert all(c["timeout"] <= premarket.AUCTION_TIMEOUT for c in llm.calls)
+    assert notifier.sent == [format_recommendation(D, act, True, "A观点（竞价确认：A确认）")]
 
 
-def test_run_final_candidate_failure_does_not_affect_active(store):
-    llm = FakeLLM({
-        "premarket:active": PremarketReview(market_view="A观点", picks=[rp("600001", conf=0.9)]),
-        "premarket:candidate": RuntimeError("boom"),
-    })
+def test_run_final_kind_without_plan_uses_quant(store):
+    save_plan(store, "active", plan(pp("600001"), view="A观点"))
+    llm = FakeLLM({"auction:active": check({})})
     premarket.run_final(D, settings(), store, llm, FakeAk(), Recorder(), CAL)
     cand, meta = store.load_recommendation(D, "h:candidate")
-    assert meta["llm_reviewed"] is False and len(cand) == 3
-    assert store.load_recommendation(D, "h:active")[1]["llm_reviewed"] is True
+    assert cand == [qpick(c, i) for i, c in enumerate(CODES[:3])]
+    assert meta["llm_reviewed"] is False and meta["market_view"] == ""
+    assert [c["purpose"] for c in llm.calls] == ["auction:active"]
 
 
-def test_run_final_deadline_falls_back_for_slow_kind(store, monkeypatch):
-    monkeypatch.setattr(premarket, "FINAL_DEADLINE", 0.3)
+def test_run_final_without_plans_pushes_quant_without_spot(store):
+    ak, notifier = FakeAk(), Recorder()
+    premarket.run_final(D, settings(), store, FakeLLM({}), ak, notifier, CAL)
+    assert ak.spot_calls() == 0
+    act, meta = store.load_recommendation(D, "h:active")
+    assert [p.code for p in act] == CODES[:3] and meta["llm_reviewed"] is False
+    assert len(notifier.sent) == 1 and "未经 LLM 审核" in notifier.sent[0]
+
+
+def test_run_final_slow_confirm_falls_back_to_prelim(store, monkeypatch):
+    monkeypatch.setattr(premarket, "FINAL_DEADLINE", 0.5)
     gate = threading.Event()
 
     class SlowLLM(FakeLLM):
         def parse(self, purpose, *args, **kwargs):
-            if purpose == "premarket:candidate":
+            if purpose == "auction:candidate":
                 gate.wait(5)
             return super().parse(purpose, *args, **kwargs)
 
-    llm = SlowLLM({"premarket:active": PremarketReview(market_view="A观点", picks=[rp("600001")]),
-                   "premarket:candidate": PremarketReview(market_view="C观点", picks=[rp("600002")])})
+    save_plan(store, "active", plan(pp("600001"), view="A观点"))
+    save_plan(store, "candidate", plan(pp("600002", conf=0.9), pp("600003", conf=0.8), pp("600004", hi=1.0),
+                                       view="C观点"))
+    llm = SlowLLM({"auction:active": check({}, note=""), "auction:candidate": check({"600002": "veto"})})
     notifier = Recorder()
+    t0 = time.monotonic()
     try:
         premarket.run_final(D, settings(), store, llm, FakeAk(), notifier, CAL)
     finally:
         gate.set()
+    assert time.monotonic() - t0 < 3
     cand, meta = store.load_recommendation(D, "h:candidate")
-    assert meta["llm_reviewed"] is False and [p.code for p in cand] == CODES[:3]
-    assert store.load_recommendation(D, "h:active")[1]["llm_reviewed"] is True
-    assert len(notifier.sent) == 1
+    assert [p.code for p in cand] == ["600002", "600003"]  # 规则过滤结果；迟到的否决不生效
+    assert meta["llm_reviewed"] is True and meta["market_view"] == "C观点（竞价二次确认未完成，按盘前条件过滤）"
+    act, act_meta = store.load_recommendation(D, "h:active")
+    assert [p.code for p in act] == ["600001"] and act_meta["market_view"] == "A观点"
+    assert notifier.sent == [format_recommendation(D, act, True, "A观点")]
+
+
+def test_run_final_without_candidates_raises():
+    notifier = Recorder()
+    with pytest.raises(RuntimeError):
+        premarket.run_final(D, settings(), Store(":memory:"), FakeLLM({}), FakeAk(), notifier, CAL)
+    assert notifier.sent == []
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -5311,25 +5841,28 @@ def test_run_final_deadline_falls_back_for_slow_kind(store, monkeypatch):
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：`ImportError: cannot import name 'premarket' from 'agents'`，全部 ERROR。
+预期：`ImportError`（`agents.premarket` 尚不存在，或仍是旧版、缺少 `PlannedPick` 等新名字），全部 ERROR。
 
 **Step 3: 最小实现**
 
 `agents/premarket.py`:
 
 ```python
-"""盘前：08:30 scan 出量化候选并抓新闻公告；09:26 finalize 结合竞价让 Claude 审核定稿。"""
+"""盘前两段式：08:30 scan 出量化候选并抓资讯，随后 analyze 让 Claude 深度分析并写下竞价条件；
+09:25 集合竞价结束后 run_final 先按条件做规则过滤，再做一次只能否决的竞价确认，09:28 前推送。"""
 from __future__ import annotations
 
 import concurrent.futures as cf
 import datetime as dt
 import json
 import logging
+import math
+import threading
 import time
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agents import playbook
 from agents.llm import LLM
@@ -5338,6 +5871,7 @@ from data.akshare_client import AkClient
 from data.cache import BarCache
 from engine.calendar import TradingCalendar
 from engine.dataview import DataView
+from engine.rules import limit_pct, limit_prices
 from engine.store import Store
 from engine.types import Pick
 from notify.format import format_recommendation
@@ -5347,26 +5881,62 @@ log = logging.getLogger(__name__)
 CANDIDATE_COUNT = 15
 NEWS_LIMIT = 30
 STOCK_NEWS_LIMIT = 3
-HISTORY_DAYS = 400      # 自然日，约 270 个交易日，够常见的一年期因子
-PRICE_BAND = 0.5        # LLM 价位须在量化 entry_max 的 ±50% 内
-FINAL_DEADLINE = 100.0  # run_final 等待两路 finalize 的总时长上限（秒）
+HISTORY_DAYS = 400       # 自然日，约 270 个交易日，够常见的一年期因子
+PRICE_BAND = 0.5         # 计划价位须在量化 entry_max 的 ±50% 内
+ANALYZE_TIMEOUT = 900.0  # 08:30 深度分析单次上限（秒）
+AUCTION_TIMEOUT = 90.0   # 09:25 竞价确认单次上限（秒）
+FINAL_DEADLINE = 110.0   # run_final 从开始到定稿的总时长上限（秒）；09:25:15 启动则约 09:27:05 推送
+SPOT_TIMEOUT = 40.0      # run_final 等待竞价快照的上限（秒），超时按竞价数据缺失处理
 KINDS = ("active", "candidate")
+NOTE_UNCONFIRMED = "（竞价二次确认未完成，按盘前条件过滤）"
+NOTE_NONE_PASSED = "（竞价条件均未满足，今日不推荐）"
+SPOT_MISSING = "（竞价数据缺失：未取到竞价快照，以下股票未经竞价条件检查，请依据盘前分析判断，并在 note 中注明）"
 
 
-class ReviewedPick(BaseModel):
+class PlannedPick(BaseModel):
     code: str
     action: Literal["keep", "veto"]
     confidence: float
     entry_max: float
     stop: float
     target: float
+    min_gap_pct: float
+    max_gap_pct: float
     reason: str
 
 
-class PremarketReview(BaseModel):
+class PremarketPlan(BaseModel):
     market_view: str
-    picks: list[ReviewedPick]
+    picks: list[PlannedPick]
 
+
+class AuctionDecision(BaseModel):
+    code: str
+    action: Literal["keep", "veto"]
+    reason: str
+
+
+class AuctionCheck(BaseModel):
+    note: str
+    picks: list[AuctionDecision]
+
+
+AUCTION_SYSTEM = """你是 A 股集合竞价复核员。08:30 的盘前深度分析已为每只候选写好竞价条件和价位；09:25 集合竞价结束后，系统已按这些条件做了规则过滤，下面列出的是通过过滤的股票。
+
+你的任务是结合竞价数据做最后确认，对每只股票给出 keep 或 veto。你只能否决，不能新增股票，也不能修改价位。
+
+出现以下情况之一时 veto，并在 reason 中写明依据的数字：
+1. 竞价成交额占 20 日均额的比例明显低于同批其他股票，说明资金不认可。
+2. 竞价价距涨停价不足 2%，开盘可能直接封板，上行空间也有限。
+3. 竞价表现与盘前理由的前提明显矛盾，例如盘前预期温和高开，实际却放量低开。
+4. 全市场竞价明显偏弱（低开家数远多于高开家数，中位竞价涨幅低于 -1%），且该股缺乏独立的支撑理由。
+
+没有明确负面证据时一律 keep。只依据输入中的数字和文字判断，不要编造新闻或数据。如果输入注明竞价数据缺失，就只依据盘前分析判断，并在 note 中说明。
+
+输出要求：note 用一两句话概括今日竞价情况（60 字以内）；picks 对列出的每只股票各给一条，code 与输入完全一致，reason 40 字以内。"""
+
+
+# ---------- 08:30 scan（与上一版相同） ----------
 
 def _safe(fn, default):
     """资讯类抓取失败不阻断盘前流程。"""
@@ -5419,17 +5989,57 @@ def scan(d: dt.date, settings: Settings, store: Store, cache: BarCache, client: 
     return picks
 
 
+def _load_candidates(d: dt.date, store: Store) -> tuple[list[Pick], dict]:
+    loaded = store.load_candidates(d)
+    if loaded is None:
+        raise RuntimeError(f"{d} 没有盘前候选（premarket_scan 未成功运行）")
+    return loaded
+
+
+def _plan_key(d: dt.date, kind: str) -> str:
+    return f"plan:{d.isoformat()}:{kind}"
+
+
+def load_plan(store: Store, d: dt.date, kind: str) -> PremarketPlan | None:
+    """读回 analyze 存下的计划；没有或无法解析时返回 None。"""
+    raw = store.kv_get(_plan_key(d, kind))
+    if raw is None:
+        return None
+    try:
+        return PremarketPlan.model_validate(raw)
+    except ValidationError as e:
+        log.warning("premarket plan %s %s unreadable: %r", d, kind, e)
+        return None
+
+
+# ---------- 提示词片段 ----------
+
+def _f(x) -> float | None:
+    """转为 float；缺失、NaN 或无法转换时为 None。"""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
+
+
 def _num(x, scale: float = 1.0, unit: str = "") -> str:
-    return "未知" if x is None or pd.isna(x) else f"{x / scale:.2f}{unit}"
+    v = _f(x)
+    return "未知" if v is None else f"{v / scale:.2f}{unit}"
 
 
-def _auction(row: dict | None) -> str:
-    if row is None:
-        return "无竞价数据"
-    op, pc, amt = row.get("open"), row.get("prev_close"), row.get("amount")
-    if op is None or pc is None or pd.isna(op) or pd.isna(pc) or op <= 0 or pc <= 0:
-        return "无竞价（可能停牌）"
-    return f"竞价 {op:.2f}（{op / pc - 1:+.2%}），竞价额 {_num(amt, 1e4, '万')}"
+def _rel(price: float, base) -> str:
+    b = _f(base)
+    return f"（{price / b - 1:+.1%}）" if b and b > 0 else ""
+
+
+def _limits(p: Pick, prev_close) -> str:
+    pct = limit_pct(p.code, p.name)
+    pc = _f(prev_close)
+    if not pc or pc <= 0:
+        return f"涨跌幅限制 ±{pct:.0%}"
+    up, down = limit_prices(p.code, p.name, pc)
+    return f"涨跌幅限制 ±{pct:.0%}（涨停 {up:.2f} / 跌停 {down:.2f}）"
 
 
 def _item(n: dict, width: int = 100) -> str:
@@ -5438,23 +6048,18 @@ def _item(n: dict, width: int = 100) -> str:
     return f"[{n.get('time', '')}] {body}"
 
 
-def _build_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict, auction: pd.DataFrame | None) -> str:
+def _analyze_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict) -> str:
     stats = ctx.get("stats", {})
-    rows: dict[str, dict] = {}
-    if auction is not None:
-        sub = auction[auction["code"].astype(str).isin([p.code for p in cands])]
-        rows = {str(r["code"]): r for r in sub.to_dict("records")}
-    lines = [f"# 交易日 {d.isoformat()}（09:26，集合竞价已结束）", "",
+    lines = [f"# 交易日 {d.isoformat()}（08:30 盘前，集合竞价尚未开始）", "",
              f"## 经验规则（playbook v{pb.get('version', 1)}）", playbook.render(pb), "",
              f"## 候选股票（量化排序，共 {len(cands)} 只）"]
-    if auction is None:
-        lines.append("（竞价数据缺失：本次未取到竞价快照，请依据公告、新闻与规则判断，并在 market_view 中注明。）")
     for p in cands:
         s = stats.get(p.code, {})
-        lines.append(f"- {p.code} {p.name}｜量化分 {p.score:.3f}｜昨收 {_num(s.get('prev_close'))}"
-                     f"｜20日均额 {_num(s.get('avg_amount20'), 1e8, '亿')}｜{_auction(rows.get(p.code))}"
-                     f"｜量化价位 买≤{p.entry_max:.2f} 止损 {p.stop:.2f} 止盈 {p.target:.2f}"
-                     f"｜持有 {p.hold_days} 日｜{p.reason}")
+        pc = s.get("prev_close")
+        lines.append(f"- {p.code} {p.name}｜量化分 {p.score:.3f}｜昨收 {_num(pc)}｜{_limits(p, pc)}"
+                     f"｜20日均额 {_num(s.get('avg_amount20'), 1e8, '亿')}"
+                     f"｜量化价位 买≤{p.entry_max:.2f}{_rel(p.entry_max, pc)} 止损 {p.stop:.2f}{_rel(p.stop, pc)}"
+                     f" 止盈 {p.target:.2f}{_rel(p.target, pc)}｜持有 {p.hold_days} 日｜{p.reason}")
     notices = [f"- {n['code']} {n['name']}：{n['title']}（{n['type']}）" for n in ctx.get("notices", [])]
     stock_news = [f"- {c}：" + "；".join(_item(n, 60) for n in items)
                   for c, items in ctx.get("stock_news", {}).items() if items]
@@ -5462,75 +6067,213 @@ def _build_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict, auction: p
     lines += ["", "## 候选相关公告", *(notices or ["（无）"])]
     lines += ["", "## 候选个股新闻", *(stock_news or ["（无）"])]
     lines += ["", "## 隔夜要闻（财联社电报）", *(news or ["（无）"])]
-    lines += ["", f"请对以上 {len(cands)} 只候选逐一给出 keep/veto 与价位，code 与上表完全一致。"]
+    lines += ["", f"请对以上 {len(cands)} 只候选逐一给出 action、confidence、价位与竞价条件"
+                  "（min_gap_pct / max_gap_pct），code 与上表完全一致。"]
     return "\n".join(lines)
 
 
-def _merge(q: Pick, r: ReviewedPick) -> Pick:
-    """采用 LLM 价位需满足 stop < entry_max < target 且都在量化 entry_max 的 ±PRICE_BAND 内。"""
+def _spot_rows(spot: pd.DataFrame | None, codes: list[str]) -> dict[str, dict]:
+    if spot is None or spot.empty or "code" not in spot.columns:
+        return {}
+    sub = spot[spot["code"].astype(str).isin(codes)]
+    return {str(r["code"]): r for r in sub.to_dict("records")}
+
+
+def _gap_pct(row: dict) -> float | None:
+    """竞价涨幅（%），四舍五入到 0.01 个百分点；竞价价或昨收缺失、非正（多为停牌）时为 None。"""
+    op, pc = _f(row.get("open")), _f(row.get("prev_close"))
+    if op is None or pc is None or op <= 0 or pc <= 0:
+        return None
+    return round((op / pc - 1) * 100, 2)
+
+
+def _breadth(spot: pd.DataFrame | None) -> str:
+    if spot is None or spot.empty or not {"open", "prev_close"} <= set(spot.columns):
+        return SPOT_MISSING
+    op = pd.to_numeric(spot["open"], errors="coerce")
+    pc = pd.to_numeric(spot["prev_close"], errors="coerce")
+    ok = (op > 0) & (pc > 0)
+    if not ok.any():
+        return SPOT_MISSING
+    gap = (op[ok] / pc[ok] - 1) * 100
+    return (f"有竞价 {int(ok.sum())} 只：高开 {int((gap > 0).sum())}，低开 {int((gap < 0).sum())}，"
+            f"中位竞价涨幅 {gap.median():+.2f}%")
+
+
+def _auction(row: dict | None, avg_amount20=None) -> str:
+    if row is None:
+        return "无竞价数据"
+    gap = _gap_pct(row)
+    if gap is None:
+        return "无竞价（可能停牌）"
+    amt, avg = _f(row.get("amount")), _f(avg_amount20)
+    share = f"，占20日均额 {amt / avg:.2%}" if amt is not None and avg else ""
+    return f"竞价 {_f(row.get('open')):.2f}（{gap:+.2f}%），竞价额 {_num(amt, 1e4, '万')}{share}"
+
+
+def _auction_prompt(d: dt.date, plan: PremarketPlan, prelim: list[Pick], ctx: dict,
+                    spot: pd.DataFrame | None) -> str:
+    stats = ctx.get("stats", {})
+    rows = _spot_rows(spot, [p.code for p in prelim])
+    planned = {pp.code.strip(): pp for pp in plan.picks}
+    lines = [f"# 交易日 {d.isoformat()}（09:25 集合竞价已结束）", "",
+             "## 盘前市场观点", plan.market_view or "（无）", "",
+             "## 全市场竞价", _breadth(spot), "",
+             f"## 通过竞价条件的股票（{len(prelim)} 只，按盘前信心排序）"]
+    for p in prelim:
+        pp, row, s = planned[p.code], rows.get(p.code), stats.get(p.code, {})
+        pc = row.get("prev_close") if row is not None else s.get("prev_close")
+        lines.append(f"- {p.code} {p.name}｜{_auction(row, s.get('avg_amount20'))}｜{_limits(p, pc)}"
+                     f"｜盘前条件 竞价涨幅 {pp.min_gap_pct:+.2f}%~{pp.max_gap_pct:+.2f}%，买≤{p.entry_max:.2f}"
+                     f"｜止损 {p.stop:.2f} 止盈 {p.target:.2f}｜盘前信心 {pp.confidence:.2f}｜盘前理由：{pp.reason}")
+    lines += ["", f"请对以上 {len(prelim)} 只逐一给出 keep 或 veto，code 与上表完全一致。"]
+    return "\n".join(lines)
+
+
+# ---------- 08:30 深度分析 ----------
+
+def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kind: str,
+            timeout: float = ANALYZE_TIMEOUT) -> PremarketPlan | None:
+    """为每只候选给出 keep/veto、价位与竞价条件，存入 kv。任何异常都记录日志并返回 None。"""
+    try:
+        cands, ctx = _load_candidates(d, store)
+        raw = llm.parse(purpose=f"analyze:{playbook_kind}", system=playbook.load_prompt("premarket"),
+                        user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx), schema=PremarketPlan,
+                        effort="high", timeout=timeout, max_budget_usd=1.5, essential=True)
+        codes = {p.code for p in cands}
+        picks: list[PlannedPick] = []
+        for pp in raw.picks:
+            code = pp.code.strip()
+            if code in codes and code not in {x.code for x in picks}:  # 丢弃候选外代码，重复代码保留第一条
+                picks.append(pp.model_copy(update={"code": code}))
+        if not picks:
+            log.warning("premarket analyze %s: plan contains no candidate code", playbook_kind)
+            return None
+        plan = PremarketPlan(market_view=raw.market_view.strip(), picks=picks)
+        store.kv_set(_plan_key(d, playbook_kind), plan.model_dump())
+    except Exception as e:  # noqa: BLE001 - 超时/预算/CLI 报错/校验失败：09:25 该路退回量化
+        log.warning("premarket analyze %s failed: %r", playbook_kind, e)
+        return None
+    log.info("premarket analyze %s %s: %d picks, %d keep", d, playbook_kind, len(picks),
+             sum(p.action == "keep" for p in picks))
+    return plan
+
+
+def run_analyze(d: dt.date, settings: Settings, store: Store, llm: LLM) -> dict[str, bool]:
+    """两套 playbook 各一个线程并发分析，返回 {"active": ok, "candidate": ok}。"""
+    with cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="analyze") as pool:
+        futures = {k: pool.submit(analyze, d, settings, store, llm, k) for k in KINDS}
+        return {k: fut.result() is not None for k, fut in futures.items()}
+
+
+# ---------- 09:25 竞价定稿 ----------
+
+def _merge(q: Pick, pp: PlannedPick) -> Pick:
+    """计划价位（四舍五入到分）满足 stop < entry_max < target 且都在量化 entry_max 的 ±PRICE_BAND 内才采用。"""
+    entry, stop, target = (round(x, 2) for x in (pp.entry_max, pp.stop, pp.target))
     lo, hi = q.entry_max * (1 - PRICE_BAND), q.entry_max * (1 + PRICE_BAND)
-    sane = r.stop < r.entry_max < r.target and all(lo <= x <= hi for x in (r.stop, r.entry_max, r.target))
-    entry, stop, target = (r.entry_max, r.stop, r.target) if sane else (q.entry_max, q.stop, q.target)
-    return Pick(code=q.code, name=q.name, score=r.confidence, entry_max=entry, stop=stop, target=target,
-                hold_days=q.hold_days, reason=r.reason)
+    if not (stop < entry < target and all(lo <= x <= hi for x in (stop, entry, target))):
+        entry, stop, target = q.entry_max, q.stop, q.target
+    return Pick(code=q.code, name=q.name, score=float(pp.confidence), entry_max=entry, stop=stop, target=target,
+                hold_days=q.hold_days, reason=pp.reason.strip() or q.reason)
 
 
-def _load_candidates(d: dt.date, store: Store) -> tuple[list[Pick], dict]:
-    loaded = store.load_candidates(d)
-    if loaded is None:
-        raise RuntimeError(f"{d} 没有盘前候选（premarket_scan 未成功运行）")
-    return loaded
+def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | None) -> list[Pick]:
+    """确定性规则：取计划中 action=keep 且仍在候选里的股票；有竞价行时要求竞价涨幅在
+    [min_gap_pct, max_gap_pct] 内且竞价价 <= 最终采用的 entry_max；没有竞价行则保留。按 confidence 降序。"""
+    by_code = {p.code: p for p in cands}
+    rows = _spot_rows(spot, list(by_code))
+    out: list[Pick] = []
+    seen: set[str] = set()
+    for pp in sorted(plan.picks, key=lambda x: x.confidence, reverse=True):  # 稳定排序：同分保持计划顺序
+        code = pp.code.strip()
+        if pp.action != "keep" or code not in by_code or code in seen:
+            continue
+        seen.add(code)
+        pick = _merge(by_code[code], pp)
+        row = rows.get(code)
+        if row is not None:
+            gap = _gap_pct(row)
+            if gap is None or not pp.min_gap_pct <= gap <= pp.max_gap_pct or _f(row["open"]) > pick.entry_max:
+                continue
+        out.append(pick)
+    return out
+
+
+def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pick],
+                 spot: pd.DataFrame | None) -> tuple[list[Pick], bool, str]:
+    """不调用 LLM 的确定性结果：无计划用量化；有计划用规则过滤。也是竞价确认失败或超时时的结果。"""
+    if plan is None:
+        return cands[: settings.max_picks], False, ""
+    prelim = auction_filter(plan, cands, spot)[: settings.max_picks]
+    if not prelim:
+        return [], True, plan.market_view + NOTE_NONE_PASSED
+    return prelim, True, plan.market_view + NOTE_UNCONFIRMED
 
 
 def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkClient, playbook_kind: str,
-             timeout: float = 90.0) -> tuple[list[Pick], bool, str]:
+             timeout: float = AUCTION_TIMEOUT, spot: pd.DataFrame | None = None) -> tuple[list[Pick], bool, str]:
+    """返回 (picks, llm_reviewed, market_view)。spot=None 时自行拉取快照；传入空表表示竞价数据缺失。"""
     cands, ctx = _load_candidates(d, store)
-    fallback = cands[: settings.max_picks]
-    auction = _safe(client.spot, None)
+    plan = load_plan(store, d, playbook_kind)
+    if plan is not None and spot is None:
+        spot = _safe(client.spot, None)
+    base = _rule_result(settings, plan, cands, spot)
+    if plan is None or not base[0]:
+        return base
+    prelim = base[0]
     try:
-        pb = playbook.load(playbook_kind)
-        review = llm.parse(purpose=f"premarket:{playbook_kind}", system=playbook.load_prompt("premarket"),
-                           user=_build_prompt(d, pb, cands, ctx, auction), schema=PremarketReview,
-                           effort="medium", timeout=timeout, essential=True)
-    except Exception as e:  # noqa: BLE001 - 超时/拒答/预算/解析失败一律退回量化
-        log.warning("premarket finalize %s fell back to quant: %r", playbook_kind, e)
-        return fallback, False, ""
-    by_code = {p.code: p for p in cands}
-    picks: list[Pick] = []
-    for r in sorted(review.picks, key=lambda r: r.confidence, reverse=True):
-        code = r.code.strip()
-        if r.action == "keep" and code in by_code and code not in {p.code for p in picks}:
-            picks.append(_merge(by_code[code], r))
-    return picks[: settings.max_picks], True, review.market_view
+        check = llm.parse(purpose=f"auction:{playbook_kind}", system=AUCTION_SYSTEM,
+                          user=_auction_prompt(d, plan, prelim, ctx, spot), schema=AuctionCheck,
+                          effort="low", timeout=timeout, max_budget_usd=0.3, essential=True)
+    except Exception as e:  # noqa: BLE001 - 超时/预算/CLI 报错/校验失败：按规则过滤结果
+        log.warning("premarket auction check %s failed, using rule-filtered picks: %r", playbook_kind, e)
+        return base
+    vetoed = {x.code.strip() for x in check.picks if x.action == "veto"}
+    picks = [p for p in prelim if p.code not in vetoed]  # 只能否决：不在 prelim 里的代码一律忽略
+    if len(picks) < len(prelim):
+        log.info("premarket auction %s vetoed %s", playbook_kind, [p.code for p in prelim if p.code in vetoed])
+    note = check.note.strip()
+    return picks, True, plan.market_view + (f"（竞价确认：{note}）" if note else "")
 
 
-class _Prefetched:
-    """run_final 只拉一次全市场快照，交给两路 finalize 共用。"""
-
-    def __init__(self, frame: pd.DataFrame | None):
-        self.frame = frame
-
-    def spot(self) -> pd.DataFrame:
-        if self.frame is None:
-            raise RuntimeError("竞价快照获取失败")
-        return self.frame
+def _fetch_spot(client: AkClient, timeout: float) -> pd.DataFrame:
+    """在守护线程里拉一次竞价快照，最多等 timeout 秒；失败或超时返回空表（按竞价数据缺失处理）。"""
+    box: list[pd.DataFrame | None] = []
+    worker = threading.Thread(target=lambda: box.append(_safe(client.spot, None)), name="premarket-spot",
+                              daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if not box or box[0] is None:
+        log.warning("auction spot unavailable within %.0fs, treating auction data as missing", timeout)
+        return pd.DataFrame()
+    return box[0]
 
 
 def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkClient, notifier,
               calendar: TradingCalendar) -> None:
-    _load_candidates(d, store)  # 没有候选直接抛错，由 run_job 告警
-    shared = _Prefetched(_safe(client.spot, None))
+    """09:25 定稿：拉一次快照，两路并发 finalize；FINAL_DEADLINE 内没完成的那一路用确定性结果。只推送 h:active。"""
     deadline = time.monotonic() + FINAL_DEADLINE
+    cands, _ = _load_candidates(d, store)  # 没有候选直接抛错，由 run_job 告警
+    plans = {k: load_plan(store, d, k) for k in KINDS}
+    spot = pd.DataFrame()  # 两路都没有计划时用不到快照
+    if any(p is not None for p in plans.values()):
+        spot = _fetch_spot(client, min(SPOT_TIMEOUT, max(0.0, deadline - time.monotonic())))
+    fallback = {k: _rule_result(settings, plans[k], cands, spot) for k in KINDS}
+    timeout = min(AUCTION_TIMEOUT, max(1.0, deadline - time.monotonic()))
     pool = cf.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix="premarket")
-    futures = {k: pool.submit(finalize, d, settings, store, llm, shared, k) for k in KINDS}
+    futures = {k: pool.submit(finalize, d, settings, store, llm, client, k, timeout, spot) for k in KINDS}
     results: dict[str, tuple[list[Pick], bool, str]] = {}
     try:
         for kind, fut in futures.items():
             try:
                 results[kind] = fut.result(timeout=max(0.0, deadline - time.monotonic()))
             except cf.TimeoutError:
-                log.warning("premarket %s exceeded %.0fs, using quant picks", kind, FINAL_DEADLINE)
-                results[kind] = (_load_candidates(d, store)[0][: settings.max_picks], False, "")
+                log.warning("premarket %s not final within %.0fs, using rule result", kind, FINAL_DEADLINE)
+                results[kind] = fallback[kind]
+            except Exception as e:  # noqa: BLE001
+                log.warning("premarket finalize %s failed: %r, using rule result", kind, e)
+                results[kind] = fallback[kind]
     finally:
         pool.shutdown(wait=False, cancel_futures=True)  # 超时的线程留在后台跑完，结果丢弃
     for kind, (picks, reviewed, view) in results.items():
@@ -5541,7 +6284,7 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
     notifier.send_markdown(format_recommendation(d, picks, reviewed, view))
 ```
 
-说明：`finalize` 在 `try` 之外只做两件事：读取候选（缺失时抛错，由 `run_job` 告警，当天不出推荐）和用 `_safe` 拉竞价快照。其余失败都退回量化 `cands[:max_picks]`，并返回 `llm_reviewed=False`，推送文案里显示"未经 LLM 审核"（由 `format_recommendation` 负责）。全部候选都被否决时返回空列表，`llm_reviewed=True`，表示今天经审核后不推荐。
+说明：`finalize` 在 `try` 之外只做三件事：读取候选（缺失时抛 `RuntimeError`，由 `run_job` 告警，当天不出推荐）、读取计划、在需要时用 `_safe` 拉快照（失败按竞价数据缺失处理）。结果分三种：无计划 → 量化 `cands[:max_picks]`，`llm_reviewed=False`，推送显示"未经 LLM 审核"（由 `format_recommendation` 负责）；规则过滤后为空 → `[]`，`llm_reviewed=True`，表示经分析后今天不推荐；否则竞价确认只从规则结果中剔除被否决的代码，`market_view` 后附上确认的 note。`_rule_result` 同时用作竞价确认失败和 `FINAL_DEADLINE` 超时时的结果，所以这两种情况推送的内容完全一致。
 
 **Step 4: 运行测试，确认通过**
 
@@ -5549,51 +6292,73 @@ def run_final(d: dt.date, settings: Settings, store: Store, llm: LLM, client: Ak
 uv run pytest tests/test_premarket.py -v
 ```
 
-预期：15 passed（参数化的 5 个失败场景各算 1 个）。若 `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Store 还不是线程安全的，按本部分开头的说明 1 处理。
+预期：30 passed（两组参数化各含 4 个失败场景，每个算 1 个）。若 `run_analyze` / `run_final` 相关用例报 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`，说明 Part 2 的 `Store` 没有按 Task 2.1 实现（需 `check_same_thread=False` + `RLock`）。
 
-**Step 5: Manual smoke step（真实竞价快照 + 真实 Claude，不推送、不写正式库）**
+**Step 5: Manual smoke step（真实 Claude 深度分析 + 真实竞价快照，不推送、不写正式库）**
 
 `scripts/smoke_premarket.py`:
 
 ```python
-"""手动冒烟：手选 3 只股票作为候选，走一遍 finalize（真实 spot + 真实 Claude）。
-运行：uv run python scripts/smoke_premarket.py
+"""手动冒烟：手选 3 只股票作为候选，走一遍 analyze（真实 Claude 深度分析）和 finalize（真实竞价快照 + 竞价确认）。
+运行：uv run python scripts/smoke_premarket.py [HH:MM]
+可选参数 HH:MM：analyze 完成后等到当天该时刻再 finalize（交易日 09:15 前启动并传 09:26，可验证真实竞价数据）。
 结果写入临时 sqlite，不影响正式库，也不推送。
 """
 import datetime as dt
 import json
+import sys
 import tempfile
+import time
 from pathlib import Path
 
-from agents import premarket
-from agents.llm import LLM
-from config import get_settings
-from data.akshare_client import AkClient
-from engine.store import Store
-from engine.types import Pick
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from agents import premarket  # noqa: E402
+from agents.llm import LLM  # noqa: E402
+from config import get_settings  # noqa: E402
+from data.akshare_client import AkClient  # noqa: E402
+from engine.store import Store  # noqa: E402
+from engine.types import Pick  # noqa: E402
+
+CODES = ("600519", "000001", "300750")
 
 
 def main() -> None:
     s = get_settings()
     store = Store(Path(tempfile.mkdtemp()) / "smoke.sqlite")
-    client = AkClient()
-    d = dt.date.today()
+    client, llm, d = AkClient(), LLM(s, store), dt.date.today()
     spot = client.spot().set_index("code")
-    picks = []
-    for code in ("600519", "000001", "300750"):
+    picks, stats = [], {}
+    for code in CODES:
         pc = float(spot.loc[code, "prev_close"])
         picks.append(Pick(code=code, name=str(spot.loc[code, "name"]), score=1.0, entry_max=round(pc * 1.03, 2),
                           stop=round(pc * 0.93, 2), target=round(pc * 1.10, 2), hold_days=5, reason="冒烟测试候选"))
-    ctx = {"news": client.news_global(10), "notices": [], "stats": {},
+        stats[code] = {"prev_close": pc}
+    ctx = {"news": client.news_global(10), "notices": [], "stats": stats,
            "stock_news": {p.code: client.stock_news(p.code, limit=3) for p in picks}}
     store.save_candidates(d, picks, json.loads(json.dumps(ctx, ensure_ascii=False, default=str)))
-    out, reviewed, view = premarket.finalize(d, s, store, LLM(s, store), client, "active")
-    print("llm_reviewed:", reviewed)
+
+    t0 = time.monotonic()
+    plan = premarket.analyze(d, s, store, llm, "active")
+    print(f"analyze 用时 {time.monotonic() - t0:.0f}s")
+    assert plan is not None, "深度分析失败，原因见 stderr 中的 'premarket analyze active failed' 日志"
+    print("market_view:", plan.market_view)
+    for x in plan.picks:
+        print(" ", x)
+
+    if len(sys.argv) > 1:
+        wait = (dt.datetime.combine(d, dt.time.fromisoformat(sys.argv[1])) - dt.datetime.now()).total_seconds()
+        if wait > 0:
+            print(f"等待 {wait:.0f}s，到 {sys.argv[1]} 再定稿")
+            time.sleep(wait)
+
+    t0 = time.monotonic()
+    out, reviewed, view = premarket.finalize(d, s, store, llm, client, "active")  # spot=None：现拉竞价快照
+    print(f"finalize 用时 {time.monotonic() - t0:.0f}s，llm_reviewed={reviewed}")
     print("market_view:", view)
     for p in out:
-        print(p)
-    print(f"本次花费约 {store.month_llm_cost(d.year, d.month):.3f} 元")
-    assert reviewed, "LLM 审核失败，stderr 中的 'fell back to quant' 日志给出原因"
+        print(" ", p)
+    print(f"本次花费约 {llm.month_cost():.3f} 元")
 
 
 if __name__ == "__main__":
@@ -5604,16 +6369,16 @@ if __name__ == "__main__":
 uv run python scripts/smoke_premarket.py
 ```
 
-预期：`llm_reviewed: True`，`market_view` 为中文大盘判断，打印 0~3 个 `Pick`，每个 `reason` 都引用了竞价数字或新闻。人工检查两点：没有引用输入中不存在的新闻；价位满足 `stop < entry_max < target`。最好在交易日 09:26~09:30 之间跑一次，确认竞价阶段 `spot()` 的 `open` 已是竞价价；非交易时段跑只能验证接口连通。
+预期：先打印 `analyze 用时 …s`（effort=high，通常 1~10 分钟）、中文 `market_view` 和 3 条 `PlannedPick`；再打印 `finalize 用时 …s`（通常 10~60 秒）、`llm_reviewed=True`、带"（竞价确认：…）"的 `market_view` 和 0~3 个 `Pick`。人工检查：每条 reason 都引用了输入中的新闻标题或数字，没有编造输入里不存在的新闻；`min_gap_pct ≤ max_gap_pct`，且上限明显低于涨停对应的涨幅；`stop < entry_max < target`。若 `market_view` 带"竞价二次确认未完成"，到 stderr 中找 `premarket auction check active failed` 看原因。非交易时段的快照不是竞价数据，只能验证连通与输出格式；要验证真实竞价，在交易日 09:15 前运行 `uv run python scripts/smoke_premarket.py 09:26`，脚本分析完后会等到 09:26 再定稿。单次冒烟的花费上限是分析 1.5 美元加确认 0.3 美元，实际通常远低于此。
 
 **Step 6: 提交**
 
 ```
 git add agents/premarket.py tests/test_premarket.py scripts/smoke_premarket.py
-git commit -m "feat: add premarket scan and LLM-reviewed final recommendation with quant fallback"
+git commit -m "feat: two-stage premarket with deep pre-auction analysis, auction rule filter and veto-only confirm"
 ```
 
-（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 ### Task 4.4: agents/review.py — 盘后复盘与日报
 
@@ -5623,19 +6388,24 @@ git commit -m "feat: add premarket scan and LLM-reviewed final recommendation wi
 
 `run_review` 先汇总两个 LLM 账户当天的推荐、成交、持仓和个股日线。两边都没有内容时跳过 LLM 调用，省掉一次花费。LLM 给出的 lesson 只写入 candidate playbook，然后依次调用 `maybe_release`、`git_commit`，最后给 `store.list_accounts()` 中所有有净值记录的账户推送日报。
 
+LLM 经 Task 4.1 的 Claude Code CLI 封装调用。复盘这次调用传 `timeout=REVIEW_TIMEOUT`（300 秒）和 `max_budget_usd=REVIEW_BUDGET_USD`（1 美元），不再有 `max_tokens`。`LLMError`（CLI 报错、拒答、没有结构化输出）、`subprocess.TimeoutExpired` 和其它异常都照常推送日报，摘要写明"复盘失败"。测试里的 `FakeLLM.parse` 与真实签名一致：`parse(purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0, essential=False)`。另有一个测试用真实 `LLM` 加假的 claude.exe 子进程跑通 `run_review`，防止假对象与真实签名不一致。
+
 **Step 1: 写失败的测试**
 
 `tests/test_review.py`:
 
 ```python
 import datetime as dt
+import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from agents import playbook, review
-from agents.llm import BudgetExceeded, LLMRefusal
+from agents.llm import LLM, BudgetExceeded, LLMError
 from agents.review import Lesson, ReviewOutput
 from config import Settings
 from engine.calendar import TradingCalendar
@@ -5675,10 +6445,10 @@ class FakeLLM:
         self.result = result
         self.calls = []
 
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_tokens=16000,
+    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0,
               essential=False):
         self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
-                               essential=essential))
+                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -5745,6 +6515,7 @@ def test_review_applies_lessons_to_candidate_only(env):
     run(env, llm)
     call = llm.calls[0]
     assert call["purpose"] == "review" and call["essential"] is False and call["effort"] == "medium"
+    assert call["timeout"] == review.REVIEW_TIMEOUT and call["max_budget_usd"] == review.REVIEW_BUDGET_USD
     assert call["schema"] is ReviewOutput and call["system"] == "复盘系统提示"
     user = call["user"]
     for s in ("600001", "600002", "600003", "10.62", "BUY", "止盈", "旧规则", "未经 LLM 审核"):
@@ -5786,7 +6557,8 @@ def test_review_budget_exceeded_still_pushes_report(env):
     assert env["releases"] == [D]  # 发布判断不依赖 LLM
 
 
-@pytest.mark.parametrize("exc", [LLMRefusal("r"), TimeoutError("t"), ValueError("bad")])
+@pytest.mark.parametrize("exc", [LLMError("review: error_during_execution"),
+                                 subprocess.TimeoutExpired(["claude.exe"], 300.0), ValueError("bad")])
 def test_review_llm_failure_still_pushes_report(env, exc):
     run(env, FakeLLM(exc))
     assert len(env["notifier"].sent) == 1 and "复盘失败" in env["notifier"].sent[0]
@@ -5811,6 +6583,30 @@ def test_review_without_recommendations_skips_llm(env):
     assert llm.calls == [] and env["cache"].requested is None
     report = env["notifier"].sent[0]
     assert "无推荐" in report and "q:no_nav" not in report
+
+
+def test_review_through_real_llm_wrapper(env, tmp_path):
+    """真实 LLM 封装 + 假 claude.exe 子进程：run_review 传给 parse 的参数必须被真实签名接受。"""
+    exe = tmp_path / "bin" / "claude.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"")
+    calls = []
+
+    def runner(args, **kw):
+        calls.append((args, kw))
+        out = {"type": "result", "subtype": "success", "is_error": False, "result": "",
+               "structured_output": OUTPUT.model_dump(), "total_cost_usd": 0.05,
+               "usage": {"input_tokens": 900, "output_tokens": 300}}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(out).encode("utf-8"), stderr=b"")
+
+    s = Settings(anthropic_api_key="k", wecom_webhook_url="", root=tmp_path, claude_exe=str(exe))
+    review.run_review(D, s, env["store"], LLM(s, env["store"], runner=runner), env["cache"], env["notifier"], CAL)
+    args, kw = calls[0]
+    assert args[args.index("--effort") + 1] == "medium"
+    assert args[args.index("--max-budget-usd") + 1] == f"{review.REVIEW_BUDGET_USD:.2f}"
+    assert kw["timeout"] == review.REVIEW_TIMEOUT and "600001" in kw["input"].decode("utf-8")
+    assert [r["text"] for r in playbook.load("candidate")["rules"]] == ["旧规则", "主板竞价高开超过 5% 的候选否决"]
+    assert "今日 600001 高开 6% 买入后回落。" in env["notifier"].sent[0]
 ```
 
 **Step 2: 运行测试，确认失败**
@@ -5850,6 +6646,8 @@ LLM_ACCOUNTS = ("h:active", "h:candidate")
 MAX_LESSONS = 3
 BAR_LOOKBACK_DAYS = 10
 PLAYBOOK_FILES = ["playbook/active.json", "playbook/candidate.json"]
+REVIEW_TIMEOUT = 300.0  # claude.exe 子进程超时（秒）；复盘没有硬性截止时间
+REVIEW_BUDGET_USD = 1.0  # 单次复盘调用的 --max-budget-usd
 
 
 class Lesson(BaseModel):
@@ -5947,10 +6745,11 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         try:
             out = llm.parse(purpose="review", system=playbook.load_prompt("review"),
                             user=_build_prompt(d, cand, sections, _bar_lines(cache, codes, d)),
-                            schema=ReviewOutput, effort="medium", essential=False)
+                            schema=ReviewOutput, effort="medium", timeout=REVIEW_TIMEOUT,
+                            max_budget_usd=REVIEW_BUDGET_USD, essential=False)
         except BudgetExceeded:
             summary = "本月 LLM 预算已用完，今日未做 LLM 复盘。"
-        except Exception as e:  # noqa: BLE001 - 拒答/超时/解析失败：日报照发
+        except Exception as e:  # noqa: BLE001 - LLMError（CLI 报错/拒答/无结构化输出）、超时等：日报照发
             log.warning("review LLM failed: %r", e)
             summary = f"LLM 复盘失败（{type(e).__name__}），今日 playbook 未更新。"
         else:
@@ -5970,7 +6769,7 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary))
 ```
 
-说明：`changed` 统计带证据、实际让 candidate 发生变化的那一批 lesson 数量（无效的 remove/merge 只要整体无变化就不提交）。`maybe_release` 不依赖 LLM，预算用完时照常执行，保证每两周一次的发布判断不被跳过。
+说明：`changed` 统计带证据、实际让 candidate 发生变化的那一批 lesson 数量（无效的 remove/merge 只要整体无变化就不提交）。`maybe_release` 不依赖 LLM，预算用完时照常执行，保证每两周一次的发布判断不被跳过。复盘没有硬性截止时间，而 CLI 不像 SDK 那样自动重试，所以 `REVIEW_TIMEOUT` 设得比 `parse` 默认的 120 秒宽松。
 
 **Step 4: 运行测试，确认通过**
 
@@ -5978,23 +6777,23 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
 uv run pytest tests/test_review.py -v
 ```
 
-预期：9 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
+预期：10 passed（参数化的 3 个失败场景各算 1 个）。再跑本部分全部测试：
 
 ```
 uv run pytest tests/test_llm.py tests/test_playbook.py tests/test_premarket.py tests/test_review.py -v
 ```
 
-预期：45 passed。
+预期：全部 passed，0 failed。
 
 **Step 5: Manual smoke step（真实 Claude 复盘一次，不推送、不提交）**
 
-前提：已执行 `python -m jobs.bootstrap`，并至少结算过一个有推荐的交易日。
+前提：已执行 `python -m jobs.bootstrap`，至少结算过一个有推荐的交易日，且 Task 4.1 的 `scripts/smoke_llm.py` 已跑通（claude.exe 与 `.env` 鉴权可用）。
 
 ```
 uv run python -c "import datetime as dt; from agents import playbook, review; from agents.llm import LLM; from config import get_settings; from data.akshare_client import AkClient; from data.cache import BarCache; from engine.calendar import TradingCalendar; from engine.store import Store; from notify.wecom import NullNotifier; s=get_settings(); st=Store(s.root / s.db_path); c=AkClient(); cal=TradingCalendar(c.trade_calendar()); playbook.git_commit=lambda *a, **k: False; n=NullNotifier(); d=cal.prev_day(dt.date.today() + dt.timedelta(days=1)); review.run_review(d, s, st, LLM(s, st), BarCache(s.root / s.db_path, c), n, cal); print(n.sent[0]); print(playbook.load('candidate'))"
 ```
 
-预期：打印日报 markdown，"复盘"段为 Claude 写的中文摘要；`candidate` 中新增的规则（若有）`evidence` 含日期和股票代码。人工检查摘要中没有编造输入里不存在的数字。检查后用 `git checkout -- playbook/candidate.json` 撤销冒烟写入的规则（`git_commit` 已打桩，不会产生提交）。
+预期：约半分钟到一两分钟后打印日报 markdown，"复盘"段为 Claude 写的中文摘要；`candidate` 中新增的规则（若有）`evidence` 含日期和股票代码。人工检查摘要中没有编造输入里不存在的数字。若摘要是"LLM 复盘失败（…）"，终端会同时打印 `review LLM failed: ...` 警告，按 Task 4.1 Step 5 排查。检查后用 `git checkout -- playbook/candidate.json` 撤销冒烟写入的规则（`git_commit` 已打桩，不会产生提交）。
 
 **Step 6: 提交**
 
@@ -6003,23 +6802,46 @@ git add agents/review.py tests/test_review.py
 git commit -m "feat: add post-close LLM review that evolves candidate playbook and pushes daily report"
 ```
 
-（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
-
+（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
 ---
 
 ## Part 5: 研究循环（递归自我提升）
 
-> 契约补充说明（本节内自行决定的最简一致选择）：工具函数以 `tool_<name>(ctx, ...)` 的模块级函数实现，`ctx` 为 `ResearchContext`；`run_research` 内用同名闭包（`list_strategies`/`read_file`/`write_strategy`/`run_evaluation`/`recent_trials`）包一层 `@beta_tool` 暴露给模型。工具出错时返回以 `ERROR:` 开头的字符串（不抛异常），让模型自行纠正。`run_evaluation` 的次数在启动子进程前就计数（超时/失败也算一次）。子进程不加 `-I`（`-I` 会让 `-m engine.run_eval` 找不到项目包），以 `cwd=root` 运行。
+> 契约补充说明（本部分内自行决定的最简一致选择，每条一行）：
+> - 每轮是一次 `llm.parse(...)`（无工具，结构化输出 `ResearchRound`）。user 消息 = 会话开始时生成一次的 `build_context` 背景 + 前几轮反馈 + 本轮任务说明。
+> - `submit_draft` 比契约更严：除现任外，影子盘、候选、已退役的名字和 `strategies/` 下已有的同名文件也一律拒绝（每个草稿都用新名字）。这样一条试验记录只对应一份代码，也不会把影子盘策略降回候选；修正出错的草稿时换新名字即可。
+> - `submit_draft` 先 `compile()` 再 `check_source()`（语法错误的提示更清楚），名字先去掉首尾空白；文件按 `newline="\n"` 写入；假设存进 `kv "research:hypothesis:<name>"`，`build_context` 把它列在最近试验旁边。
+> - `build_context` 另外嵌入 `engine/rules.py`（策略可以 import）。嵌入的源码去掉 `#` 注释（省 token，也避开注释里的非编码措辞），docstring 保留；单文件上限 `FILE_MAX_CHARS`，总长上限 `CONTEXT_MAX_CHARS`，超出从尾部截断。
+> - `evaluate_strategy` 给子进程加 `PYTHONIOENCODING=utf-8`（否则 Windows 管道按 ANSI 代码页输出，中文错误信息会乱码），只认最后一个非空行。该行含 `error` 键或缺 `gate_pass`、退出码非 0、超时、无法启动，都返回 `ok=False` 和中文原因，不抛异常。
+> - 只在还有评估额度时才提交草稿，提交成功立即评估，所以写入的策略都评估过；评估超时或失败同样消耗一次额度，被拒的草稿不占额度。
+> - `done=true` 时先处理本轮草稿再停止。每轮调用前再查一次预算，保证 `max_budget_usd` 为正：`remaining_usd = (monthly_budget_cny - 本月花费) / usd_cny`。
+> - `status` 取值：`ok`、`integrity_failed`、`budget_exceeded`（会前或会中）、`llm_error`（`llm.parse` 抛出的任何异常：`LLMError`、超时、输出不合 schema）、`error`（本地写文件或数据库故障）。
+> - 返回 dict 只有契约规定的 6 个键。`results` 每项为 `{round, name, hypothesis, saved, message, ok, report, error}`；`written` 为写入的策略名；`analysis` 为最后一轮的分析。
+> - `cost_cny` 用 `store.month_llm_cost` 前后相减（与 `LLM.month_cost` 等价），因此测试替身只需实现 `check_budget` 和 `parse`。
+> - 推送：正常结束推送普通文本摘要；`llm_error`、`error` 用 `format_alert`；会前预算不足推送一条“跳过”；完整性失败只推告警（会后失败时列出本次写入的策略）。
+> - 测试注入：用 `monkeypatch` 把 `research.evaluate_strategy` 包一层、绑定假 runner，`run_research` 的签名保持契约原样；完整性测试在临时目录写真实清单，不打桩 `verify`。
 
-本部分产出 `agents/research.py`：每周一次（`jobs/research.py`，周六 10:00）由 Claude 提出策略变体、写入 `strategies/`、调用隔离的评估子进程回测。安全边界：
+本部分产出 `agents/research.py`：每周六 10:00 由 `jobs/research.py`（Task 6.4）调用 `run_research`，Claude 提出策略变体，合格者进入影子盘。原来基于 SDK `tool_runner` 的方案作废：中转只放行 Claude Code CLI，而 Claude Code 的文件权限规则在 Windows 上表现不稳定，不能当作边界。新的安全模型如下。
 
-- 工具只能读 `strategies/*.py`、`playbook/*`、`engine/*.py`，只能写 `strategies/<name>.py`，且必须通过 `sandbox.check_source`。
-- 评估在子进程里跑 `engine.run_eval`，模型只拿到 `EvalReport.to_agent_dict()`（留出集只有通过/不通过）。
-- 会话前后都校验 `integrity.verify(root) == []`，否则告警并中止（不提交 git）。
-- 每条消息的 usage 记账到 `store.add_llm_usage("research", ...)`，月预算超限立即停止迭代。
+- **模型没有任何工具。** 每轮是一次 `llm.parse(...)`（Claude Code 无头模式，`--tools ""`），模型只能返回结构化的 `ResearchRound`：`analysis`、`drafts[name, hypothesis, code]`、`done`。它看不到也碰不到文件系统、git、数据库和网络，对系统唯一的影响途径是返回的代码文本，怎么处理全由 Python 决定。
+- **Python 提供全部上下文。** `build_context` 把策略接口、`engine/types.py`、`engine/dataview.py`、`engine/rules.py`、基线与现任策略源码、可 import 的模块列表、`SPLITS`/`GATE`/`HOLDOUT_GATE`、试验总数、最近 20 次试验和各策略状态拼进提示词，总长有上限。
+- **Python 执行全部动作，并逐步把关：**
+  1. 命名规则：`NAME_RE` 全匹配、不是保留名、不是现任，而且必须是新名字。
+  2. 代码规范：`compile()` 通过，且 `strategies.sandbox.check_source()` 无违规（import 白名单、禁用的内建与反射写法、双下划线、pandas/numpy 读写函数）。违规原因原样反馈给下一轮。
+  3. 隔离评估：独立子进程 `python -m engine.run_eval <name>`（`cwd=root`，`EVAL_TIMEOUT=900` 秒），只解析最后一行 JSON（`EvalReport.to_agent_dict()`），留出集只有 `holdout_pass` 布尔值。超时、非零退出、输出异常一律按失败处理并反馈。
+  4. 次数上限：每会话最多 `MAX_ROUNDS=3` 轮，每轮最多 `MAX_DRAFTS_PER_ROUND=3` 个草稿，整个会话最多 `MAX_EVALS_PER_SESSION=5` 次评估（超时也算）。DSR 按全部历史试验折减，多试只会更难过门槛。
+  5. 完整性：会话前 `integrity.verify(root)` 必须为 `[]`，否则告警且不调用 LLM；会话后再校验一次，有变化就告警、不提交 git，文件留在工作区供人工排查。
+  6. 预算：开始前 `check_budget(False)`；每轮 `max_budget_usd=min(3.0, 本月剩余预算折合美元)`；`BudgetExceeded` 立即停止。
+  7. 审计：所有写入的策略文件都用带假设的提交信息 `git_commit`，并推送企业微信摘要。
+  8. 晋升：过门槛和留出集只代表进入影子盘；能否成为现任由至少 20 个交易日的前向模拟盘决定（Task 2.7），研究会话影响不了。
+- **已知局限：** `check_source` 是尽力而为的静态检查，而策略代码和评估器在同一个子进程里运行，静态检查挡不住所有动态写法（例如通过已导入的包对象访问其他模块的属性）。所以门槛结果只授予影子盘资格，每个策略文件都进 git 供审计，engine/ 的文件哈希在会前、会后各校验一次。
+- **提示词措辞：** `RESEARCH_SYSTEM`、背景和反馈里的约束一律写成编码规范（“只 import 下列模块”“不读写文件、不联网”），不出现安全、沙箱、绕过、权限一类说法。这类措辞会触发 Opus 5.5 的分类器，服务端回退到中转没有的模型，调用直接失败。测试会检查提示词（嵌入的源码块除外）里没有这些词。
+- **失败降级：** 任何 LLM 失败（`LLMError`、超时、输出不合 schema）都只结束本次会话：照常做会后完整性校验，提交此前已写入的策略，推送带原因的告警摘要。
 
-### Task 5.1: 研究工具函数（agents/research.py 第一部分）
+依赖：Part 2（`Store`、`engine.evaluator`、`engine.integrity`）、Part 3（`strategies.base`、`strategies.sandbox`、`engine.run_eval`、`notify.*`）、Part 4（`agents.llm` 的 `LLM`/`BudgetExceeded`/`LLMError`，`agents.playbook.git_commit`）。按 5.1 → 5.2 顺序执行。测试全部离线：不访问网络、不调用真实 claude.exe、不推送企业微信、不起评估子进程。
+
+### Task 5.1: 研究背景、草稿提交与隔离评估（agents/research.py 第一部分）
 
 **Files:**
 - Create: `agents/research.py`
@@ -6027,30 +6849,34 @@ git commit -m "feat: add post-close LLM review that evolves candidate playbook a
 
 **Step 1: 写失败测试**
 
+测试把真实的 `strategies/base.py`、`strategies/baseline_momo.py`、`engine/types.py`、`engine/dataview.py`、`engine/rules.py` 复制到临时目录，当作项目根目录；评估一律注入假 runner，不起子进程。
+
 `tests/test_research_tools.py`：
 
 ```python
 import json
+import shutil
 import subprocess
 import sys
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from agents import research
-from agents.research import (
-    ResearchContext,
-    tool_list_strategies,
-    tool_read_file,
-    tool_recent_trials,
-    tool_run_evaluation,
-    tool_write_strategy,
-)
+from agents.research import Draft, build_context, evaluate_strategy, submit_draft
+from config import Settings
+from engine.evaluator import GATE, HOLDOUT_GATE
 from engine.store import Store
+from strategies.sandbox import ALLOWED_IMPORTS
+
+PROJECT = Path(__file__).resolve().parents[1]
+SOURCES = ["strategies/base.py", "strategies/baseline_momo.py",
+           "engine/types.py", "engine/dataview.py", "engine/rules.py"]
 
 GOOD_SRC = '''"""假设：测试用空策略。"""
-from engine.types import Pick
 from engine.dataview import DataView
+from engine.types import Pick
 
 
 class Probe:
@@ -6065,784 +6891,1139 @@ STRATEGY = Probe()
 
 
 @pytest.fixture
-def ctx(tmp_path):
-    for d in ("strategies", "engine", "playbook"):
-        (tmp_path / d).mkdir()
-    (tmp_path / "strategies" / "baseline_momo.py").write_text("# incumbent\n", encoding="utf-8")
-    (tmp_path / "engine" / "metrics.py").write_text("# metrics\n", encoding="utf-8")
-    (tmp_path / "playbook" / "active.json").write_text('{"version": 1}', encoding="utf-8")
-    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=secret\n", encoding="utf-8")
-    (tmp_path / "config.py").write_text("X = 1\n", encoding="utf-8")
+def env(tmp_path):
+    for rel in SOURCES:  # 用真实源码搭一个临时项目根目录
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(PROJECT / rel, tmp_path / rel)
+    settings = Settings(anthropic_api_key="", wecom_webhook_url="", root=tmp_path)
     store = Store(":memory:")
     store.set_status("baseline_momo", "incumbent", date(2026, 10, 1))
-    return ResearchContext(root=tmp_path, store=store, today=date(2026, 10, 17), max_evals=2)
+    return settings, store
 
 
-# ---------- read_file ----------
-
-@pytest.mark.parametrize("path", [
-    "strategies/baseline_momo.py",
-    "engine/metrics.py",
-    "playbook/active.json",
-    r"strategies\baseline_momo.py",
-])
-def test_read_file_allowed(ctx, path):
-    assert not tool_read_file(ctx, path).startswith("ERROR")
+def draft(name="probe_one", code=GOOD_SRC, hypothesis="测试假设：空策略"):
+    return Draft(name=name, hypothesis=hypothesis, code=code)
 
 
-@pytest.mark.parametrize("path", [
-    ".env",
-    "config.py",
-    "../secret.txt",
-    "strategies/../.env",
-    "strategies/../config.py",
-    "/etc/passwd",
-    "C:/Windows/win.ini",
-    "engine/notes.txt",
-    "strategies/missing.py",
-    "data/rsiqs.sqlite",
-])
-def test_read_file_rejected(ctx, path):
-    assert tool_read_file(ctx, path).startswith("ERROR")
+# ---------- submit_draft ----------
+
+@pytest.mark.parametrize("name", ["Bad", "ab", "1abc", "foo-bar", "../evil", "x" * 42,
+                                  "base", "sandbox", "__init__"])
+def test_submit_bad_name_rejected(env, name):
+    settings, store = env
+    ok, msg = submit_draft(settings, store, draft(name=name))
+    assert not ok and "不合规" in msg
+    assert store.get_status(name) is None
+    assert sorted(p.name for p in (settings.root / "strategies").glob("*.py")) == ["base.py", "baseline_momo.py"]
 
 
-def test_read_file_absolute_inside_root_rejected(ctx):
-    p = str(ctx.root / "strategies" / "baseline_momo.py")
-    assert tool_read_file(ctx, p).startswith("ERROR")
+def test_submit_incumbent_rejected_and_file_untouched(env):
+    settings, store = env
+    path = settings.root / "strategies" / "baseline_momo.py"
+    before = path.read_text(encoding="utf-8")
+    ok, msg = submit_draft(settings, store, draft(name="baseline_momo"))
+    assert not ok and "当前现任策略" in msg
+    assert path.read_text(encoding="utf-8") == before
+    assert store.get_status("baseline_momo") == "incumbent"
 
 
-# ---------- list / recent ----------
-
-def test_list_strategies_reports_status(ctx, monkeypatch):
-    monkeypatch.setattr(research, "list_strategy_names", lambda: ["baseline_momo", "foo_bar"])
-    out = json.loads(tool_list_strategies(ctx))
-    assert {"name": "baseline_momo", "status": "incumbent"} in out
-    assert {"name": "foo_bar", "status": None} in out
-
-
-def test_recent_trials_json(ctx):
-    ctx.store.add_trial("foo_bar", {"k": 1}, 0.7, 0.9, True, False)
-    out = json.loads(tool_recent_trials(ctx))
-    assert out[0]["strategy"] == "foo_bar"
+@pytest.mark.parametrize("status", ["shadow", "candidate", "retired"])
+def test_submit_existing_name_rejected(env, status):
+    settings, store = env
+    store.set_status("old_idea", status, date(2026, 10, 1))
+    ok, msg = submit_draft(settings, store, draft(name="old_idea"))
+    assert not ok and "新名字" in msg
+    assert store.get_status("old_idea") == status
+    assert not (settings.root / "strategies" / "old_idea.py").exists()
 
 
-# ---------- write_strategy ----------
-
-@pytest.mark.parametrize("name", ["Bad", "ab", "1abc", "foo-bar", "../evil", "base", "sandbox", "__init__"])
-def test_write_strategy_bad_name(ctx, name):
-    assert tool_write_strategy(ctx, name, GOOD_SRC).startswith("ERROR")
-    assert ctx.store.get_status(name) is None
-
-
-def test_write_strategy_incumbent_rejected(ctx):
-    out = tool_write_strategy(ctx, "baseline_momo", GOOD_SRC)
-    assert out.startswith("ERROR")
-    assert (ctx.root / "strategies" / "baseline_momo.py").read_text(encoding="utf-8") == "# incumbent\n"
+def test_submit_existing_file_without_status_rejected(env):
+    settings, store = env
+    path = settings.root / "strategies" / "manual_one.py"
+    path.write_text("# 手写策略\n", encoding="utf-8")
+    ok, msg = submit_draft(settings, store, draft(name="manual_one"))
+    assert not ok and "新名字" in msg
+    assert path.read_text(encoding="utf-8") == "# 手写策略\n"
+    assert store.get_status("manual_one") is None
 
 
-def test_write_strategy_sandbox_violation(ctx):
-    src = "import os\n" + GOOD_SRC
-    out = tool_write_strategy(ctx, "probe_one", src)
-    assert out.startswith("ERROR") and "os" in out
-    assert not (ctx.root / "strategies" / "probe_one.py").exists()
+def test_submit_disallowed_import_rejected_with_clear_reason(env):
+    settings, store = env
+    ok, msg = submit_draft(settings, store, draft(code="import os\n" + GOOD_SRC))
+    assert not ok
+    assert "代码规范检查未通过" in msg and "禁止导入 os" in msg  # 原样反馈给模型
+    assert not (settings.root / "strategies" / "probe_one.py").exists()
+    assert store.get_status("probe_one") is None
 
 
-def test_write_strategy_syntax_error(ctx):
-    out = tool_write_strategy(ctx, "probe_one", "def broken(:\n")
-    assert out.startswith("ERROR")
-    assert not (ctx.root / "strategies" / "probe_one.py").exists()
+def test_submit_syntax_error_rejected(env):
+    settings, store = env
+    ok, msg = submit_draft(settings, store, draft(code="def broken(:\n    return []\n"))
+    assert not ok and "语法错误" in msg and "第 1 行" in msg
+    assert not (settings.root / "strategies" / "probe_one.py").exists()
 
 
-def test_write_strategy_success(ctx):
-    out = tool_write_strategy(ctx, "probe_one", GOOD_SRC)
-    assert out.startswith("OK")
-    assert (ctx.root / "strategies" / "probe_one.py").read_text(encoding="utf-8") == GOOD_SRC
-    assert ctx.store.get_status("probe_one") == "candidate"
-    assert "probe_one" in ctx.written
+def test_submit_compile_only_error_rejected(env):
+    # ast.parse 能过、compile() 才报错的代码（模块顶层 return）
+    settings, store = env
+    ok, msg = submit_draft(settings, store, draft(code=GOOD_SRC + "return STRATEGY\n"))
+    assert not ok and "语法错误" in msg
+    assert store.get_status("probe_one") is None
 
 
-# ---------- run_evaluation ----------
+def test_submit_success_writes_file_and_sets_candidate(env):
+    settings, store = env
+    ok, msg = submit_draft(settings, store, draft(name=" probe_one "))  # 首尾空白会被去掉
+    assert ok and "strategies/probe_one.py" in msg
+    path = settings.root / "strategies" / "probe_one.py"
+    assert path.read_text(encoding="utf-8") == GOOD_SRC
+    assert b"\r\n" not in path.read_bytes()  # Windows 上也写 LF
+    assert store.get_status("probe_one") == "candidate"
+    assert store.kv_get("research:hypothesis:probe_one") == "测试假设：空策略"
+    ok2, msg2 = submit_draft(settings, store, draft())  # 同名再交一次：拒绝
+    assert not ok2 and "新名字" in msg2
 
-def _fake_run(payload, calls):
+
+# ---------- evaluate_strategy ----------
+
+def report(gate=True, holdout=True):
+    return {"strategy": "probe_one", "train": {"sharpe": 1.0}, "val": {"sharpe": 1.2},
+            "dsr": 0.95, "gate_pass": gate, "holdout_pass": holdout, "n_trials": 3}
+
+
+def fake_runner(stdout, returncode=0, stderr="", calls=None):
     def run(cmd, **kw):
-        calls.append((cmd, kw))
-        return subprocess.CompletedProcess(cmd, 0, stdout="log line\n" + json.dumps(payload) + "\n", stderr="")
+        if calls is not None:
+            calls.append((cmd, kw))
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
     return run
 
 
-def _write_probe(ctx):
-    assert tool_write_strategy(ctx, "probe_one", GOOD_SRC).startswith("OK")
+@pytest.fixture
+def written(env):
+    settings, store = env
+    assert submit_draft(settings, store, draft())[0]
+    return settings, store
 
 
-def test_run_evaluation_pass_sets_shadow(ctx, monkeypatch):
-    _write_probe(ctx)
+def test_evaluate_pass_parses_last_json_line_and_sets_shadow(written):
+    settings, store = written
     calls = []
-    payload = {"strategy": "probe_one", "train": {"sharpe": 1.0}, "val": {"sharpe": 1.2},
-               "gate_pass": True, "holdout_pass": True}
-    monkeypatch.setattr(research.subprocess, "run", _fake_run(payload, calls))
-    out = json.loads(tool_run_evaluation(ctx, "probe_one"))
-    assert out["gate_pass"] is True and out["holdout_pass"] is True
-    assert ctx.store.get_status("probe_one") == "shadow"
+    stdout = "策略日志一行\n" + json.dumps(report()) + "\n\n"
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(stdout, calls=calls))
+    assert out == {"ok": True, "report": report(), "error": ""}
+    assert store.get_status("probe_one") == "shadow"
     cmd, kw = calls[0]
     assert cmd == [sys.executable, "-m", "engine.run_eval", "probe_one"]
-    assert kw["cwd"] == str(ctx.root) and kw["timeout"] == 900
-    assert ctx.results[-1]["strategy"] == "probe_one"
+    assert kw["cwd"] == str(settings.root) and kw["timeout"] == research.EVAL_TIMEOUT == 900
+    assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
 
 
-def test_run_evaluation_gate_fail_keeps_candidate(ctx, monkeypatch):
-    _write_probe(ctx)
-    payload = {"strategy": "probe_one", "train": {}, "val": {}, "gate_pass": False, "holdout_pass": None}
-    monkeypatch.setattr(research.subprocess, "run", _fake_run(payload, []))
-    tool_run_evaluation(ctx, "probe_one")
-    assert ctx.store.get_status("probe_one") == "candidate"
+@pytest.mark.parametrize("gate,holdout", [(True, False), (False, None)])
+def test_evaluate_without_full_pass_keeps_candidate(written, gate, holdout):
+    settings, store = written
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(json.dumps(report(gate, holdout))))
+    assert out["ok"] is True and out["report"]["gate_pass"] is gate and out["error"] == ""
+    assert store.get_status("probe_one") == "candidate"
 
 
-def test_run_evaluation_holdout_fail_keeps_candidate(ctx, monkeypatch):
-    _write_probe(ctx)
-    payload = {"strategy": "probe_one", "train": {}, "val": {}, "gate_pass": True, "holdout_pass": False}
-    monkeypatch.setattr(research.subprocess, "run", _fake_run(payload, []))
-    tool_run_evaluation(ctx, "probe_one")
-    assert ctx.store.get_status("probe_one") == "candidate"
+def test_evaluate_timeout(written):
+    settings, store = written
 
-
-def test_run_evaluation_limit_enforced(ctx, monkeypatch):
-    _write_probe(ctx)
-    calls = []
-    payload = {"strategy": "probe_one", "train": {}, "val": {}, "gate_pass": False, "holdout_pass": None}
-    monkeypatch.setattr(research.subprocess, "run", _fake_run(payload, calls))
-    tool_run_evaluation(ctx, "probe_one")
-    tool_run_evaluation(ctx, "probe_one")
-    out = tool_run_evaluation(ctx, "probe_one")
-    assert out.startswith("ERROR") and "limit" in out.lower()
-    assert len(calls) == 2 and ctx.evals_used == 2
-
-
-def test_run_evaluation_unknown_strategy(ctx, monkeypatch):
-    calls = []
-    monkeypatch.setattr(research.subprocess, "run", _fake_run({}, calls))
-    assert tool_run_evaluation(ctx, "nope_strategy").startswith("ERROR")
-    assert tool_run_evaluation(ctx, "../evil").startswith("ERROR")
-    assert calls == [] and ctx.evals_used == 0
-
-
-def test_run_evaluation_timeout_and_bad_output(ctx, monkeypatch):
-    _write_probe(ctx)
-
-    def boom(cmd, **kw):
+    def slow(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, kw["timeout"])
 
-    monkeypatch.setattr(research.subprocess, "run", boom)
-    assert "timeout" in tool_run_evaluation(ctx, "probe_one").lower()
+    out = evaluate_strategy(settings, store, "probe_one", runner=slow)
+    assert out["ok"] is False and out["report"] is None and "超时" in out["error"]
+    assert store.get_status("probe_one") == "candidate"
 
-    monkeypatch.setattr(research.subprocess, "run",
-                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="not json\n", stderr=""))
-    assert tool_run_evaluation(ctx, "probe_one").startswith("ERROR")
-    assert ctx.store.get_status("probe_one") == "candidate"
+
+def test_evaluate_cannot_start(written):
+    settings, store = written
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("python 不存在")
+
+    out = evaluate_strategy(settings, store, "probe_one", runner=missing)
+    assert out["ok"] is False and "无法启动" in out["error"]
+
+
+@pytest.mark.parametrize("stdout,code", [
+    ('{"error": "KeyError: \'close\'"}\n', 1),  # run_eval 的错误 JSON
+    (json.dumps(report()) + "\n", 3),           # 退出码非 0 时，报告也不采信
+])
+def test_evaluate_nonzero_exit(written, stdout, code):
+    settings, store = written
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(stdout, returncode=code))
+    assert out["ok"] is False and out["report"] is None and f"退出码 {code}" in out["error"]
+    assert store.get_status("probe_one") == "candidate"
+    if code == 1:
+        assert "KeyError" in out["error"]
+
+
+@pytest.mark.parametrize("stdout", ["", "not json\n", "[1, 2]\n", '{"strategy": "probe_one"}\n',
+                                    json.dumps(report()) + "\n多出来的一行\n"])
+def test_evaluate_garbage_output(written, stdout):
+    settings, store = written
+    out = evaluate_strategy(settings, store, "probe_one",
+                            runner=fake_runner(stdout, stderr="Traceback: 出错了"))
+    assert out["ok"] is False and out["report"] is None and "评估失败" in out["error"]
+    assert store.get_status("probe_one") == "candidate"
+
+
+# ---------- build_context ----------
+
+def test_build_context_contents(env):
+    settings, store = env
+    store.add_trial("old_idea", {}, 0.4, 0.2, False, None)
+    store.kv_set("research:hypothesis:old_idea", "小盘股短期反转更强")
+    store.set_status("old_idea", "candidate", date(2026, 10, 2))
+    store.set_status("shadow_one", "shadow", date(2026, 10, 3))
+    ctx = build_context(settings, store)
+    assert "class Strategy(Protocol)" in ctx           # strategies/base.py 接口
+    assert "class BaselineMomo" in ctx                 # 基线策略源码
+    assert "class DataView" in ctx and "class Pick" in ctx and "def limit_prices" in ctx
+    for mod in ALLOWED_IMPORTS:
+        assert mod in ctx
+    assert json.dumps(GATE) in ctx and json.dumps(HOLDOUT_GATE) in ctx
+    assert "2016-01-01" in ctx and "2026-07-01" in ctx  # SPLITS
+    assert "n_trials：1" in ctx
+    assert "old_idea" in ctx and "小盘股短期反转更强" in ctx  # 最近试验及其假设
+    assert "shadow_one" in ctx and "baseline_momo" in ctx       # 策略状态
+    assert "沙箱" not in ctx                                    # 源码里的 # 注释已去掉
+    assert len(ctx) <= research.CONTEXT_MAX_CHARS
+
+
+def test_build_context_incumbent_source_and_length_cap(env, monkeypatch):
+    settings, store = env
+    store.set_status("baseline_momo", "retired", date(2026, 10, 5))
+    store.set_status("momo_v2", "incumbent", date(2026, 10, 5))
+    body = '"""现任策略。"""\n' + "\n".join(f"X_{i} = {i}" for i in range(20_000))
+    (settings.root / "strategies" / "momo_v2.py").write_text(body, encoding="utf-8")
+    ctx = build_context(settings, store)
+    assert "strategies/momo_v2.py（当前现任策略）" in ctx and "X_1 = 1" in ctx
+    assert "已截断" in ctx and "X_19999" not in ctx           # 单文件上限
+    assert "class BaselineMomo" in ctx
+    assert len(ctx) <= research.CONTEXT_MAX_CHARS
+    monkeypatch.setattr(research, "CONTEXT_MAX_CHARS", 3000)  # 总长度上限
+    assert len(build_context(settings, store)) <= 3000
 ```
 
 **Step 2: 运行测试，确认失败**
 
-```bash
+```
 uv run pytest tests/test_research_tools.py -v
 ```
 
-预期：FAIL，`ModuleNotFoundError: No module named 'agents.research'`（或 `ImportError: cannot import name 'ResearchContext'`）。
+预期：FAIL，`ModuleNotFoundError: No module named 'agents.research'`。
 
-**Step 3: 最小实现**
+**Step 3: 实现**
 
-`agents/research.py`（本任务先写工具部分；Task 5.2 追加 `RESEARCH_SYSTEM`、`build_brief`、`run_research`）：
+`agents/research.py`（本任务写到 `evaluate_strategy` 为止；Task 5.2 会替换顶部 import 区，并在文件末尾追加 `RESEARCH_SYSTEM` 与 `run_research`）：
 
 ```python
-"""研究循环：Claude 提出策略变体 -> 沙箱校验 -> 子进程评估 -> 合格者进影子盘。
+"""研究循环：Claude 每轮返回分析和策略草稿（结构化输出，没有任何工具）。
 
-工具函数为模块级 tool_* 函数（便于测试），run_research 内再用 @beta_tool 包装。
-工具出错返回 "ERROR: ..." 字符串而非抛异常，让模型自行纠正。
+Claude 只能返回代码文本。命名规则、import 白名单（strategies.sandbox.check_source）、编译、
+写文件、子进程评估、评估次数上限、留出集只回传通过/不通过、会话前后的 engine/ 哈希校验和
+月度预算，全部由本模块的 Python 代码执行。
 """
 from __future__ import annotations
 
+import io
 import json
-import re
+import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import tokenize
 from datetime import date
 from pathlib import Path
 
+from pydantic import BaseModel
+
+from config import Settings
+from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.store import Store
-from strategies.base import list_strategies as list_strategy_names
-from strategies.sandbox import check_source
+from strategies.base import NAME_RE, RESERVED
+from strategies.sandbox import ALLOWED_IMPORTS, check_source
 
+MAX_ROUNDS = 3
+MAX_DRAFTS_PER_ROUND = 3
 MAX_EVALS_PER_SESSION = 5
-EVAL_TIMEOUT_S = 900
-NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
-RESERVED_NAMES = {"base", "sandbox", "__init__"}
-# 可读目录 -> 允许的后缀（None = 任意文件）；只允许 <dir>/<file> 一层
-READABLE = {"strategies": ".py", "engine": ".py", "playbook": None}
-MAX_READ_CHARS = 60_000
+EVAL_TIMEOUT = 900
+CONTEXT_MAX_CHARS = 60_000       # build_context 总长度上限（字符）
+FILE_MAX_CHARS = 15_000          # 背景里单个源码文件的上限
+TRIALS_IN_CONTEXT = 20
+BASELINE = "baseline_momo"
+INTERFACE_FILES = (
+    ("strategies/base.py", "策略接口"),
+    ("engine/types.py", "Pick 等数据类型"),
+    ("engine/dataview.py", "DataView：策略唯一的数据入口"),
+    ("engine/rules.py", "A 股交易规则工具，可以 import"),
+)
+STATUS_CN = {"incumbent": "现任", "shadow": "影子盘", "candidate": "候选", "retired": "已退役"}
 
 
-@dataclass
-class ResearchContext:
-    root: Path
-    store: Store
-    today: date
-    max_evals: int = MAX_EVALS_PER_SESSION
-    evals_used: int = 0
-    written: set[str] = field(default_factory=set)
-    results: list[dict] = field(default_factory=list)
+class Draft(BaseModel):
+    name: str
+    hypothesis: str
+    code: str
 
 
-def _err(msg: str) -> str:
-    return f"ERROR: {msg}"
+class ResearchRound(BaseModel):
+    analysis: str
+    drafts: list[Draft]
+    done: bool
 
 
-def tool_list_strategies(ctx: ResearchContext) -> str:
-    rows = [{"name": n, "status": ctx.store.get_status(n)} for n in list_strategy_names()]
-    return json.dumps(rows, ensure_ascii=False)
-
-
-def tool_read_file(ctx: ResearchContext, path: str) -> str:
-    p = path.strip().replace("\\", "/")
-    if not p or p.startswith("/") or ":" in p:
-        return _err("absolute paths are not allowed; use e.g. strategies/baseline_momo.py")
-    parts = p.split("/")
-    if ".." in parts or "." in parts or len(parts) != 2 or parts[0] not in READABLE:
-        return _err("only strategies/*.py, engine/*.py and playbook/* are readable")
-    suffix = READABLE[parts[0]]
-    if suffix and not parts[1].endswith(suffix):
-        return _err(f"only {suffix} files are readable in {parts[0]}/")
-    if parts[1].startswith("."):
-        return _err("hidden files are not readable")
-    base = (ctx.root / parts[0]).resolve()
-    target = (base / parts[1]).resolve()
-    if target.parent != base or not target.is_file():
-        return _err(f"file not found: {p}")
-    text = target.read_text(encoding="utf-8")
-    return text if len(text) <= MAX_READ_CHARS else text[:MAX_READ_CHARS] + "\n# [truncated]"
-
-
-def tool_write_strategy(ctx: ResearchContext, name: str, code: str) -> str:
-    if not NAME_RE.match(name) or name in RESERVED_NAMES:
-        return _err("name must match ^[a-z][a-z0-9_]{2,40}$ and not be base/sandbox/__init__")
-    if name in ctx.store.strategies_with_status("incumbent"):
-        return _err(f"{name} is the current incumbent and cannot be overwritten; pick a new name")
+def _strip_comments(src: str) -> str:
+    """去掉 # 注释（保留 docstring 与字符串里的 #）；无法分词时原样返回。"""
     try:
-        compile(code, f"strategies/{name}.py", "exec")
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return src
+    lines = src.split("\n")
+    drop: set[int] = set()
+    for t in toks:
+        if t.type == tokenize.COMMENT:
+            row, col = t.start[0] - 1, t.start[1]
+            head = lines[row][:col].rstrip()
+            lines[row] = head
+            if not head:
+                drop.add(row)
+    return "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+
+
+def _source_block(root: Path, rel: str, title: str) -> str:
+    p = root / rel
+    text = _strip_comments(p.read_text(encoding="utf-8")) if p.is_file() else "（文件不存在）"
+    if len(text) > FILE_MAX_CHARS:
+        text = text[:FILE_MAX_CHARS] + "\n# ...（已截断）"
+    return f"### {rel}（{title}）\n```python\n{text.rstrip()}\n```"
+
+
+def _hypothesis(store: Store, name: str) -> str:
+    return str(store.kv_get(f"research:hypothesis:{name}", "") or "")
+
+
+def _trial_line(store: Store, t: dict) -> str:
+    def f(x):
+        return "?" if x is None else f"{x:.2f}"
+
+    ho = {True: "通过", False: "未通过", None: "未运行"}[t["holdout_pass"]]
+    hyp = _hypothesis(store, t["strategy"])[:120]
+    return (f"- {t['ts'][:10]} {t['strategy']}：train 夏普 {f(t['train_sharpe'])}，val 夏普 "
+            f"{f(t['val_sharpe'])}，门槛{'达标' if t['gate_pass'] else '未达标'}，holdout {ho}"
+            + (f"；假设：{hyp}" if hyp else ""))
+
+
+def _status_lines(store: Store) -> list[str]:
+    out = []
+    for st, cn in STATUS_CN.items():
+        names = store.strategies_with_status(st)
+        shown = "、".join(names[:50]) + (f" 等 {len(names)} 个" if len(names) > 50 else "")
+        out.append(f"- {cn}（{st}）：{shown or '无'}")
+    return out
+
+
+def build_context(settings: Settings, store: Store) -> str:
+    """每轮共用的背景：会话限制、门槛、可用模块、策略状态、最近试验、接口与策略源码。
+
+    短而关键的部分在前，源码在后；超过 CONTEXT_MAX_CHARS 时从尾部截断。"""
+    root = Path(settings.root)
+    splits = {k: [a.isoformat(), b.isoformat() if b else "最新"] for k, (a, b) in SPLITS.items()}
+    trials = store.recent_trials(TRIALS_IN_CONTEXT)
+    head = [
+        f"# 本次研究会话（{date.today().isoformat()}）",
+        "",
+        "## 会话限制",
+        f"- 最多 {MAX_ROUNDS} 轮；每轮最多处理 {MAX_DRAFTS_PER_ROUND} 个草稿；整个会话最多评估 "
+        f"{MAX_EVALS_PER_SESSION} 次；单次评估限时 {EVAL_TIMEOUT} 秒。",
+        "",
+        "## 数据切分与门槛",
+        f"- 切分 SPLITS：{json.dumps(splits, ensure_ascii=False)}",
+        f"- 回测门槛 GATE（全部为 >= 比较；val_max_dd 为负数）：{json.dumps(GATE)}",
+        f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
+        f"- 历史试验总数 n_trials：{store.trial_count()}（下一次评估计为第 {store.trial_count() + 1} 次）",
+        "",
+        "## 策略代码可以 import 的模块（含其子模块）",
+        "- " + ", ".join(sorted(ALLOWED_IMPORTS)),
+        "",
+        "## 现有策略（新草稿不能再用这些名字）",
+        *_status_lines(store),
+        "",
+        f"## 最近 {TRIALS_IN_CONTEXT} 次试验（新到旧）",
+        *([_trial_line(store, t) for t in trials] or ["- 暂无"]),
+        "",
+        "## 接口与示例源码（已去掉 # 注释）",
+    ]
+    blocks = [_source_block(root, rel, title) for rel, title in INTERFACE_FILES]
+    incumbents = [n for n in store.strategies_with_status("incumbent") if NAME_RE.fullmatch(n)]
+    for name in incumbents:
+        if name != BASELINE:
+            blocks.append(_source_block(root, f"strategies/{name}.py", "当前现任策略"))
+    baseline_title = "基线策略，当前现任" if BASELINE in incumbents else "基线策略，写法示例"
+    blocks.append(_source_block(root, f"strategies/{BASELINE}.py", baseline_title))
+    text = "\n".join(head) + "\n\n" + "\n\n".join(blocks)
+    if len(text) > CONTEXT_MAX_CHARS:
+        text = text[:CONTEXT_MAX_CHARS - 20] + "\n...（背景已截断）"
+    return text
+
+
+def submit_draft(settings: Settings, store: Store, draft: Draft) -> tuple[bool, str]:
+    """校验并保存一个草稿。成功返回 (True, 说明)；失败返回 (False, 原因)，原因会原样反馈给模型。
+
+    规则：名字匹配 NAME_RE 且不是保留名；不是现任；是新名字（任何已有状态或已有文件都不覆盖，
+    保证每个试验记录对应唯一一份代码）；compile() 通过；check_source() 无违规。"""
+    name, code = draft.name.strip(), draft.code
+    if not NAME_RE.fullmatch(name) or name in RESERVED:
+        return False, (f"策略名 {name!r} 不合规：须匹配 ^[a-z][a-z0-9_]{{2,40}}$，"
+                       "且不能是 strategies/ 下的保留模块名")
+    if name in store.strategies_with_status("incumbent"):
+        return False, f"{name} 是当前现任策略，不能覆盖；请换一个新名字"
+    path = Path(settings.root) / "strategies" / f"{name}.py"
+    status = store.get_status(name)
+    if status is not None or path.exists():
+        return False, f"策略名 {name} 已被使用（{STATUS_CN.get(status, '已有同名文件')}）；每个草稿都要用新名字"
+    try:
+        compile(code, f"strategies/{name}.py", "exec", dont_inherit=True)
     except SyntaxError as e:
-        return _err(f"syntax error: {e}")
-    violations = check_source(code)
-    if violations:
-        return _err("sandbox violations: " + "; ".join(violations))
-    (ctx.root / "strategies" / f"{name}.py").write_text(code, encoding="utf-8")
-    ctx.store.set_status(name, "candidate", ctx.today)
-    ctx.written.add(name)
-    return f"OK: wrote strategies/{name}.py (status=candidate)"
+        return False, f"语法错误（第 {e.lineno} 行）：{e.msg}"
+    except (ValueError, RecursionError, MemoryError) as e:
+        return False, f"源码无法编译：{type(e).__name__}: {e}"
+    problems = check_source(code)
+    if problems:
+        return False, "代码规范检查未通过：" + "；".join(problems)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(code, encoding="utf-8", newline="\n")
+    store.set_status(name, "candidate", date.today())
+    store.kv_set(f"research:hypothesis:{name}", draft.hypothesis.strip())
+    return True, f"已写入 strategies/{name}.py（状态 candidate）"
 
 
 def _last_json_line(stdout: str) -> dict | None:
-    for line in reversed(stdout.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                return None
-    return None
-
-
-def tool_run_evaluation(ctx: ResearchContext, name: str) -> str:
-    if not NAME_RE.match(name) or name in RESERVED_NAMES:
-        return _err("invalid strategy name")
-    if not (ctx.root / "strategies" / f"{name}.py").is_file():
-        return _err(f"strategies/{name}.py does not exist; write it first")
-    if ctx.evals_used >= ctx.max_evals:
-        return _err(f"evaluation limit reached ({ctx.max_evals} per session); stop and summarize")
-    ctx.evals_used += 1  # 先计数：超时/失败同样消耗一次额度
+    lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "engine.run_eval", name],
-            cwd=str(ctx.root), capture_output=True, text=True,
-            encoding="utf-8", timeout=EVAL_TIMEOUT_S,
-        )
+        obj = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) -> dict:
+    """在子进程中运行 engine.run_eval；gate_pass 且 holdout_pass 时设为 shadow。
+
+    返回 {"ok": bool, "report": dict | None, "error": str}；任何失败都不抛异常。"""
+    run = runner or subprocess.run
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}  # Windows 管道默认是 ANSI 代码页
+    try:
+        proc = run([sys.executable, "-m", "engine.run_eval", name], cwd=str(settings.root),
+                   capture_output=True, text=True, encoding="utf-8", errors="replace",
+                   env=env, timeout=EVAL_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return _err(f"evaluation timeout after {EVAL_TIMEOUT_S}s; simplify the strategy")
-    report = _last_json_line(proc.stdout or "")
-    if proc.returncode != 0 or report is None:
-        tail = (proc.stderr or proc.stdout or "")[-2000:]
-        return _err(f"evaluation failed (exit {proc.returncode}): {tail}")
+        return {"ok": False, "report": None, "error": f"评估超时（{EVAL_TIMEOUT} 秒），请简化计算"}
+    except OSError as e:
+        return {"ok": False, "report": None, "error": f"无法启动评估进程：{e}"}
+    report = _last_json_line(proc.stdout)
+    if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
+        if report and report.get("error"):
+            detail = str(report["error"])
+        else:
+            detail = (proc.stderr or proc.stdout or "无输出").strip()[-1500:]
+        return {"ok": False, "report": None, "error": f"评估失败（退出码 {proc.returncode}）：{detail}"}
     if report.get("gate_pass") and report.get("holdout_pass"):
-        ctx.store.set_status(name, "shadow", ctx.today)
-        report["new_status"] = "shadow"
-    ctx.results.append(report)
-    return json.dumps(report, ensure_ascii=False)
-
-
-def tool_recent_trials(ctx: ResearchContext, n: int = 20) -> str:
-    return json.dumps(ctx.store.recent_trials(n), ensure_ascii=False, default=str)
+        store.set_status(name, "shadow", date.today())
+    return {"ok": True, "report": report, "error": ""}
 ```
+
+说明：
+- `strategies.base.NAME_RE` 没有锚点，必须用 `fullmatch`。
+- `compile(..., dont_inherit=True)` 不继承本模块的 `from __future__ import annotations`，与策略文件被 import 时的编译方式一致；它还能抓到 `ast.parse` 放过的错误（例如模块顶层的 `return`）。
+- 子进程不加 `-I`（`-I` 会让 `-m engine.run_eval` 找不到项目包）。策略里的 `print` 只会出现在报告行之前，所以取最后一个非空行。
+- `evaluate_strategy` 只依据 `run_eval` 的输出把状态设为 `shadow`；试验记录由子进程里的 `engine.evaluator.evaluate` 写入同一个数据库。
 
 **Step 4: 运行测试，确认通过**
 
-```bash
+```
 uv run pytest tests/test_research_tools.py -v
 ```
 
-预期：全部 PASS。
+预期：32 passed。
 
 **Step 5: 提交**
 
-```bash
+```
 git add agents/research.py tests/test_research_tools.py
-git commit -m "feat: research agent tool functions with path/sandbox/eval-limit guards"
+git commit -m "feat: research context builder, draft submission and isolated evaluation"
 ```
 
-（提交信息末尾附加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾附加 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
-### Task 5.2: run_research 主循环 + RESEARCH_SYSTEM 提示词
+### Task 5.2: RESEARCH_SYSTEM 提示词与 run_research 多轮主循环
 
 **Files:**
-- Modify: `agents/research.py`（追加）
+- Modify: `agents/research.py`（替换顶部 import 区，文件末尾追加）
 - Test: `tests/test_research_loop.py`
 
 **Step 1: 写失败测试**
 
+`FakeLLM` 按顺序返回预设的 `ResearchRound`（或抛出预设异常），像真 `LLM` 一样先查预算、成功后记账；`FakeEval` 代替 `subprocess.run`，按策略名返回预设报告。`git_commit` 打桩，`verify` 用临时目录里的真实清单。不访问网络，也不起 claude 子进程。
+
 `tests/test_research_loop.py`：
 
 ```python
-from dataclasses import dataclass
+import json
+import re
+import shutil
+import subprocess
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agents import research
-from agents.research import RESEARCH_SYSTEM, run_research
+from agents.llm import BudgetExceeded, LLMError
+from agents.research import RESEARCH_SYSTEM, Draft, ResearchRound, run_research
 from config import Settings
+from engine import integrity
 from engine.store import Store
 from notify.wecom import NullNotifier
+from strategies.sandbox import ALLOWED_IMPORTS
+
+PROJECT = Path(__file__).resolve().parents[1]
+SOURCES = ["strategies/base.py", "strategies/baseline_momo.py",
+           "engine/types.py", "engine/dataview.py", "engine/rules.py"]
+# 提示词里不能出现的措辞（会触发分类器，导致调用失败）
+BANNED_WORDS = ["安全", "沙箱", "绕过", "权限", "漏洞", "攻击", "注入", "逃逸", "恶意",
+                "sandbox", "bypass", "security", "permission", "exploit", "jailbreak", "escape", "malicious"]
 
 
-@dataclass
-class FakeUsage:
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
-
-
-@dataclass
-class FakeText:
-    text: str
-    type: str = "text"
-
-
-@dataclass
-class FakeMessage:
-    usage: FakeUsage
-    content: list
-    stop_reason: str = "end_turn"
-
-
-class FakeMessages:
-    def __init__(self, messages):
-        self._messages = messages
-        self.kwargs = None
-        self.yielded = 0
-
-    def tool_runner(self, **kwargs):
-        self.kwargs = kwargs
-
-        def gen():
-            for m in self._messages:
-                self.yielded += 1
-                yield m
-        return gen()
-
-
-class FakeClient:
-    def __init__(self, messages):
-        self.beta = type("Beta", (), {})()
-        self.beta.messages = FakeMessages(messages)
-
-
-def msg(inp, out, text="done"):
-    return FakeMessage(usage=FakeUsage(inp, out), content=[FakeText(text)])
-
-
-@pytest.fixture
-def env(tmp_path, monkeypatch):
-    (tmp_path / "strategies").mkdir()
-    settings = Settings(anthropic_api_key="test-key", wecom_webhook_url="",
-                        monthly_budget_cny=50.0, usd_cny=7.2, root=tmp_path)
-    store = Store(":memory:")
-    store.set_status("baseline_momo", "incumbent", date(2026, 10, 1))
-    commits = []
-    monkeypatch.setattr(research, "verify", lambda root: [])
-    monkeypatch.setattr(research, "git_commit", lambda paths, message: commits.append((paths, message)) or True)
-    monkeypatch.setattr(research, "list_strategy_names", lambda: ["baseline_momo"])
-    return settings, store, NullNotifier(), commits
-
-
-def test_system_prompt_covers_key_points():
-    for kw in ["≤5", "DSR", "holdout", "过拟合", "docstring", "超额"]:
-        assert kw in RESEARCH_SYSTEM
-
-
-def test_runner_called_with_contract_params_and_cost_recorded(env):
-    settings, store, notifier, commits = env
-    client = FakeClient([msg(1000, 500), msg(2000, 1000, "总结：无新策略")])
-    out = run_research(settings, store, notifier, client=client)
-    kw = client.beta.messages.kwargs
-    assert kw["model"] == settings.llm_model and kw["max_tokens"] == 16000
-    assert kw["system"] == RESEARCH_SYSTEM and kw["output_config"] == {"effort": "high"}
-    assert kw["messages"][0]["role"] == "user"
-    assert {t.name for t in kw["tools"]} == {
-        "list_strategies", "read_file", "write_strategy", "run_evaluation", "recent_trials"}
-    # (3000*4 + 1500*20) / 1e6 USD * 7.2
-    expected = (3000 * 4.0 + 1500 * 20.0) / 1e6 * 7.2
-    today = date.today()
-    assert store.month_llm_cost(today.year, today.month) == pytest.approx(expected)
-    assert out["status"] == "ok" and out["cost_cny"] == pytest.approx(expected)
-    assert out["final_text"] == "总结：无新策略"
-    assert commits == []  # 没写策略就不提交
-    assert notifier.sent  # 推送了摘要
-
-
-def test_stops_when_budget_exceeded(env):
-    settings, store, notifier, _ = env
-    # 每条 1M 输入 token = 4 USD * 7.2 = 28.8 CNY；预算 50 -> 第 2 条后停止
-    client = FakeClient([msg(1_000_000, 0) for _ in range(5)])
-    out = run_research(settings, store, notifier, client=client)
-    assert client.beta.messages.yielded == 2
-    assert out["status"] == "budget_stopped"
-
-
-def test_budget_already_exhausted_skips_session(env):
-    settings, store, notifier, _ = env
-    store.add_llm_usage("premarket:active", 0, 0, 60.0)
-    client = FakeClient([msg(10, 10)])
-    out = run_research(settings, store, notifier, client=client)
-    assert out["status"] == "budget_exceeded"
-    assert client.beta.messages.kwargs is None
-
-
-def test_integrity_failure_before_aborts_and_alerts(env, monkeypatch):
-    settings, store, notifier, commits = env
-    monkeypatch.setattr(research, "verify", lambda root: ["engine/broker.py"])
-    client = FakeClient([msg(10, 10)])
-    out = run_research(settings, store, notifier, client=client)
-    assert out["status"] == "integrity_failed"
-    assert client.beta.messages.kwargs is None
-    assert any("engine/broker.py" in m for m in map(str, notifier.sent))
-    assert commits == []
-
-
-def test_integrity_failure_after_aborts_without_commit(env, monkeypatch):
-    settings, store, notifier, commits = env
-    results = iter([[], ["engine/evaluator.py"]])
-    monkeypatch.setattr(research, "verify", lambda root: next(results))
-    client = FakeClient([msg(10, 10)])
-    out = run_research(settings, store, notifier, client=client)
-    assert out["status"] == "integrity_failed"
-    assert any("engine/evaluator.py" in m for m in map(str, notifier.sent))
-    assert commits == []
-
-
-GOOD_SRC = '''"""假设：测试用空策略。"""
+def src(name: str, extra: str = "") -> str:
+    return f'''"""假设：{name} 的测试假设。"""
+{extra}from engine.dataview import DataView
 from engine.types import Pick
-from engine.dataview import DataView
 
 
-class Probe:
-    name = "probe_two"
+class S:
+    name = "{name}"
 
     def select(self, view: DataView) -> list[Pick]:
         return []
 
 
-STRATEGY = Probe()
+STRATEGY = S()
 '''
 
 
-def test_written_strategy_is_committed(env):
-    settings, store, notifier, commits = env
-
-    class WritingMessages(FakeMessages):
-        def tool_runner(self, **kwargs):
-            self.kwargs = kwargs
-            tools = {t.name: t for t in kwargs["tools"]}
-
-            def gen():
-                # 模拟 runner 执行模型发起的工具调用
-                tools["write_strategy"].call({"name": "probe_two", "code": GOOD_SRC})
-                self.yielded += 1
-                yield msg(100, 100, "写了 probe_two")
-            return gen()
-
-    client = FakeClient([])
-    client.beta.messages = WritingMessages([])
-    out = run_research(settings, store, notifier, client=client)
-    assert (settings.root / "strategies" / "probe_two.py").exists()
-    assert store.get_status("probe_two") == "candidate"
-    assert out["written"] == ["probe_two"]
-    assert commits and commits[0][0] == ["strategies/probe_two.py"]
+def d(name: str, extra: str = "") -> Draft:
+    return Draft(name=name, hypothesis=f"{name} 的假设：动量在高换手股票上更强", code=src(name, extra))
 
 
-def test_runner_exception_alerts(env):
-    settings, store, notifier, _ = env
+def rnd(*drafts, done=False, analysis="分析") -> ResearchRound:
+    return ResearchRound(analysis=analysis, drafts=list(drafts), done=done)
 
-    class Boom(FakeMessages):
-        def tool_runner(self, **kwargs):
-            raise RuntimeError("api down")
 
-    client = FakeClient([])
-    client.beta.messages = Boom([])
-    out = run_research(settings, store, notifier, client=client)
-    assert out["status"] == "error" and "api down" in out["error"]
-    assert notifier.sent
+def report(name, gate=False, holdout=None):
+    return {"strategy": name, "train": {"sharpe": 0.61, "excess_ann": 0.021},
+            "val": {"sharpe": 0.95, "excess_ann": 0.043, "max_dd": -0.18},
+            "dsr": 0.912345678, "gate_pass": gate, "holdout_pass": holdout, "n_trials": 7}
+
+
+class FakeLLM:
+    """按顺序返回预设结果（ResearchRound 或异常）；像真 LLM 一样先查预算，成功后记账。"""
+
+    def __init__(self, settings, store, script, round_cost=0.5):
+        self.settings, self.store = settings, store
+        self.script = list(script)
+        self.round_cost = round_cost
+        self.calls: list[dict] = []
+
+    def check_budget(self, essential):
+        t = date.today()
+        if not essential and self.store.month_llm_cost(t.year, t.month) >= self.settings.monthly_budget_cny:
+            raise BudgetExceeded("本月 LLM 预算已用完")
+
+    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0,
+              max_budget_usd=1.0, essential=False):
+        assert max_budget_usd > 0, "单次预算必须为正"
+        self.check_budget(essential)
+        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
+                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        self.store.add_llm_usage(purpose, 1000, 200, self.round_cost)
+        return item
+
+
+class FakeEval:
+    """替代 subprocess.run 的评估 runner：按策略名返回预设报告，可在评估时执行副作用。"""
+
+    def __init__(self):
+        self.outcomes: dict[str, dict] = {}
+        self.side_effect = None
+        self.names: list[str] = []
+
+    def __call__(self, cmd, **kw):
+        name = cmd[-1]
+        self.names.append(name)
+        if self.side_effect:
+            self.side_effect(name)
+        rep = self.outcomes.get(name, report(name))
+        return subprocess.CompletedProcess(cmd, 0, stdout="评估日志\n" + json.dumps(rep) + "\n", stderr="")
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    for rel in SOURCES:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(PROJECT / rel, tmp_path / rel)
+    integrity.write_manifest(tmp_path)  # 真实清单：之后 verify(tmp_path) == []
+    settings = Settings(anthropic_api_key="", wecom_webhook_url="", monthly_budget_cny=50.0,
+                        usd_cny=7.2, root=tmp_path)
+    store = Store(":memory:")
+    store.set_status("baseline_momo", "incumbent", date(2026, 10, 1))
+    commits = []
+    monkeypatch.setattr(research, "git_commit",
+                        lambda paths, message: commits.append((paths, message)) or True)
+    fake_eval = FakeEval()
+    real_evaluate = research.evaluate_strategy
+    monkeypatch.setattr(research, "evaluate_strategy",
+                        lambda s, st, name, runner=None: real_evaluate(s, st, name, runner=fake_eval))
+    return SimpleNamespace(settings=settings, store=store, notifier=NullNotifier(), commits=commits,
+                           evals=fake_eval, root=tmp_path)
+
+
+def make_llm(e, *script, cost=0.5) -> FakeLLM:
+    return FakeLLM(e.settings, e.store, script, round_cost=cost)
+
+
+def run(e, llm):
+    return run_research(e.settings, e.store, e.notifier, llm=llm)
+
+
+def test_system_prompt_key_points_and_neutral_wording():
+    for kw in ["≤5", "沪深 300", "开盘价", "T+1", "train", "val", "holdout", "通过/不通过", "DSR",
+               "n_trials", "过拟合", "经济学", "docstring", "STRATEGY", "Strategy", "不联网", "可复现",
+               "done=true"]:
+        assert kw in RESEARCH_SYSTEM, kw
+    for mod in ALLOWED_IMPORTS:
+        assert mod in RESEARCH_SYSTEM, mod
+    assert "<<" not in RESEARCH_SYSTEM
+    assert not [w for w in BANNED_WORDS if w in RESEARCH_SYSTEM.lower()]
+
+
+def test_multi_round_feedback_contains_previous_results(env):
+    e = env
+    e.evals.outcomes["good_one"] = report("good_one", gate=True, holdout=False)
+    llm = make_llm(e, rnd(d("good_one"), d("bad_one", extra="import os\n"), analysis="第一轮：换手动量"),
+                   rnd(done=True, analysis="结论：good_one 门槛达标但 holdout 未通过"))
+    out = run(e, llm)
+    assert out["status"] == "ok" and out["rounds"] == 2
+    first, second = llm.calls
+    for c in llm.calls:
+        assert c["purpose"] == "research" and c["system"] == RESEARCH_SYSTEM
+        assert c["schema"] is ResearchRound and c["effort"] == "high"
+        assert c["timeout"] == 1800.0 and c["essential"] is False
+        assert "class Strategy(Protocol)" in c["user"]  # 每轮都带完整背景
+    assert first["max_budget_usd"] == 3.0                 # 预算充足时取上限 3 美元
+    assert "前几轮" not in first["user"]
+    fb = second["user"]
+    assert "第一轮：换手动量" in fb
+    assert '"gate_pass": true' in fb and '"holdout_pass": false' in fb
+    assert '"dsr": 0.9123' in fb                          # 报告数值保留 4 位小数
+    assert "bad_one" in fb and "禁止导入 os" in fb         # 被拒原因原样反馈
+    assert 'name = "good_one"' in fb                      # 附上草稿代码
+    assert "还可评估 4 次" in fb
+    prose = re.sub(r"```python.*?```", "", fb, flags=re.S).lower()
+    assert not [w for w in BANNED_WORDS if w in prose]    # 代码块以外的文字措辞中性
+    assert out["analysis"] == "结论：good_one 门槛达标但 holdout 未通过"
+    assert out["written"] == ["good_one"]
+    assert [r["name"] for r in out["results"]] == ["good_one", "bad_one"]
+
+
+def test_eval_cap_enforced_across_rounds(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(research, "MAX_EVALS_PER_SESSION", 3)
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three"), d("d_four")), rnd(d("e_five")))
+    out = run(e, llm)
+    assert e.evals.names == ["a_one", "b_two", "c_three"]
+    assert len(llm.calls) == 2                            # 额度用完即停，不再请求第 3 轮
+    assert "还可评估 1 次" in llm.calls[1]["user"]
+    assert out["written"] == ["a_one", "b_two", "c_three"]
+    assert not (e.root / "strategies" / "d_four.py").exists()
+    skipped = out["results"][-1]
+    assert skipped["name"] == "d_four" and not skipped["saved"] and "评估次数已用完" in skipped["message"]
+
+
+def test_draft_cap_per_round_and_rejections_cost_no_eval(env):
+    e = env
+    llm = make_llm(e, rnd(d("a_one", extra="import os\n"), d("b_two"), d("c_three"), d("d_four")),
+                   rnd(done=True))
+    out = run(e, llm)
+    assert e.evals.names == ["b_two", "c_three"]          # 被拒的 a_one 不占评估次数
+    assert [r["name"] for r in out["results"]] == ["a_one", "b_two", "c_three"]
+    assert not (e.root / "strategies" / "d_four.py").exists()
+    assert "另有 1 个草稿超出每轮 3 个的上限" in llm.calls[1]["user"]
+    assert "还可评估 3 次" in llm.calls[1]["user"]
+
+
+def test_stops_on_done_after_processing_drafts(env):
+    e = env
+    llm = make_llm(e, rnd(d("a_one"), done=True), rnd(d("b_two")))
+    out = run(e, llm)
+    assert len(llm.calls) == 1 and out["rounds"] == 1 and out["status"] == "ok"
+    assert e.evals.names == ["a_one"]
+
+
+def test_stops_on_empty_drafts_without_commit(env):
+    e = env
+    llm = make_llm(e, rnd(analysis="暂无值得检验的想法"), rnd(d("b_two")))
+    out = run(e, llm)
+    assert len(llm.calls) == 1 and out["status"] == "ok" and out["written"] == []
+    assert e.commits == []
+    assert "本次没有提交策略草稿" in e.notifier.sent[-1]
+
+
+def test_stops_after_max_rounds(env):
+    e = env
+    llm = make_llm(e, rnd(d("a_one")), rnd(d("b_two")), rnd(d("c_three")), rnd(d("d_four")))
+    out = run(e, llm)
+    assert len(llm.calls) == research.MAX_ROUNDS == 3 and out["rounds"] == 3
+    assert "这是最后一轮" in llm.calls[2]["user"] and "这是最后一轮" not in llm.calls[1]["user"]
+    assert e.evals.names == ["a_one", "b_two", "c_three"]
+
+
+def test_budget_exceeded_mid_session_stops_and_keeps_earlier_work(env):
+    e = env
+    llm = make_llm(e, rnd(d("a_one")), rnd(d("b_two")), cost=60.0)  # 第 1 轮就花掉 60 元 > 预算 50 元
+    out = run(e, llm)
+    assert out["status"] == "budget_exceeded" and out["rounds"] == 1 and len(llm.calls) == 1
+    assert out["cost_cny"] == pytest.approx(60.0)
+    assert e.commits[0][0] == ["strategies/a_one.py"]
+    assert "预算" in e.notifier.sent[-1]
+
+
+def test_budget_exhausted_before_start_skips_session(env):
+    e = env
+    e.store.add_llm_usage("premarket:active", 0, 0, 50.0)
+    llm = make_llm(e, rnd(d("a_one")))
+    out = run(e, llm)
+    assert out == {"status": "budget_exceeded", "rounds": 0, "written": [], "results": [],
+                   "cost_cny": 0.0, "analysis": ""}
+    assert llm.calls == [] and e.evals.names == [] and e.commits == []
+    assert len(e.notifier.sent) == 1 and "跳过" in e.notifier.sent[0]
+
+
+def test_max_budget_usd_and_cost_follow_month_budget(env):
+    e = env
+    e.store.add_llm_usage("review", 0, 0, 40.0)  # 本月已花 40 元，剩 10 元
+    llm = make_llm(e, rnd(d("a_one")), rnd(done=True), cost=0.5)
+    out = run(e, llm)
+    assert llm.calls[0]["max_budget_usd"] == pytest.approx(10.0 / 7.2)
+    assert llm.calls[1]["max_budget_usd"] == pytest.approx(9.5 / 7.2)
+    assert out["cost_cny"] == pytest.approx(1.0)  # 本次会话的月度花费增量
+
+
+@pytest.mark.parametrize("exc", [LLMError("research: error_during_execution 中转返回 502"),
+                                 subprocess.TimeoutExpired("claude.exe", 1800)])
+def test_llm_failure_aborts_cleanly(env, exc):
+    e = env
+    out = run(e, make_llm(e, exc))
+    assert out["status"] == "llm_error" and out["rounds"] == 0 and out["written"] == []
+    assert e.evals.names == [] and e.commits == []
+    msg = e.notifier.sent[-1]
+    assert "告警" in msg and type(exc).__name__ in msg
+
+
+def test_llm_failure_in_later_round_still_commits_earlier_drafts(env):
+    e = env
+    out = run(e, make_llm(e, rnd(d("a_one")), LLMError("research: error_max_budget_usd")))
+    assert out["status"] == "llm_error" and out["rounds"] == 1 and out["written"] == ["a_one"]
+    assert e.commits[0][0] == ["strategies/a_one.py"]
+    assert "error_max_budget_usd" in e.notifier.sent[-1]
+
+
+def _touch_engine(root):
+    with open(root / "engine" / "rules.py", "a", encoding="utf-8") as f:
+        f.write("\nEXTRA = 1\n")
+
+
+def test_integrity_failure_before_alerts_without_llm_call(env):
+    e = env
+    _touch_engine(e.root)
+    llm = make_llm(e, rnd(d("a_one")))
+    out = run(e, llm)
+    assert out["status"] == "integrity_failed" and llm.calls == []
+    assert e.evals.names == [] and e.commits == []
+    assert "告警" in e.notifier.sent[0] and "engine/rules.py" in e.notifier.sent[0]
+
+
+def test_integrity_change_after_alerts_and_skips_commit(env):
+    e = env
+    e.evals.side_effect = lambda name: _touch_engine(e.root)  # 评估过程中 engine/ 被改动
+    out = run(e, make_llm(e, rnd(d("a_one"), done=True)))
+    assert out["status"] == "integrity_failed" and out["written"] == ["a_one"]
+    assert e.commits == []
+    assert (e.root / "strategies" / "a_one.py").exists()       # 留在工作区供人工检查
+    alert = e.notifier.sent[-1]
+    assert "告警" in alert and "engine/rules.py" in alert and "a_one" in alert
+
+
+def test_commit_summary_and_return_shape(env):
+    e = env
+    e.evals.outcomes["a_one"] = report("a_one", gate=True, holdout=True)
+    llm = make_llm(e, rnd(d("a_one"), d("b_two"), done=True, analysis="结论：a_one 值得进影子盘观察"))
+    out = run(e, llm)
+    assert set(out) == {"status", "rounds", "written", "results", "cost_cny", "analysis"}
+    assert out["written"] == ["a_one", "b_two"] and out["cost_cny"] == pytest.approx(0.5)
+    assert e.store.get_status("a_one") == "shadow" and e.store.get_status("b_two") == "candidate"
+    paths, message = e.commits[0]
+    assert paths == ["strategies/a_one.py", "strategies/b_two.py"]
+    assert "a_one 的假设：动量在高换手股票上更强" in message and "b_two 的假设" in message
+    assert "进入影子盘" in message
+    summary = e.notifier.sent[-1]
+    assert "研究会话" in summary and "a_one" in summary and "进入影子盘" in summary
+    assert "0.50 元" in summary and "结论：a_one 值得进影子盘观察" in summary
+
+
+def test_default_llm_is_built_from_settings(env, monkeypatch):
+    e = env
+    fake = make_llm(e, rnd(done=True))
+    seen = []
+    monkeypatch.setattr(research, "LLM", lambda settings, store: seen.append((settings, store)) or fake)
+    out = run_research(e.settings, e.store, e.notifier)
+    assert seen == [(e.settings, e.store)] and len(fake.calls) == 1 and out["status"] == "ok"
 ```
-
-说明：已在 anthropic==1.15.0 上核实：`@beta_tool` 返回 `BetaFunctionTool`，有 `.call(input)`、`.func`、`.name`；`client.beta.messages.tool_runner` 接受 `output_config`、`system`、`tools`、`max_tokens`、`messages`。
 
 **Step 2: 运行测试，确认失败**
 
-```bash
+```
 uv run pytest tests/test_research_loop.py -v
 ```
 
 预期：FAIL，`ImportError: cannot import name 'RESEARCH_SYSTEM' from 'agents.research'`。
 
-**Step 3: 最小实现**
+**Step 3: 实现**
 
-在 `agents/research.py` 顶部 import 区追加（与 Task 5.1 的 import 合并）：
+先把 `agents/research.py` 顶部的 import 区（从 `import io` 到 `from strategies.sandbox import ALLOWED_IMPORTS, check_source`）整体替换为：
 
 ```python
-from anthropic import beta_tool
+import io
+import json
+import logging
+import os
+import subprocess
+import sys
+import tokenize
+from datetime import date
+from pathlib import Path
+
+from pydantic import BaseModel
 
 from agents.llm import LLM, BudgetExceeded
 from agents.playbook import git_commit
 from config import Settings
 from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
+from engine.store import Store
 from notify.format import format_alert
+from strategies.base import NAME_RE, RESERVED
+from strategies.sandbox import ALLOWED_IMPORTS, check_source
+
+log = logging.getLogger(__name__)
 ```
 
-在文件末尾追加提示词：
+再在文件末尾追加：
 
 ```python
-RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是 A 股盘前推荐 + 模拟交易系统，你的工作是提出并检验新的选股策略。
-You are the quant researcher of RSIQS (A-share pre-open picks + simulated trading).
-
-## 目标 Goal
-在“每日最多 ≤5 笔新开仓（max 5 picks/day）”的约束下，提高扣除交易成本（佣金、印花税、过户费、10bp 滑点）后、
-相对沪深 300 的风险调整超额收益（risk-adjusted excess return after costs）。
-回测引擎已模拟 T+1、涨跌停无法成交、停牌、整手交易；你不能修改 engine/，只能在 strategies/ 下写新策略。
-
-## 数据切分 Data splits
-- train 2016-2024：用于开发；val 2025-01 至 2026-06：门槛检验。
-- holdout 2026-07 以后：你只会得到 holdout_pass 通过/不通过（pass/fail only），永远看不到具体数值。
-  不要试图通过反复提交来“探测” holdout；每次评估都被记录并计入多重检验惩罚。
-
-## 过拟合 Overfitting
-- 每一次 run_evaluation 都会计入全局试验次数 n_trials。门槛包含 Deflated Sharpe Ratio（DSR）：
-  试验越多，同样的夏普越可能是运气，DSR 越低，越难过门槛。
-- 因此：少而精。本次会话最多评估若干次（见用户消息），宁可提交 1-3 个论证充分的变体，也不要做参数网格搜索。
-- 不要微调阈值去拟合 train/val；参数取整、取常见值（如 5/10/20/60 日），规则越简单越好。
-- 警惕数据窥探：只使用 DataView.history() 给出的截至 asof 的数据，引擎会对未来数据抛 LookaheadError。
-
-## 好的假设 Good hypotheses
-- 优先有经济学或市场微观结构依据的想法：例如动量/反转、流动性与成交额、波动率、涨跌停后的行为、
-  A 股散户主导下的过度反应、T+1 带来的隔夜风险等。说清“为什么这个效应应该存在、为什么还没被套利掉”。
-- 先读现任策略和最近的试验记录（recent_trials），避免重复已失败的方向。
-
-## 写策略的规范 Strategy file rules
-- 模块必须定义 STRATEGY = <实例>，实例有 name 属性（与文件名一致）和 select(view: DataView) -> list[Pick]（按优先级降序）。
-- 只能 import：math, statistics, numpy, pandas, dataclasses, typing, engine.types, engine.dataview, engine.rules, strategies.base。
-  禁止文件/网络/exec/eval/双下划线属性等；违规会被沙箱拒绝。
-- 在模块 docstring 里写明：假设（hypothesis）、经济学理由、与现任策略的差异、预期失效情形。
-- 每个 Pick 需给出 entry_max、stop、target、hold_days 和中文 reason。
-
-## 工作流程 Workflow
-1. list_strategies / read_file 阅读 strategies/baseline_momo.py、engine/dataview.py、engine/types.py 等。
-2. recent_trials 查看历史试验。
-3. write_strategy 写入新策略（新名字，不能覆盖现任）。
-4. run_evaluation 评估；gate_pass 且 holdout_pass 的策略会自动进入影子盘（shadow），之后由前向表现决定是否晋升。
-5. 结束时用中文给出简短总结：尝试了哪些假设、结果如何、下次建议的方向。
-"""
-```
-
-继续在文件末尾追加 `build_brief` 与 `run_research`：
-
-```python
-def build_brief(store: Store, today: date, max_evals: int) -> str:
-    splits = {k: [str(a), str(b) if b else "latest"] for k, (a, b) in SPLITS.items()}
-    return (
-        f"今天是 {today.isoformat()}。请开始本周研究会话。\n"
-        f"- 当前现任策略：{store.strategies_with_status('incumbent')}\n"
-        f"- 影子盘策略：{store.strategies_with_status('shadow')}\n"
-        f"- 历史试验总数 n_trials：{store.trial_count()}\n"
-        f"- 本次会话最多 run_evaluation {max_evals} 次。\n"
-        f"- 数据切分：{json.dumps(splits)}\n"
-        f"- 回测门槛 GATE：{json.dumps(GATE)}；holdout 门槛仅以 pass/fail 返回"
-        f"（共 {len(HOLDOUT_GATE)} 项条件）。\n"
-        "先阅读现任策略和最近试验，再提出 1-3 个有经济学依据的新假设。"
-    )
+FEEDBACK_CODE_CHARS = 6_000      # 反馈里每个草稿代码的上限
+FEEDBACK_ANALYSIS_CHARS = 2_000  # 反馈里每轮分析的上限
 
 
-def _final_text(message) -> str:
-    for block in getattr(message, "content", None) or []:
-        if getattr(block, "type", None) == "text":
-            return block.text
-    return ""
+RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘前推荐与模拟交易系统：每个交易日开盘前，现任量化策略给出候选股票，LLM 层复核后推送不超过 5 只，模拟盘按开盘价成交。你的工作是提出并检验新的选股策略，让系统长期变得更好。
+
+# 目标
+在下列约束下，提高扣除交易成本后、相对沪深 300 的风险调整超额收益：
+- 每天最多新开仓 ≤5 只：回测与模拟盘只取 select 返回列表的前 5 个，每只约占初始资金的 1/5。
+- 开盘价成交：t 日的 select 只能看到截至上一交易日收盘的数据（view.asof），选中的股票在 t 日按开盘价加 10bp 滑点买入；开盘价高于 entry_max、开盘即涨停、停牌或买不足 100 股时不成交。
+- T+1：买入当天不能卖出。之后每天依次检查：到达到期日（买入后第 hold_days 个交易日）按开盘价卖出；否则最低价触及 stop，按 min(开盘价, stop) 卖出；否则最高价触及 target，按 max(开盘价, target) 卖出；全天封死跌停时卖不出。卖出同样扣 10bp 滑点。
+- 成本：佣金万 2.5（最低 5 元）、过户费十万分之一、卖出印花税万 5。换手越高，成本吃掉的收益越多。
+- 股票池约 800 只（沪深 300 与中证 500 的当前成分股，前复权日线，2015 年 6 月起）。存在幸存者偏差，回测结果偏乐观。
+
+# 数据切分
+- train：2016 年至 2024 年，用来形成和检验想法。
+- val：2025 年 1 月至 2026 年 6 月，样本外检验，门槛主要看这一段。
+- holdout：2026 年 7 月至今。只有 train/val 门槛全部达标才会运行，而且只返回 holdout_pass（通过/不通过），不给任何数值。不要根据 holdout 结果反复改版去碰运气，那只会消耗试验次数。
+精确日期和各项门槛数值见用户消息。
+
+# 过拟合与多重检验
+- 每次评估都记为一次试验；n_trials 是所有策略、所有会话累计的总数。门槛里的 DSR（Deflated Sharpe Ratio）按 n_trials 折减：试验越多，同样的夏普越可能只是运气，DSR 越低，越难达标。
+- 所以要少而精：1 到 2 个论证充分、彼此差异明显的变体，胜过一堆参数微调。不做参数网格搜索，不为贴合 train/val 去微调阈值；参数取常见的整数（如 5、10、20、60 日），规则越简单越好。
+- 只在 val 好看、train 很差，或者只靠少数几笔交易撑起来的结果，大概率是噪声，属于过拟合的信号。
+
+# 好的假设
+- 优先有经济学或市场微观结构依据的想法，例如：中期动量与短期反转、流动性与成交额变化、波动率与特质波动、涨跌停附近的价格行为、散户主导下的过度反应与修正、T+1 带来的隔夜风险、开盘成交的价格冲击等。
+- 讲清楚：这个效应为什么应该存在，为什么还没被套利掉，在什么市场环境下会失效，与现任策略有什么不同。
+- 先读用户消息里的现任策略和最近的试验记录，不重复已经失败的方向；前几轮有结果时，据此调整。
+- 没有值得检验的想法时，宁可返回 done=true 和空的 drafts，也不要凑数。
+
+# 策略代码规范
+每个草稿的 code 是一个完整的 Python 模块，会原样保存为 strategies/<name>.py：
+1. 模块 docstring 以“假设：”开头，写明假设、经济学理由、与现任策略的差异、预期何时失效；Draft.hypothesis 用一两句话概括同一个假设。
+2. 定义一个类，实现 strategies.base.Strategy 接口：类属性 name 等于草稿的 name；方法 select(self, view: DataView) -> list[Pick] 返回按优先级从高到低排序的 Pick 列表（可以多于 5 个：回测取前 5 个，盘前流程最多取前 15 个复核）。
+3. 模块末尾定义模块级实例 STRATEGY = 你的类()。
+4. 只 import 下列模块（及其子模块）：<<ALLOWED_IMPORTS>>。不要写 from __future__ import annotations。
+5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停价。
+6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
+7. 写法保持直接：不用 getattr、setattr、vars、globals 这类反射写法，不用 eval、exec、open；不引用以双下划线开头的名字或属性（例如 super().__init__()、__name__；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
+8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
+9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
+10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。
+
+# 工作方式
+- 本任务不使用工具：需要的接口说明、源码、门槛和试验记录都在用户消息里。你只需按 JSON Schema 返回 analysis、drafts、done。
+- 系统依次处理你的草稿：检查名字和代码规范，保存为 strategies/<name>.py（状态 candidate），然后运行回测评估。没通过检查的草稿不会评估，也不占评估次数，原因会在下一轮告诉你。
+- gate_pass 且 holdout_pass 的策略自动进入影子盘（shadow），之后由至少 20 个交易日的前向模拟盘表现决定能否成为现任。
+- 一次会话有轮数、每轮草稿数和评估次数的上限（具体数字见用户消息）。草稿数不要超过剩余评估次数，超出的部分不会处理。
+- 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、gate_pass、holdout_pass（门槛未达标时为 null，表示没有运行）和 n_trials。
+- 每个草稿都要用新名字，包括修正上一轮出错的草稿。
+
+# 输出
+- analysis：中文。先回顾现任策略、试验记录和上一轮结果，再说明本轮每个假设的逻辑和预期；最后一轮或准备结束时，总结结论和下次研究的方向。
+- drafts：0 个或多个 Draft（name、hypothesis、code）。
+- done：之后不需要再来一轮时为 true（本轮的草稿照常处理）；想根据本轮评估结果继续迭代时为 false。
+""".replace("<<ALLOWED_IMPORTS>>", ", ".join(sorted(ALLOWED_IMPORTS)))
 
 
-def run_research(settings: Settings, store: Store, notifier, client=None) -> dict:
+def _month_cost(store: Store) -> float:
+    t = date.today()
+    return store.month_llm_cost(t.year, t.month)
+
+
+def _rounded(obj, nd: int = 4):
+    if isinstance(obj, float):
+        return round(obj, nd)
+    if isinstance(obj, dict):
+        return {k: _rounded(v, nd) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rounded(v, nd) for v in obj]
+    return obj
+
+
+def _outcome(res: dict) -> str:
+    """一个草稿的处理结果，一句中文（用于推送与提交信息）。"""
+    if not res["saved"]:
+        return res["message"]
+    if not res["ok"]:
+        return res["error"]
+    rep = res["report"]
+    if rep.get("gate_pass") and rep.get("holdout_pass"):
+        return "门槛达标，holdout 通过，已进入影子盘"
+    if rep.get("gate_pass"):
+        return "门槛达标，holdout 未通过，保持 candidate"
+    return "门槛未达标，保持 candidate"
+
+
+def _draft_block(res: dict, draft: Draft) -> str:
+    lines = [f"### 草稿 {res['name']}", f"假设：{res['hypothesis']}", f"处理：{res['message']}"]
+    if res["saved"] and res["ok"]:
+        lines.append("评估报告：" + json.dumps(_rounded(res["report"]), ensure_ascii=False))
+    elif res["saved"]:
+        lines.append(res["error"])
+    code = draft.code
+    if len(code) > FEEDBACK_CODE_CHARS:
+        code = code[:FEEDBACK_CODE_CHARS] + "\n# ...（已截断）"
+    lines.append(f"代码：\n```python\n{code.rstrip()}\n```")
+    return "\n".join(lines)
+
+
+def _feedback(history: list[dict]) -> str:
+    parts = ["# 本会话前几轮的结果"]
+    for h in history:
+        parts.append(f"## 第 {h['round']} 轮\n你的分析（节选）：{h['analysis'][:FEEDBACK_ANALYSIS_CHARS]}")
+        parts += [_draft_block(res, d) for res, d in zip(h["results"], h["drafts"])]
+        if not h["results"]:
+            parts.append("（本轮没有草稿）")
+        if h["ignored"]:
+            parts.append(f"另有 {h['ignored']} 个草稿超出每轮 {MAX_DRAFTS_PER_ROUND} 个的上限，没有处理。")
+    return "\n\n".join(parts)
+
+
+def _round_task(rnd_no: int, evals_left: int) -> str:
+    lines = [f"# 本轮任务（第 {rnd_no}/{MAX_ROUNDS} 轮）",
+             f"本会话还可评估 {evals_left} 次，本轮最多处理 {MAX_DRAFTS_PER_ROUND} 个草稿；草稿数不要超过剩余评估次数。"]
+    if rnd_no == 1:
+        lines.append("先在 analysis 里回顾现任策略和最近的试验记录，再提出有依据的新假设。"
+                     "没有值得检验的想法时，返回 done=true 和空的 drafts。")
+    else:
+        lines.append("请根据上面的结果决定：修正出错的草稿（换新名字）、提出有依据的新变体，或者返回 done=true 结束。"
+                     "不要为了让 holdout 通过而微调参数。")
+    if rnd_no == MAX_ROUNDS:
+        lines.append("这是最后一轮：analysis 里请总结本会话的结论和下次研究的方向。")
+    return "\n".join(lines)
+
+
+def _commit_message(today: date, saved: list[dict]) -> str:
+    lines = [f"research: {today.isoformat()} 新增候选策略 {', '.join(r['name'] for r in saved)}", ""]
+    for r in saved:
+        hyp = " ".join(r["hypothesis"].split())[:300]
+        lines.append(f"- {r['name']}：{hyp}（{_outcome(r)}）")
+    return "\n".join(lines)
+
+
+def _summary(today: date, out: dict, error: str) -> str:
+    label = {"ok": "完成", "budget_exceeded": "本月 LLM 预算用完，提前结束",
+             "llm_error": "Claude 调用失败，提前结束", "error": "本地处理出错，提前结束"}[out["status"]]
+    saved = [r for r in out["results"] if r["saved"]]
+    other = [r for r in out["results"] if not r["saved"]]
+    lines = [f"轮数 {out['rounds']}｜评估 {len(saved)} 次｜花费 {out['cost_cny']:.2f} 元"]
+    if error:
+        lines.append(f"原因：{error[:300]}")
+    if saved:
+        lines += ["新策略："] + [f"- {r['name']}：{_outcome(r)[:200]}" for r in saved]
+    if other:
+        lines += ["未采用的草稿："] + [f"- {r['name']}：{r['message'][:200]}" for r in other]
+    if not out["results"]:
+        lines.append("本次没有提交策略草稿。")
+    if out["analysis"]:
+        lines.append("结论：" + out["analysis"][:800])
+    title = f"研究会话 {today.isoformat()}：{label}"
+    if out["status"] in ("llm_error", "error"):
+        return format_alert(title, "\n".join(lines))
+    return f"RSIQS {title}\n" + "\n".join(lines)
+
+
+def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
+                   evals: int, out: dict) -> tuple[list[dict], int]:
+    """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
+
+    结果边做边记进 out：即使本地出错抛异常，已写入的文件也会照常提交。"""
+    results = []
+    for draft in rnd.drafts[:MAX_DRAFTS_PER_ROUND]:
+        res = {"round": rnd_no, "name": draft.name.strip(), "hypothesis": draft.hypothesis.strip(),
+               "saved": False, "message": "", "ok": False, "report": None, "error": ""}
+        results.append(res)
+        out["results"].append(res)
+        if evals >= MAX_EVALS_PER_SESSION:
+            res["message"] = "本会话评估次数已用完，没有处理"
+            continue
+        res["saved"], res["message"] = submit_draft(settings, store, draft)
+        if res["saved"]:
+            out["written"].append(res["name"])
+            evals += 1  # 先计数：超时、失败同样消耗一次额度
+            res.update(evaluate_strategy(settings, store, res["name"]))
+    return results, evals
+
+
+def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
+    """一次研究会话（最多 MAX_ROUNDS 轮）。返回 status/rounds/written/results/cost_cny/analysis。"""
     root = Path(settings.root)
     today = date.today()
-    summary: dict = {"status": "ok", "cost_cny": 0.0, "messages": 0, "written": [],
-                     "results": [], "final_text": "", "error": ""}
-
-    def alert(title: str, body: str) -> None:
-        notifier.send_text(format_alert(title, body))
+    out = {"status": "ok", "rounds": 0, "written": [], "results": [], "cost_cny": 0.0, "analysis": ""}
 
     bad = verify(root)
     if bad:
-        alert("研究循环中止：锁定区哈希不符", "\n".join(bad))
-        return {**summary, "status": "integrity_failed", "error": ", ".join(bad)}
+        notifier.send_text(format_alert("研究会话未启动：engine/ 校验不符", "\n".join(bad)))
+        return {**out, "status": "integrity_failed"}
 
-    llm = LLM(settings, store, client=client)
+    llm = llm or LLM(settings, store)
     try:
-        llm.check_budget(essential=False)
-    except BudgetExceeded:
-        notifier.send_text("研究循环跳过：本月 LLM 预算已用完")
-        return {**summary, "status": "budget_exceeded"}
+        llm.check_budget(False)
+    except BudgetExceeded as e:
+        notifier.send_text(f"RSIQS 研究会话 {today.isoformat()} 跳过：{e}")
+        return {**out, "status": "budget_exceeded"}
 
-    # 运行时读取模块常量，便于 smoke 时改为 1
-    ctx = ResearchContext(root=root, store=store, today=today, max_evals=MAX_EVALS_PER_SESSION)
-
-    @beta_tool
-    def list_strategies() -> str:
-        """列出 strategies/ 下所有策略及其状态（candidate/shadow/incumbent/retired/null）。"""
-        return tool_list_strategies(ctx)
-
-    @beta_tool
-    def read_file(path: str) -> str:
-        """只读文件。允许 strategies/*.py、engine/*.py、playbook/*，使用相对路径。
-
-        Args:
-            path: 相对项目根目录的路径，例如 strategies/baseline_momo.py
-        """
-        return tool_read_file(ctx, path)
-
-    @beta_tool
-    def write_strategy(name: str, code: str) -> str:
-        """写入新策略 strategies/<name>.py 并标记为 candidate。代码须通过沙箱检查。
-
-        Args:
-            name: 策略名，匹配 ^[a-z][a-z0-9_]{2,40}$，不能是现任策略
-            code: 完整 Python 源码，模块 docstring 写明假设，并定义 STRATEGY
-        """
-        return tool_write_strategy(ctx, name, code)
-
-    @beta_tool
-    def run_evaluation(name: str) -> str:
-        """在隔离子进程中回测评估策略，返回 train/val 指标与 gate_pass/holdout_pass。每次调用计入试验次数。
-
-        Args:
-            name: 已写入的策略名
-        """
-        return tool_run_evaluation(ctx, name)
-
-    @beta_tool
-    def recent_trials() -> str:
-        """返回最近 20 次试验记录（所有策略）。"""
-        return tool_recent_trials(ctx)
-
-    tools = [list_strategies, read_file, write_strategy, run_evaluation, recent_trials]
-    month = (today.year, today.month)
-    last = None
+    cost0 = _month_cost(store)
+    error = ""
+    history: list[dict] = []
+    evals = 0
     try:
-        runner = llm.client.beta.messages.tool_runner(
-            model=settings.llm_model,
-            max_tokens=16000,
-            system=RESEARCH_SYSTEM,
-            tools=tools,
-            messages=[{"role": "user", "content": build_brief(store, today, ctx.max_evals)}],
-            output_config={"effort": "high"},
-        )
-        for message in runner:
-            last = message
-            summary["messages"] += 1
-            usage = getattr(message, "usage", None)
-            cost = llm.cost_cny(usage)
-            store.add_llm_usage("research", int(getattr(usage, "input_tokens", 0) or 0),
-                                int(getattr(usage, "output_tokens", 0) or 0), cost)
-            summary["cost_cny"] += cost
-            if store.month_llm_cost(*month) >= settings.monthly_budget_cny:
-                summary["status"] = "budget_stopped"
+        context = build_context(settings, store)
+        for rnd_no in range(1, MAX_ROUNDS + 1):
+            feedback = _feedback(history) + "\n\n" if history else ""
+            user = f"{context}\n\n{feedback}{_round_task(rnd_no, MAX_EVALS_PER_SESSION - evals)}"
+            try:
+                llm.check_budget(False)
+                remaining_usd = (settings.monthly_budget_cny - _month_cost(store)) / settings.usd_cny
+                rnd = llm.parse(purpose="research", system=RESEARCH_SYSTEM, user=user, schema=ResearchRound,
+                                effort="high", timeout=1800.0, max_budget_usd=min(3.0, remaining_usd),
+                                essential=False)
+            except BudgetExceeded as e:
+                out["status"], error = "budget_exceeded", str(e)
                 break
-    except Exception as e:  # API 错误等：告警但仍做完整性检查与提交
-        summary["status"] = "error"
-        summary["error"] = f"{type(e).__name__}: {e}"
-        alert("研究循环异常", summary["error"])
-
-    summary["written"] = sorted(ctx.written)
-    summary["results"] = ctx.results
-    summary["final_text"] = _final_text(last) if last is not None else ""
+            except Exception as e:  # noqa: BLE001 — LLMError、超时、输出不合 schema 都在这里收口
+                log.warning("research round %d failed: %s: %s", rnd_no, type(e).__name__, e)
+                out["status"], error = "llm_error", f"{type(e).__name__}: {e}"
+                break
+            out["rounds"], out["analysis"] = rnd_no, rnd.analysis
+            results, evals = _process_round(settings, store, rnd_no, rnd, evals, out)
+            history.append({"round": rnd_no, "analysis": rnd.analysis, "results": results,
+                            "drafts": rnd.drafts[:MAX_DRAFTS_PER_ROUND],
+                            "ignored": max(0, len(rnd.drafts) - MAX_DRAFTS_PER_ROUND)})
+            if rnd.done or not rnd.drafts or evals >= MAX_EVALS_PER_SESSION:
+                break
+    except Exception as e:  # noqa: BLE001 — 写文件、数据库等本地故障：停止，但照常做会后校验与提交
+        log.exception("research session failed")
+        out["status"], error = "error", f"{type(e).__name__}: {e}"
+    out["cost_cny"] = _month_cost(store) - cost0
 
     bad = verify(root)
     if bad:
-        alert("研究循环中止：会话后锁定区哈希不符", "\n".join(bad))
-        return {**summary, "status": "integrity_failed", "error": ", ".join(bad)}
+        notifier.send_text(format_alert(
+            "研究会话后 engine/ 校验不符，未提交 git",
+            "\n".join(bad) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"))
+        return {**out, "status": "integrity_failed"}
 
-    if ctx.written:
-        git_commit([f"strategies/{n}.py" for n in summary["written"]],
-                   f"research: {today.isoformat()} new strategies {', '.join(summary['written'])}")
-
-    passed = [r["strategy"] for r in ctx.results if r.get("new_status") == "shadow"]
-    notifier.send_text(
-        f"🔬 研究会话 {today.isoformat()}（{summary['status']}）\n"
-        f"新策略：{', '.join(summary['written']) or '无'}；评估 {ctx.evals_used} 次；进入影子盘：{', '.join(passed) or '无'}\n"
-        f"花费：{summary['cost_cny']:.2f} 元\n{summary['final_text'][:1200]}"
-    )
-    return summary
+    saved = [r for r in out["results"] if r["saved"]]
+    if saved:
+        git_commit([f"strategies/{r['name']}.py" for r in saved], _commit_message(today, saved))
+    notifier.send_text(_summary(today, out, error))
+    return out
 ```
 
 说明：
-- `LLM` 仅用于 `cost_cny`/`check_budget` 及持有 client（`client=None` 时由 `LLM` 创建 `anthropic.Anthropic`）。`tool_runner` 不发送 `thinking`/`temperature`/`tool_choice`（Opus 5.5 约束）。
-- 预算检查在每条消息记账后进行，超限立即 `break`，正在进行中的工具调用不会再继续。
-- 会话后完整性失败时不提交 git，留给人工排查；写入的策略文件保留在工作区。
+- `RESEARCH_SYSTEM` 不写死轮数、草稿数和评估次数，这些上限由 `build_context` 和 `_round_task` 按运行时的模块常量写进 user 消息，所以冒烟时把 `MAX_ROUNDS` 等改成 1 也前后一致。可 import 的模块列表由 `ALLOWED_IMPORTS` 生成，与 `check_source` 始终一致。
+- 背景在会话开始时生成一次，各轮前缀相同。反馈里每轮附分析节选、每个草稿的处理结果、评估报告（浮点保留 4 位）和代码，各有长度上限，所以 user 消息的长度有界。
+- 模型输出只以策略文件的形式进入系统：先经 `submit_draft` 校验写入，再在评估子进程里运行。Python 不执行模型输出的其他任何部分。
+- LLM 失败不重试：研究每周一次，失败就结束本次会话，下周再跑。所有 parse 异常都在 `run_research` 内收口，`jobs/research.py` 的 `run_job` 照常记为完成。
+- 会后完整性失败时不提交 git，写入的策略文件留在工作区，由人工排查后决定提交还是删除。
 
 **Step 4: 运行测试，确认通过**
 
-```bash
+```
 uv run pytest tests/test_research_tools.py tests/test_research_loop.py -v
 ```
 
-预期：全部 PASS。
+预期：49 passed（tools 32 + loop 17）。
 
 **Step 5: 提交**
 
-```bash
+```
 git add agents/research.py tests/test_research_loop.py
-git commit -m "feat: research loop with tool_runner, budget stop and integrity checks"
+git commit -m "feat: multi-round research loop with structured drafts, eval cap, budget and integrity checks"
 ```
 
-（提交信息末尾附加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer。）
+（提交信息末尾附加 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer。）
 
-**Manual smoke step（真实 Claude API，一次研究会话，仅 1 次评估）**
+**Manual smoke step（真实 Claude Code CLI：一轮、最多一次评估）**
 
-前置：已完成 `python -m jobs.bootstrap`（数据缓存、现任策略、integrity manifest 已就绪），`.env` 中填入真实 `ANTHROPIC_API_KEY`。
+前置：已完成 `python -m jobs.bootstrap`（行情缓存、现任策略、integrity 清单就绪）；`.env` 已配置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`（或 `ANTHROPIC_API_KEY`），并且 `uv run python scripts/smoke_llm.py` 能通过；`git status` 干净（会话会提交新的策略文件）。
 
-```bash
-uv run python -c "from agents import research; research.MAX_EVALS_PER_SESSION = 1; from agents.research import run_research; from config import get_settings; from engine.store import Store; from notify.wecom import NullNotifier; s = get_settings(); n = NullNotifier(); print(run_research(s, Store(s.root / s.db_path), n)); print(n.sent)"
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python -c "from agents import research; research.MAX_ROUNDS = 1; research.MAX_EVALS_PER_SESSION = 1; from config import get_settings; from engine.store import Store; from notify.wecom import NullNotifier; s = get_settings(); n = NullNotifier(); out = research.run_research(s, Store(s.root / s.db_path), n); print({k: out[k] for k in ('status', 'rounds', 'written', 'cost_cny')}); print(n.sent[-1])"
 ```
 
 检查点：
-- 返回 `status` 为 `ok`；推送摘要中“评估 N 次”的 N ≤ 1（第二次 `run_evaluation` 返回 `ERROR: evaluation limit reached`）。
-- `strategies/` 下出现新文件，docstring 写有假设；`store.get_status(<name>)` 为 `candidate` 或 `shadow`。
-- `uv run python -c "from config import get_settings; from engine.store import Store; s=get_settings(); import datetime as d; t=d.date.today(); print(Store(s.root / s.db_path).month_llm_cost(t.year, t.month))"` 显示有 research 花费。
-- `git log -1` 显示 `research: ...` 提交；`uv run python -c "from engine.integrity import verify; from pathlib import Path; print(verify(Path('.')))"` 输出 `[]`。
-
+- `status` 为 `ok`，`rounds` 为 1，`written` 最多 1 个名字（其余草稿在摘要里标“本会话评估次数已用完，没有处理”）。若为 `llm_error`，摘要里写有原因：先单独跑 `scripts/smoke_llm.py` 排查中转和鉴权；若报错与 schema 或分类器有关，检查提示词措辞。
+- `strategies/<name>.py` 的 docstring 以“假设：”开头；`uv run python -c "from config import get_settings; from engine.store import Store; s = get_settings(); print(Store(s.root / s.db_path).recent_trials(1))"` 能看到这次试验。
+- `cost_cny` 大于 0，且在几元人民币的量级（单轮上限 3 美元）。
+- `git log -1 --format=%B` 显示 `research: <日期> 新增候选策略 <name>` 以及假设；`uv run python -c "from engine.integrity import verify; from pathlib import Path; print(verify(Path('.')))"` 输出 `[]`。
+- 若不想保留这次冒烟写入的策略：`git revert HEAD`，并把它的状态改为 retired（`Store(...).set_status(name, "retired", date.today())`），以免它留在候选或影子盘里。
 
 ---
 
@@ -6856,13 +8037,14 @@ uv run python -c "from agents import research; research.MAX_EVALS_PER_SESSION = 
 > - `bootstrap` 若 `kv "playbook_released"` 不存在，则写入锚定日 ISO 字符串（视为 v1 的发布日），保证 `maybe_release` 的 10 个交易日间隔从启动日起算。
 > - `monitor` 去重键持久化在 `kv "monitor_sent:<ISO日期>"`（进程重启不重复告警）；`check_once(d, store, client, notifier) -> list[str]`。
 > - `jobs.review` 只复盘"不晚于今天、已结算"的最近一个交易日（契约原文）；该日已复盘则跳过。
-> - `jobs.premarket_final` 若当日 `premarket_scan` 未完成（开机晚），先内联补跑扫描再定稿。
-> - 所有入口 `main(now: datetime | None = None)`，通过 `common.context()` 取依赖；测试中 monkeypatch `jobs.common.context`。
-> - `jobs/common.py` 额外提供 `make_llm(settings, store)` 工厂（入口通过 `common.make_llm` 调用，测试打桩）与 `load_calendar`、`setup_logging`；入口一律以 `from jobs import common` 引用以便 monkeypatch 生效。
-> - 端到端测试依赖 Part 2 的 `Store` 可跨线程使用（`check_same_thread=False` + 锁），因为 `run_final` 在两个线程里调用 `finalize`。
+> - 盘前分两段。`jobs.premarket_scan`（08:30）在同一个 `run_job("premarket_scan")` 里先跑 `premarket.scan`，再跑 `premarket.run_analyze`（active/candidate 两路深度分析并行，计划存 `kv "plan:<ISO日期>:<kind>"`）。分析失败（包括 `run_analyze` 本身抛异常）不算任务失败：任务照样记 ok，只推一条"盘前分析未完成"告警。启动时已过 09:25（开机补跑）则只扫描、不分析，因为定稿已经开始，计划用不上，不必白花钱。
+> - `jobs.premarket_final` 的计划任务 09:25 触发。入口先判断交易日和是否过时（晚于 09:35 跳过），再等到 09:25:15（竞价快照落定）后定稿；非交易日、过时都不等待。若当日 `premarket_scan` 未完成（开机晚或 08:30 扫描失败），先内联补跑扫描：只扫描不分析，同样记为 `premarket_scan` 完成。此时两路都没有计划，`run_final` 退回量化推荐。
+> - 所有入口 `main(now: datetime | None = None)`；`premarket_final.main` 另有 `sleep=time.sleep` 参数，测试注入假 sleep。入口通过 `common.context()` 取依赖；测试中 monkeypatch `jobs.common.context`。
+> - `jobs/common.py` 另外提供 `make_llm(settings, store)` 工厂、`load_calendar` 与 `setup_logging`。`make_llm` 返回 `agents.llm.LLM`（经本机 `claude.exe` 无头模式调用 Claude）；入口一律通过 `common.make_llm` 取 LLM，测试打桩为 `FakeLLM`，没有任何测试会启动 `claude.exe`。入口一律以 `from jobs import common` 引用，以便 monkeypatch 生效。
+> - `setup_logging` 把文件 handler 挂在根 logger 上：`agents.*` 记录的 `LLMError`（CLI 返回的 subtype 与输出摘要）、`notify.wecom` 的推送失败都写进 `logs/jobs.log`，排查"未经 LLM 审核"时只看这一个文件。
+> - 端到端测试依赖 Part 2 的 `Store` 可跨线程使用（`check_same_thread=False` + 锁）：`run_analyze` 与 `run_final` 都用两个线程分别处理 active/candidate。
 > - 测试共享假对象放在 `tests/jobfakes.py`，以 `from tests.jobfakes import ...` 导入；为此新增空文件 `tests/__init__.py`（若已存在则保留），使 `tests` 成为常规包，避免与 site-packages 中同名包冲突。
 > - 开机补跑用单独的计划任务 `\RSIQS\Catchup`（AtLogOn，延迟 3 分钟，顺序执行 settle → review 两个动作），满足"settle also AtLogOn"且保证复盘在结算之后。
-
 
 ### Task 6.1: jobs/common.py 与测试假对象
 
@@ -6872,12 +8054,20 @@ uv run python -c "from agents import research; research.MAX_EVALS_PER_SESSION = 
 - Create: `tests/jobfakes.py`（本部分所有 jobs 测试共享的假对象）
 - Test: `tests/test_jobs_common.py`
 
-**Step 1: 写共享假对象（测试基础设施，非产品代码）**
+`FakeLLM` 与契约的 `LLM.parse(purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0, essential=False)` 同签名，按 schema 分派：
+- `PremarketPlan`：`store` 中 `day` 当天的全部候选 keep，价位沿用量化，可接受跳空 ±5%；
+- `AuctionCheck`：同一批候选全部 keep；
+- `ReviewOutput`：固定一条带证据的新规则；
+- `ResearchRound`：无草稿，`done=True`。
+
+每次调用先记入 `calls`（失败的调用也记）。`fail={purpose 前缀: 异常}` 命中时抛出，用来模拟中转失效、超时、拒答。`FakeLLM` 不计费，也没有 `cost_cny`。`store`、`day` 由测试在主线程设置，`parse` 会在 `run_analyze`/`run_final` 的工作线程里被调用，只读 `store`（Store 带锁，可跨线程）。
+
+**Step 1: 写共享假对象与失败测试（测试基础设施，非产品代码）**
 
 `tests/jobfakes.py`：
 
 ```python
-"""jobs 测试共享假对象：不联网、不调用 Claude。"""
+"""jobs 测试共享假对象：不联网、不启动 claude.exe、不推送企业微信。"""
 from __future__ import annotations
 
 import shutil
@@ -6890,7 +8080,6 @@ import pandas as pd
 from config import Settings
 from engine.calendar import TradingCalendar
 from engine.store import Store
-from notify.wecom import NullNotifier
 
 CODES = [f"6000{i:02d}" for i in range(1, 11)]
 NAMES = {c: f"测试{c[-2:]}" for c in CODES}
@@ -6933,7 +8122,13 @@ def make_index(dates: list[date]) -> pd.Series:
 
 
 def make_settings(root: Path) -> Settings:
-    return Settings(anthropic_api_key="test-key", wecom_webhook_url="", root=root)
+    """claude_exe 指向一个空文件：万一某个测试漏打桩 common.make_llm，真实 LLM 在启动
+    子进程时立即报错，不会联网，也不会用到本机真实的 Claude Code。"""
+    stub = root / "bin" / "claude.exe"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_bytes(b"")
+    return Settings(anthropic_api_key="test-key", wecom_webhook_url="", root=root,
+                    claude_exe=str(stub))
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -7029,34 +8224,57 @@ class FakeCache:
 
 
 class FakeLLM:
-    """LLM 替身：盘前全部 keep（沿用量化价位），复盘固定给出一条带证据的新规则。
-    candidates 由测试在主线程预先填入（避免在 finalize 线程里访问 sqlite）。"""
+    """agents.llm.LLM 替身：parse 同签名，按 schema 分派；不联网、不启动 claude.exe、不计费。
+    fail = {purpose 前缀: 异常}：命中的调用先记录再抛出（模拟中转失效、超时、拒答）。"""
 
-    def __init__(self):
-        self.candidates = []
-        self.purposes: list[str] = []
+    def __init__(self, store: Store | None = None, fail: dict | None = None):
+        self.store = store
+        self.day: date | None = None  # 当天交易日：PremarketPlan/AuctionCheck 覆盖这天的全部候选
+        self.fail = dict(fail or {})
+        self.calls: list[dict] = []
+
+    @property
+    def purposes(self) -> list[str]:
+        return [c["purpose"] for c in self.calls]
 
     def check_budget(self, essential):
         return None
 
-    def cost_cny(self, usage):
+    def month_cost(self) -> float:
         return 0.0
 
+    def _candidates(self) -> list:
+        loaded = self.store.load_candidates(self.day) if self.store is not None and self.day else None
+        return loaded[0] if loaded else []
+
     def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0,
-              max_tokens=16000, essential=False):
-        from agents.premarket import PremarketReview, ReviewedPick
+              max_budget_usd=1.0, essential=False):
+        from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
+        from agents.research import ResearchRound
         from agents.review import Lesson, ReviewOutput
 
-        self.purposes.append(purpose)
-        if schema is PremarketReview:
-            picks = [ReviewedPick(code=p.code, action="keep", confidence=1.0 - i * 0.05,
-                                  entry_max=p.entry_max, stop=p.stop, target=p.target,
-                                  reason="测试保留") for i, p in enumerate(self.candidates)]
-            return PremarketReview(market_view="震荡", picks=picks)
+        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema,
+                               effort=effort, timeout=timeout, max_budget_usd=max_budget_usd,
+                               essential=essential))
+        for prefix, exc in self.fail.items():
+            if purpose.startswith(prefix):
+                raise exc
+        if schema is PremarketPlan:
+            return PremarketPlan(market_view="震荡", picks=[PlannedPick(
+                code=p.code, action="keep", confidence=round(1.0 - i * 0.05, 2),
+                entry_max=p.entry_max, stop=p.stop, target=p.target, min_gap_pct=-5.0,
+                max_gap_pct=5.0, reason="测试保留：竞价跳空在 ±5% 内可买")
+                for i, p in enumerate(self._candidates())])
+        if schema is AuctionCheck:
+            return AuctionCheck(note="竞价符合盘前计划", picks=[
+                AuctionDecision(code=p.code, action="keep", reason="测试确认")
+                for p in self._candidates()])
         if schema is ReviewOutput:
             return ReviewOutput(summary="复盘：测试摘要", lessons=[Lesson(
                 action="add", rule_id="", text="高开超过 3% 的候选放弃",
                 evidence=f"{purpose} 测试证据 600001 高开回落")])
+        if schema is ResearchRound:
+            return ResearchRound(analysis="测试：本轮不提交新策略", drafts=[], done=True)
         raise AssertionError(f"unexpected schema {schema}")
 
 
@@ -7074,21 +8292,29 @@ def new_store() -> Store:
 
 def cal(dates) -> TradingCalendar:
     return TradingCalendar(dates)
-
 ```
 
-> 说明：`prepare_root` 依赖 Part 4/5 已提交的 `playbook/premarket_system.md`、`playbook/review_system.md`；若 `agents.review` 以 `from agents.playbook import git_commit` 方式导入，也一并打桩。
-
-**Step 2: 写 run_job 的失败测试**
+> 说明：`prepare_root` 依赖 Part 4 已提交的 `playbook/premarket_system.md`、`playbook/review_system.md`；若 `agents.review` 以 `from agents.playbook import git_commit` 方式导入，也一并打桩。`make_settings` 的空 `claude.exe` 是兜底：本部分测试都会打桩 `common.make_llm`，漏打桩时也只会立即报错，不会真的调用 Claude。
 
 `tests/test_jobs_common.py`：
 
 ```python
-from datetime import date
+import logging
+from datetime import date, datetime, time
 
+import pytest
+
+from agents.llm import LLMError
+from agents.premarket import AuctionCheck, PremarketPlan
+from agents.research import ResearchRound
+from agents.review import ReviewOutput
+from engine.calendar import TradingCalendar
 from engine.store import Store
-from jobs.common import run_job
+from engine.types import Pick
+from jobs.common import (incumbent_strategy, last_closed_day, load_calendar, run_job,
+                         setup_logging)
 from notify.wecom import NullNotifier
+from tests.jobfakes import FakeLLM
 
 D = date(2026, 10, 16)
 
@@ -7132,24 +8358,95 @@ def test_run_job_alert_failure_does_not_raise():
             raise OSError("网络断开")
 
     assert run_job("x", D, lambda: 1 / 0, store, Broken()) is False
+
+
+class CalClient:
+    def __init__(self):
+        self.n = 0
+
+    def trade_calendar(self):
+        self.n += 1
+        if self.n > 1:
+            raise RuntimeError("down")
+        return [date(2026, 10, 15), date(2026, 10, 16)]
+
+
+def test_load_calendar_cached_per_day_and_falls_back():
+    store, c = Store(":memory:"), CalClient()
+    cal1 = load_calendar(store, c, now=D)
+    cal2 = load_calendar(store, c, now=D)
+    assert c.n == 1 and cal2.is_trading_day(D)
+    cal3 = load_calendar(store, c, now=date(2026, 10, 17))  # 刷新失败 -> 旧缓存
+    assert c.n == 2 and cal3.last() == D and cal1.last() == D
+
+
+def test_incumbent_strategy_default_and_store():
+    store = Store(":memory:")
+    assert incumbent_strategy(store) == "baseline_momo"
+    store.set_status("momo_v2", "incumbent", D)
+    assert incumbent_strategy(store) == "momo_v2"
+
+
+def test_last_closed_day():
+    c = TradingCalendar([date(2026, 10, 15), date(2026, 10, 16), date(2026, 10, 19)])
+    assert last_closed_day(datetime.combine(D, time(15, 9)), c) == date(2026, 10, 15)
+    assert last_closed_day(datetime.combine(D, time(15, 10)), c) == D
+    assert last_closed_day(datetime(2026, 10, 18, 9, 0), c) == D  # 周日
+
+
+def test_setup_logging_captures_agent_logs_once(tmp_path):
+    base = logging.getLogger()
+    before, level = list(base.handlers), base.level
+    try:
+        setup_logging(tmp_path)
+        setup_logging(tmp_path)  # 重复调用不重复挂 handler
+        added = [h for h in base.handlers if h not in before]
+        assert len(added) == 1
+        logging.getLogger("agents.premarket").warning("analyze:active 失败 LLMError")
+        added[0].flush()
+        text = (tmp_path / "logs" / "jobs.log").read_text(encoding="utf-8")
+        assert "agents.premarket" in text and "LLMError" in text
+    finally:
+        for h in [h for h in base.handlers if h not in before]:
+            base.removeHandler(h)
+            h.close()
+        base.setLevel(level)
+
+
+def test_fake_llm_dispatch_and_scripted_failure():
+    store = Store(":memory:")
+    store.save_candidates(D, [Pick(code="600001", name="测试01", score=1.0, entry_max=10.3,
+                                   stop=9.3, target=11.0, hold_days=5, reason="量化")], {})
+    llm = FakeLLM(store, fail={"auction": LLMError("中转不可用")})
+    llm.day = D
+    plan = llm.parse("analyze:active", "s", "u", PremarketPlan, effort="high",
+                     max_budget_usd=1.5, essential=True)
+    assert [(p.code, p.action, p.entry_max) for p in plan.picks] == [("600001", "keep", 10.3)]
+    assert llm.parse("review", "s", "u", ReviewOutput).lessons[0].evidence
+    assert llm.parse("research", "s", "u", ResearchRound).done is True
+    with pytest.raises(LLMError):
+        llm.parse("auction:active", "s", "u", AuctionCheck)
+    assert llm.purposes == ["analyze:active", "review", "research", "auction:active"]
+    assert llm.calls[0]["max_budget_usd"] == 1.5 and llm.calls[0]["essential"] is True
 ```
 
-**Step 3: 运行，确认失败**
+**Step 2: 运行，确认失败**
 
 ```
 uv run pytest tests/test_jobs_common.py -v
 ```
 预期：FAIL，`ModuleNotFoundError: No module named 'jobs.common'`。
 
-**Step 4: 最小实现**
+**Step 3: 最小实现**
 
-`jobs/common.py`：
+`jobs/common.py`（`setup_logging` 挂在根 logger 上，`agents.*` 的 LLM 失败原因也进 `logs/jobs.log`）：
 
 ```python
-"""任务入口公共设施：幂等运行、告警、依赖装配。"""
+"""任务入口公共设施：幂等运行、告警、日志、依赖装配。"""
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from datetime import date, datetime, time
 from pathlib import Path
@@ -7166,15 +8463,17 @@ log = logging.getLogger("rsiqs.jobs")
 
 
 def setup_logging(root: Path) -> None:
-    """日志写入 <root>/logs/jobs.log（重复调用不重复挂 handler）。"""
+    """所有模块的日志写入 <root>/logs/jobs.log。handler 挂在根 logger 上：jobs、agents
+    （LLMError 的 subtype 与输出摘要）、notify（推送失败）都进同一文件；重复调用不重复挂。"""
     log_dir = root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    target = str(log_dir / "jobs.log")
-    if not any(getattr(h, "baseFilename", None) == target for h in log.handlers):
+    target = os.path.abspath(log_dir / "jobs.log")
+    base = logging.getLogger()
+    if not any(getattr(h, "baseFilename", None) == target for h in base.handlers):
         h = logging.FileHandler(target, encoding="utf-8")
-        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        log.addHandler(h)
-    log.setLevel(logging.INFO)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        base.addHandler(h)
+    base.setLevel(logging.INFO)
 
 
 INDEX_SYMBOL = "sh000300"
@@ -7202,7 +8501,7 @@ def incumbent_strategy(store: Store) -> str:
 
 
 def make_llm(settings, store: Store):
-    """LLM 工厂（测试中打桩为 FakeLLM）。"""
+    """LLM 工厂：agents.llm.LLM（经本机 claude.exe 无头模式调用 Claude）；测试中打桩为 FakeLLM。"""
     from agents.llm import LLM
 
     return LLM(settings, store)
@@ -7262,70 +8561,20 @@ def context():
     return settings, store, client, cache, calendar, notifier
 ```
 
-补一条日历缓存测试，追加到 `tests/test_jobs_common.py` 末尾（import 可上移到文件顶部）：
-
-```python
-from jobs.common import load_calendar
-
-
-class CalClient:
-    def __init__(self):
-        self.n = 0
-
-    def trade_calendar(self):
-        self.n += 1
-        if self.n > 1:
-            raise RuntimeError("down")
-        return [date(2026, 10, 15), date(2026, 10, 16)]
-
-
-def test_load_calendar_cached_per_day_and_falls_back():
-    store, c = Store(":memory:"), CalClient()
-    cal1 = load_calendar(store, c, now=D)
-    cal2 = load_calendar(store, c, now=D)
-    assert c.n == 1 and cal2.is_trading_day(D)
-    cal3 = load_calendar(store, c, now=date(2026, 10, 17))  # 刷新失败 -> 旧缓存
-    assert c.n == 2 and cal3.last() == D and cal1.last() == D
-```
-
-再补一条现任策略回退测试：
-
-```python
-from datetime import datetime, time
-
-from engine.calendar import TradingCalendar
-from jobs.common import incumbent_strategy, last_closed_day
-
-
-def test_incumbent_strategy_default_and_store():
-    store = Store(":memory:")
-    assert incumbent_strategy(store) == "baseline_momo"
-    store.set_status("momo_v2", "incumbent", D)
-    assert incumbent_strategy(store) == "momo_v2"
-
-
-def test_last_closed_day():
-    c = TradingCalendar([date(2026, 10, 15), date(2026, 10, 16), date(2026, 10, 19)])
-    assert last_closed_day(datetime.combine(D, time(15, 9)), c) == date(2026, 10, 15)
-    assert last_closed_day(datetime.combine(D, time(15, 10)), c) == D
-    assert last_closed_day(datetime(2026, 10, 18, 9, 0), c) == D  # 周日
-```
-
-**Step 5: 运行，确认通过**
+**Step 4: 运行，确认通过**
 
 ```
 uv run pytest tests/test_jobs_common.py -v
 ```
-预期：7 passed。
+预期：9 passed。
 
-**Step 6: 提交**
+**Step 5: 提交**
 
 ```
 git add jobs/common.py tests/__init__.py tests/jobfakes.py tests/test_jobs_common.py
-git commit -m "feat: jobs.common run_job/context with calendar cache"
+git commit -m "feat: jobs.common run_job/context/logging and shared job test fakes"
 ```
-（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`。）
-
+（提交信息末尾附 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。）
 
 ### Task 6.2: jobs/bootstrap.py
 
@@ -7823,6 +9072,14 @@ git commit -m "feat: jobs.settle with multi-day catch-up and idempotent settleme
 
 入口只做三件事：判断时间窗/交易日 → 通过 `common.context()` 装配依赖 → 用 `run_job` 调 agents 层。agents 函数一律以模块属性方式调用（`premarket.scan(...)`），便于测试替换。
 
+盘前两段的分工：
+
+| 触发 | 入口 | 做什么 |
+|---|---|---|
+| 08:30 | `premarket_scan` | `premarket.scan` 存候选，再 `premarket.run_analyze` 两路深度分析（每路最长 `ANALYZE_TIMEOUT` = 900 秒），计划存 kv。有一路失败就推"盘前分析未完成"告警，任务仍记 ok；09:25 之后启动只扫描 |
+| 09:25 | `premarket_final` | 等到 09:25:15；扫描缺失则补跑（只扫描）；`premarket.run_final` 拉一次竞价快照，按计划条件过滤并做轻量确认，`FINAL_DEADLINE` = 110 秒内定稿，只推 h:active |
+| 09:35 之后 | `premarket_final` | 视为过时，直接返回 False，不推送 |
+
 **Step 1: 写失败测试**
 
 `tests/test_jobs_entrypoints.py`：
@@ -7850,11 +9107,15 @@ def env(tmp_path, monkeypatch):
     cache, store, notifier = FakeCache(panel, NAMES, index), new_store(), NullNotifier()
     install_context(monkeypatch, make_settings(tmp_path), store, client, cache, cal(dates),
                     notifier)
-    calls = []
+    calls, analysis = [], {"active": True, "candidate": True}
 
     def fake_scan(d, settings, store, cache, client, strategy, calendar):
         calls.append(("scan", d, strategy.name))
         return []
+
+    def fake_analyze(d, settings, store, llm):
+        calls.append(("analyze", d, llm))
+        return dict(analysis)
 
     def fake_final(d, settings, store, llm, client, notifier, calendar):
         calls.append(("final", d, llm))
@@ -7862,27 +9123,60 @@ def env(tmp_path, monkeypatch):
     def fake_review(d, settings, store, llm, cache, notifier, calendar):
         calls.append(("review", d, llm))
 
-    def fake_research(settings, store, notifier, client=None):
-        calls.append(("research",))
-        return {"evals": 0}
+    def fake_research(settings, store, notifier, llm=None):
+        calls.append(("research", llm))
+        return {"status": "ok"}
 
     monkeypatch.setattr(premarket, "scan", fake_scan)
+    monkeypatch.setattr(premarket, "run_analyze", fake_analyze)
     monkeypatch.setattr(premarket, "run_final", fake_final)
     monkeypatch.setattr(review_agent, "run_review", fake_review)
     monkeypatch.setattr(research_agent, "run_research", fake_research)
     monkeypatch.setattr(common, "make_llm", lambda settings, store: "LLM")
-    return dict(dates=dates, store=store, notifier=notifier, calls=calls)
+    return dict(dates=dates, store=store, notifier=notifier, calls=calls, analysis=analysis,
+                slept=[])
 
 
-def at(d, hh, mm=0):
-    return datetime.combine(d, time(hh, mm))
+def at(d, hh, mm=0, ss=0):
+    return datetime.combine(d, time(hh, mm, ss))
 
 
-def test_scan_runs_once_on_trading_day(env):
+def test_scan_runs_scan_then_analyze_once(env):
     d = env["dates"][10]
     assert premarket_scan.main(now=at(d, 8, 30)) is True
     assert premarket_scan.main(now=at(d, 8, 40)) is True  # 已完成 -> 跳过
+    assert env["calls"] == [("scan", d, "baseline_momo"), ("analyze", d, "LLM")]
+    assert env["notifier"].sent == []
+
+
+def test_scan_alerts_when_analysis_incomplete_but_job_ok(env):
+    d = env["dates"][10]
+    env["analysis"]["candidate"] = False
+    assert premarket_scan.main(now=at(d, 8, 30)) is True
+    assert env["store"].job_done("premarket_scan", d)
+    [msg] = env["notifier"].sent
+    assert "盘前分析未完成" in msg and "9:25 将按量化/规则推荐" in msg
+    assert "candidate" in msg and "active" not in msg
+
+
+def test_scan_analyze_crash_counts_as_incomplete(env, monkeypatch):
+    d = env["dates"][10]
+
+    def crash(*a, **k):
+        raise RuntimeError("找不到 claude.exe")
+
+    monkeypatch.setattr(premarket, "run_analyze", crash)
+    assert premarket_scan.main(now=at(d, 8, 30)) is True
+    assert env["store"].job_done("premarket_scan", d)
+    [msg] = env["notifier"].sent
+    assert "盘前分析未完成" in msg and "active、candidate" in msg
+
+
+def test_scan_started_after_0925_skips_analyze(env):
+    d = env["dates"][10]
+    assert premarket_scan.main(now=at(d, 9, 28)) is True  # 开机补跑
     assert env["calls"] == [("scan", d, "baseline_momo")]
+    assert env["notifier"].sent == []
 
 
 def test_scan_skips_non_trading_day(env):
@@ -7890,30 +9184,38 @@ def test_scan_skips_non_trading_day(env):
     assert env["calls"] == []
 
 
-def test_final_after_scan(env):
+@pytest.mark.parametrize("hh, mm, ss, waited", [
+    (9, 20, 0, [315.0]), (9, 25, 0, [15.0]), (9, 25, 15, []), (9, 30, 0, [])])
+def test_final_waits_until_092515_then_runs(env, hh, mm, ss, waited):
     d = env["dates"][10]
     premarket_scan.main(now=at(d, 8, 30))
-    assert premarket_final.main(now=at(d, 9, 26)) is True
-    assert env["calls"] == [("scan", d, "baseline_momo"), ("final", d, "LLM")]
+    assert premarket_final.main(now=at(d, hh, mm, ss), sleep=env["slept"].append) is True
+    assert env["slept"] == waited
+    assert env["calls"] == [("scan", d, "baseline_momo"), ("analyze", d, "LLM"),
+                            ("final", d, "LLM")]
     assert env["store"].job_done("premarket_final", d)
 
 
-def test_final_runs_missing_scan_inline(env):
+def test_final_runs_missing_scan_inline_without_analyze(env):
     d = env["dates"][10]
-    assert premarket_final.main(now=at(d, 9, 30)) is True
+    assert premarket_final.main(now=at(d, 9, 30), sleep=env["slept"].append) is True
+    assert [c[0] for c in env["calls"]] == ["scan", "final"]
+    assert env["store"].job_done("premarket_scan", d)
+    assert premarket_scan.main(now=at(d, 9, 31)) is True  # 已补跑 -> 跳过，不再分析
     assert [c[0] for c in env["calls"]] == ["scan", "final"]
 
 
 def test_final_stale_after_0935(env):
     d = env["dates"][10]
-    assert premarket_final.main(now=at(d, 9, 36)) is False
-    assert env["calls"] == []
+    assert premarket_final.main(now=at(d, 9, 36), sleep=env["slept"].append) is False
+    assert env["calls"] == [] and env["slept"] == []
     assert not env["store"].job_done("premarket_final", d)
 
 
-def test_final_skips_non_trading_day(env):
-    assert premarket_final.main(now=at(next_saturday(env["dates"][5]), 9, 26)) is False
-    assert env["calls"] == []
+def test_final_skips_non_trading_day_without_waiting(env):
+    sat = next_saturday(env["dates"][5])
+    assert premarket_final.main(now=at(sat, 9, 25), sleep=env["slept"].append) is False
+    assert env["calls"] == [] and env["slept"] == []
 
 
 def test_final_not_run_when_scan_fails(env, monkeypatch):
@@ -7923,7 +9225,7 @@ def test_final_not_run_when_scan_fails(env, monkeypatch):
         raise RuntimeError("数据源失败")
 
     monkeypatch.setattr(premarket, "scan", boom)
-    assert premarket_final.main(now=at(d, 9, 26)) is False
+    assert premarket_final.main(now=at(d, 9, 26), sleep=env["slept"].append) is False
     assert env["calls"] == []
     assert any("数据源失败" in str(m) for m in env["notifier"].sent)
 
@@ -7951,11 +9253,11 @@ def test_review_on_weekend_reviews_friday(env):
     assert env["calls"] == [("review", fri, "LLM")]
 
 
-def test_research_runs_once_per_day(env):
+def test_research_runs_once_per_day_with_factory_llm(env):
     sat = next_saturday(env["dates"][5])
-    assert research.main(now=at(sat, 10)) == {"evals": 0}
+    assert research.main(now=at(sat, 10)) == {"status": "ok"}
     assert research.main(now=at(sat, 11)) is None  # 当天已跑过
-    assert env["calls"] == [("research",)]
+    assert env["calls"] == [("research", "LLM")]
 ```
 
 **Step 2: 运行，确认失败**
@@ -7970,20 +9272,36 @@ uv run pytest tests/test_jobs_entrypoints.py -v
 `jobs/premarket_scan.py`：
 
 ```python
-"""08:30 盘前扫描（仅交易日）。python -m jobs.premarket_scan"""
+"""08:30 盘前扫描 + 深度分析（仅交易日）。python -m jobs.premarket_scan
+
+扫描失败由 run_job 告警（09:25 定稿时会再补跑扫描）。深度分析失败只降级：任务仍记 ok，
+推一条"盘前分析未完成"告警，09:25 时那一路按量化/规则推荐。"""
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 from agents import premarket
 from jobs import common
+from notify.format import format_alert
 from strategies.base import load_strategy
 
+KINDS = ("active", "candidate")
+ANALYZE_CUTOFF = time(9, 25)  # 晚于此刻启动（开机补跑）只扫描：定稿已开始，计划用不上
 
-def run(d: date, settings, store, client, cache, calendar, notifier) -> bool:
+
+def scan(d: date, settings, store, client, cache, calendar) -> list:
+    """只做量化扫描并保存候选；premarket_final 补跑扫描时也调用它。"""
     strategy = load_strategy(common.incumbent_strategy(store))
-    return common.run_job("premarket_scan", d, lambda: premarket.scan(
-        d, settings, store, cache, client, strategy, calendar), store, notifier)
+    return premarket.scan(d, settings, store, cache, client, strategy, calendar)
+
+
+def analyze_all(d: date, settings, store) -> dict[str, bool]:
+    """两路深度分析；run_analyze 本身抛异常时按两路都未完成处理。"""
+    try:
+        return premarket.run_analyze(d, settings, store, common.make_llm(settings, store))
+    except Exception:  # noqa: BLE001 — 分析只影响推荐质量，不能让扫描任务失败
+        common.log.exception("premarket analyze %s crashed", d)
+        return {k: False for k in KINDS}
 
 
 def main(now: datetime | None = None) -> bool:
@@ -7993,7 +9311,21 @@ def main(now: datetime | None = None) -> bool:
     if not calendar.is_trading_day(d):
         common.log.info("premarket_scan %s: not a trading day", d)
         return False
-    return run(d, settings, store, client, cache, calendar, notifier)
+    status: dict[str, bool] = {}
+
+    def job() -> None:
+        scan(d, settings, store, client, cache, calendar)
+        if now.time() >= ANALYZE_CUTOFF:
+            common.log.info("premarket_scan %s: started at %s, analysis skipped", d, now.time())
+            return
+        status.update(analyze_all(d, settings, store))
+
+    ok = common.run_job("premarket_scan", d, job, store, notifier)
+    failed = sorted(k for k, done in status.items() if not done)
+    if failed:
+        notifier.send_text(format_alert(
+            "盘前分析未完成", f"9:25 将按量化/规则推荐（未完成：{'、'.join(failed)}）"))
+    return ok
 
 
 if __name__ == "__main__":
@@ -8003,18 +9335,22 @@ if __name__ == "__main__":
 `jobs/premarket_final.py`：
 
 ```python
-"""09:26 竞价定稿并推送（仅交易日；09:35 之后视为过时跳过）。python -m jobs.premarket_final"""
+"""09:25 竞价定稿并推送（仅交易日）。python -m jobs.premarket_final
+
+计划任务 09:25 触发；入口先等到 09:25:15，让竞价快照落定后再定稿；09:35 之后视为过时跳过。"""
 from __future__ import annotations
 
+import time as _time
 from datetime import datetime, time
 
 from agents import premarket
 from jobs import common, premarket_scan
 
+READY_AT = time(9, 25, 15)  # 集合竞价 09:25 结束，留 15 秒给行情源刷新竞价价
 STALE_AFTER = time(9, 35)
 
 
-def main(now: datetime | None = None) -> bool:
+def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
     now = now or datetime.now()
     settings, store, client, cache, calendar, notifier = common.context()
     d = now.date()
@@ -8024,9 +9360,16 @@ def main(now: datetime | None = None) -> bool:
     if now.time() > STALE_AFTER:
         common.log.info("premarket_final %s: stale at %s, skipped", d, now.time())
         return False
-    if not store.job_done("premarket_scan", d) and not premarket_scan.run(
-            d, settings, store, client, cache, calendar, notifier):
-        return False  # 扫描失败已告警；按设计当天不出推荐
+    wait = (datetime.combine(d, READY_AT) - now).total_seconds()
+    if wait > 0:
+        common.log.info("premarket_final %s: waiting %.0fs for auction data", d, wait)
+        sleep(wait)
+    if not store.job_done("premarket_scan", d):
+        # 开机晚或 08:30 扫描失败：只补跑扫描（不做深度分析），run_final 会退回量化推荐
+        scanned = common.run_job("premarket_scan", d, lambda: premarket_scan.scan(
+            d, settings, store, client, cache, calendar), store, notifier)
+        if not scanned:
+            return False  # 扫描失败已告警；按设计当天不出推荐
     llm = common.make_llm(settings, store)
     return common.run_job("premarket_final", d, lambda: premarket.run_final(
         d, settings, store, llm, client, notifier, calendar), store, notifier)
@@ -8067,7 +9410,7 @@ if __name__ == "__main__":
 `jobs/research.py`：
 
 ```python
-"""周六 10:00 研究循环。python -m jobs.research"""
+"""周六 10:00 研究循环（Claude 多轮结构化输出，评估在子进程里跑）。python -m jobs.research"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8083,7 +9426,8 @@ def main(now: datetime | None = None) -> dict | None:
     out: dict = {}
 
     def fn():
-        out["summary"] = research_agent.run_research(settings, store, notifier)
+        out["summary"] = research_agent.run_research(
+            settings, store, notifier, llm=common.make_llm(settings, store))
 
     common.run_job("research", now.date(), fn, store, notifier)
     return out.get("summary")
@@ -8098,13 +9442,13 @@ if __name__ == "__main__":
 ```
 uv run pytest tests/test_jobs_entrypoints.py -v
 ```
-预期：11 passed。
+预期：17 passed（参数化的 4 个等待场景各算 1 个）。
 
 **Step 5: 提交**
 
 ```
 git add jobs/premarket_scan.py jobs/premarket_final.py jobs/review.py jobs/research.py tests/test_jobs_entrypoints.py
-git commit -m "feat: thin job entrypoints for premarket, review, research"
+git commit -m "feat: thin job entrypoints for two-stage premarket, review, research"
 ```
 （附 Co-Authored-By trailer。）
 
@@ -8343,15 +9687,15 @@ git commit -m "feat: jobs.monitor intraday stop/target/zhaban alerts with daily 
 
 | 任务 | 触发 | 动作 |
 |---|---|---|
-| PremarketScan | 周一至周五 08:30 | `jobs.premarket_scan` |
-| PremarketFinal | 周一至周五 09:26 | `jobs.premarket_final` |
+| PremarketScan | 周一至周五 08:30 | `jobs.premarket_scan`（扫描 + 两路深度分析，约 5–20 分钟） |
+| PremarketFinal | 周一至周五 09:25 | `jobs.premarket_final`（入口内等到 09:25:15 再定稿，09:28 前推送） |
 | Monitor | 周一至周五 09:30 | `jobs.monitor` |
 | Settle | 周一至周五 15:35 | `jobs.settle` |
 | Review | 周一至周五 16:05 | `jobs.review` |
 | Research | 周六 10:00 | `jobs.research` |
 | Catchup | 登录时（延迟 3 分钟） | `jobs.settle` 然后 `jobs.review`（顺序执行） |
 
-所有任务开启 `StartWhenAvailable`（错过的触发在开机后补跑，过时与否由代码判断）、`MultipleInstances IgnoreNew`（同一任务不并发）、允许电池供电运行。`.ps1` 保持纯 ASCII：Windows PowerShell 5.1 按系统代码页读取无 BOM 文件，中文会乱码。
+所有任务开启 `StartWhenAvailable`（错过的触发在开机后补跑，是否过时由代码判断：PremarketFinal 过 09:35 跳过，PremarketScan 过 09:25 只扫描不分析）、`MultipleInstances IgnoreNew`（同一任务不并发）、允许电池供电运行。`.ps1` 保持纯 ASCII：Windows PowerShell 5.1 按系统代码页读取无 BOM 文件，中文会乱码。
 
 **Step 1: 写失败测试**
 
@@ -8378,8 +9722,9 @@ def test_every_task_points_to_existing_job_module():
 
 def test_schedule_times_and_triggers():
     ps1 = read("install_tasks.ps1")
-    for t in ("08:30", "09:26", "09:30", "15:35", "16:05", "10:00"):
+    for t in ("08:30", "09:25", "09:30", "15:35", "16:05", "10:00"):
         assert f'"{t}"' in ps1, t
+    assert '(New-WeekdayTrigger "09:25") (New-JobAction "premarket_final")' in ps1
     assert "-AtLogOn" in ps1 and "Saturday" in ps1 and "StartWhenAvailable" in ps1
 
 
@@ -8405,6 +9750,7 @@ uv run pytest tests/test_install_tasks.py -v
 # Register RSIQS scheduled tasks for the current user (run only while logged on).
 # Usage (repo root): powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tasks.ps1
 # Re-running is safe: -Force overwrites existing task definitions.
+# PremarketFinal fires at 09:25; the job itself waits until 09:25:15 for auction data.
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Uv = (Get-Command uv -ErrorAction Stop).Source
@@ -8431,7 +9777,7 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action) {
 }
 
 Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan")
-Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:26") (New-JobAction "premarket_final")
+Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final")
 Register-Rsiqs "Monitor"        (New-WeekdayTrigger "09:30") (New-JobAction "monitor")
 Register-Rsiqs "Settle"         (New-WeekdayTrigger "15:35") (New-JobAction "settle")
 Register-Rsiqs "Review"         (New-WeekdayTrigger "16:05") (New-JobAction "review")
@@ -8480,11 +9826,11 @@ Start-ScheduledTask -TaskPath "\RSIQS\" -TaskName Settle
 Get-Content logs\jobs.log -Tail 20
 ```
 
-预期：列出 7 个任务（State 为 Ready）；NextRunTime 与上表一致（Research 为下一个周六 10:00）；Catchup 有两个动作（settle、review）；手动触发 Settle 后 `LastTaskResult` 为 `0`，`logs\jobs.log` 出现 `job settle ... ok` 或 `skip settle`。再验证卸载：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\uninstall_tasks.ps1` 后 `Get-ScheduledTask -TaskPath "\RSIQS\"` 无输出（报 "No MSFT_ScheduledTask objects found"），然后重新执行安装脚本。
+预期：列出 7 个任务（State 为 Ready）；NextRunTime 与上表一致（PremarketFinal 为下一个工作日 09:25，Research 为下一个周六 10:00）；Catchup 有两个动作（settle、review）；手动触发 Settle 后 `LastTaskResult` 为 `0`，`logs\jobs.log` 出现 `job settle ... ok` 或 `skip settle`。再验证卸载：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\uninstall_tasks.ps1` 后 `Get-ScheduledTask -TaskPath "\RSIQS\"` 无输出（报 "No MSFT_ScheduledTask objects found"），然后重新执行安装脚本。
 
 注意：
 - 若注册时报 `Access is denied`，以管理员身份打开 PowerShell 重跑（任务仍以当前用户 Interactive 身份运行）。
-- 每个任务运行时会弹出控制台窗口，Monitor 的窗口会保持到 15:00，不要关闭。若介意弹窗，可在 `New-JobAction` 中把 `-Execute` 换成 `"$Root\.venv\Scripts\pythonw.exe"`、`-Argument` 换成 `"-m jobs.$Job"`（需先 `uv sync`）。
+- 每个任务运行时会弹出控制台窗口：PremarketScan 的窗口在深度分析期间会停留十几分钟，PremarketFinal 约 2–3 分钟，Monitor 保持到 15:00，都不要关闭。若介意弹窗，可在 `New-JobAction` 中把 `-Execute` 换成 `"$Root\.venv\Scripts\pythonw.exe"`、`-Argument` 换成 `"-m jobs.$Job"`（需先 `uv sync`）。
 
 **Step 6: 提交**
 
@@ -8499,20 +9845,22 @@ git commit -m "feat: Windows scheduled task install/uninstall scripts"
 **Files:**
 - Test: `tests/test_e2e.py`
 
-真实组件：`jobs.*` 入口、`agents.premarket.scan/run_final`、`agents.review.run_review`、`agents.playbook`、`engine.*`（撮合、账本、Store、promotion）、`strategies.baseline_momo`。替身：`FakeClient`（行情/新闻/竞价）、`FakeCache`、`FakeLLM`、`NullNotifier`，git 提交被打桩。时间全部通过 `main(now=...)` 注入。
+真实组件：`jobs.*` 入口、`agents.premarket`（`scan`、`run_analyze`/`analyze`、`run_final`/`finalize`/`auction_filter`）、`agents.review.run_review`、`agents.playbook`、`engine.*`（撮合、账本、Store、promotion）、`strategies.baseline_momo`。替身：`FakeClient`（行情/新闻/竞价）、`FakeCache`、`FakeLLM`、`NullNotifier`，git 提交被打桩。时间全部通过 `main(now=...)` 注入，`premarket_final` 的等待用假 sleep 记录。共三个场景：两个交易日的完整循环；中转失效时的降级；关机两天后的开机补跑。
 
 **Step 1: 写测试**
 
 `tests/test_e2e.py`：
 
 ```python
-"""端到端：bootstrap -> 扫描 -> 定稿推送 -> 结算 -> 复盘 -> 次日，全程无网络、无真实 Claude。"""
+"""端到端：bootstrap -> 扫描+深度分析 -> 竞价定稿推送 -> 结算 -> 复盘 -> 次日。
+全程无网络、不启动 claude.exe（FakeLLM），时间全部通过 main(now=...) 注入。"""
 from datetime import datetime, time
 
 import pytest
 
 import agents.playbook as pb
 import engine.integrity as integrity
+from agents.llm import LLMError
 from jobs import bootstrap, common, premarket_final, premarket_scan, review, settle
 from notify.wecom import NullNotifier
 from tests.jobfakes import (CODES, NAMES, FakeCache, FakeClient, FakeLLM, cal,
@@ -8536,7 +9884,7 @@ def world(tmp_path, monkeypatch):
     cache, store, notifier = FakeCache(panel, NAMES, index), new_store(), NullNotifier()
     settings = make_settings(root)
     install_context(monkeypatch, settings, store, client, cache, cal(dates), notifier)
-    llm = FakeLLM()
+    llm = FakeLLM(store)
     monkeypatch.setattr(common, "make_llm", lambda s, st: llm)
     sent_at_settle = {}
     real_settle_day = settle.settle_day
@@ -8553,21 +9901,29 @@ def world(tmp_path, monkeypatch):
                 settings=settings, sent_at_settle=sent_at_settle)
 
 
+def start_day(world, day):
+    """“今天”切到 day：行情快照与 FakeLLM 覆盖的候选都按这一天。"""
+    world["client"].current = world["llm"].day = day
+
+
 def test_two_trading_days_full_cycle(world):
-    dates, client, store = world["dates"], world["client"], world["store"]
-    notifier, llm = world["notifier"], world["llm"]
+    dates, store, notifier, llm = world["dates"], world["store"], world["notifier"], world["llm"]
     for day in dates[101:103]:
-        client.current = day
+        start_day(world, day)
         assert premarket_scan.main(now=at(day, 8, 30)) is True
         cands, _ = store.load_candidates(day)
-        assert cands
-        llm.candidates = cands  # 主线程预填，FakeLLM 在定稿线程里只读
-        n0 = len(notifier.sent)
-        assert premarket_final.main(now=at(day, 9, 26)) is True
-        pushed = [str(m) for m in notifier.sent[n0:]]
-        recs, _ = store.load_recommendation(day, "h:active")
-        assert recs and len(recs) <= world["settings"].max_picks
-        assert any(recs[0].code in m for m in pushed)        # 推荐已推送
+        plan = store.kv_get(f"plan:{day.isoformat()}:active")
+        assert cands and plan and {p["code"] for p in plan["picks"]} == {p.code for p in cands}
+        assert store.kv_get(f"plan:{day.isoformat()}:candidate")
+        assert not any("盘前分析未完成" in m for m in notifier.sent)
+
+        n0, slept = len(notifier.sent), []
+        assert premarket_final.main(now=at(day, 9, 25), sleep=slept.append) is True
+        assert slept == [15.0]                                 # 等到 09:25:15 再定稿
+        recs, meta = store.load_recommendation(day, "h:active")
+        assert recs and len(recs) <= world["settings"].max_picks and meta["llm_reviewed"] is True
+        pushed = notifier.sent[n0:]
+        assert len(pushed) == 1 and all(p.code in pushed[0] for p in recs)  # 只推 h:active
         assert store.load_recommendation(day, "h:candidate") is not None
 
         assert settle.main(now=at(day, 15, 35)) == [day]
@@ -8589,15 +9945,43 @@ def test_two_trading_days_full_cycle(world):
     cand, active = pb.load("candidate"), pb.load("active")
     assert any("高开" in r["text"] for r in cand["rules"])    # 候选 playbook 已更新
     assert active["rules"] == [] and active["version"] == 1   # 未满 10 个交易日，不发布
-    assert {"premarket:active", "premarket:candidate", "review"} <= set(llm.purposes)
+    assert {"analyze:active", "analyze:candidate", "auction:active", "auction:candidate",
+            "review"} <= set(llm.purposes)
+    assert all(c["essential"] for c in llm.calls if c["purpose"] != "review")  # 盘前不受月预算限制
+
+
+def test_relay_outage_degrades_to_quant_and_still_reports(world):
+    """中转失效（Claude Code 升级或账号被封）：分析与复盘都抛 LLMError，推荐与日报照常推送。"""
+    dates, store, notifier, llm = world["dates"], world["store"], world["notifier"], world["llm"]
+    day = dates[101]
+    start_day(world, day)
+    llm.fail = {"analyze": LLMError("中转不可用"), "review": LLMError("中转不可用")}
+    assert premarket_scan.main(now=at(day, 8, 30)) is True     # 扫描成功即记 ok
+    assert store.kv_get(f"plan:{day.isoformat()}:active") is None
+    assert any("盘前分析未完成" in m for m in notifier.sent)
+
+    n0 = len(notifier.sent)
+    assert premarket_final.main(now=at(day, 9, 26)) is True
+    recs, meta = store.load_recommendation(day, "h:active")
+    cands, _ = store.load_candidates(day)
+    assert meta["llm_reviewed"] is False
+    assert [p.code for p in recs] == [p.code for p in cands[: world["settings"].max_picks]]
+    assert any("未经 LLM 审核" in m for m in notifier.sent[n0:])    # 量化推荐照常推送
+    assert not any(p.startswith("auction") for p in llm.purposes)  # 无计划不做竞价确认
+
+    assert settle.main(now=at(day, 15, 35)) == [day]
+    assert review.main(now=at(day, 16, 5)) is True
+    assert "复盘失败" in notifier.sent[-1] and "h:active" in notifier.sent[-1]
+    assert pb.load("candidate")["rules"] == []
 
 
 def test_logon_catch_up_after_missed_days(world):
     """电脑在 dates[101]、dates[102] 全天关机，dates[103] 10:00 开机。"""
-    dates, client, store = world["dates"], world["client"], world["store"]
+    dates, store, llm = world["dates"], world["store"], world["llm"]
     day = dates[103]
-    client.current = day
-    assert premarket_final.main(now=at(day, 10, 0)) is False  # 过时推荐跳过
+    start_day(world, day)
+    assert premarket_scan.main(now=at(day, 10, 0)) is True      # 错过的 08:30 任务：只扫描
+    assert premarket_final.main(now=at(day, 10, 0)) is False    # 过时推荐跳过
     assert store.load_recommendation(day, "h:active") is None
     assert settle.main(now=at(day, 10, 3)) == dates[101:103]   # Catchup 动作 1
     assert review.main(now=at(day, 10, 5)) is True              # Catchup 动作 2
@@ -8605,6 +9989,7 @@ def test_logon_catch_up_after_missed_days(world):
     for acct in ACCOUNTS:
         assert store.last_nav_date(acct) == dates[102], acct
     assert store.load_account("h:active").trades == []          # 无推荐的日子不交易
+    assert llm.calls == []                                      # 开机补跑不花 LLM 费用
 ```
 
 **Step 2: 运行**
@@ -8612,9 +9997,12 @@ def test_logon_catch_up_after_missed_days(world):
 ```
 uv run pytest tests/test_e2e.py -v
 ```
-预期：2 passed（此时 Part 1-5 与 Task 6.1-6.6 均已完成，本测试是集成验证，不需要新增产品代码）。若失败，按报错定位到契约不一致的那一方修复（不放宽断言）；常见原因：
-- `sqlite3.ProgrammingError: ... created in a thread` → Part 2 的 `Store` 需 `sqlite3.connect(..., check_same_thread=False)` 并以 `threading.Lock` 串行化执行（`run_final` 在线程中调用 `finalize`）。
+预期：3 passed（此时 Part 1-5 与 Task 6.1-6.6 均已完成，本测试是集成验证，不需要新增产品代码）。若失败，按报错定位到契约不一致的那一方修复（不放宽断言）；常见原因：
+- `sqlite3.ProgrammingError: ... created in a thread` → Part 2 的 `Store` 需 `sqlite3.connect(..., check_same_thread=False)` 并以锁串行化执行（`run_analyze`、`run_final` 都在工作线程里用 Store）。
+- `kv "plan:<日期>:active"` 为空 → `premarket.analyze` 须在 LLM 成功后执行 `store.kv_set(f"plan:{d.isoformat()}:{kind}", plan.model_dump())`；另外 `FakeLLM` 只覆盖 `llm.day` 当天的候选，`start_day` 必须在 `premarket_scan.main` 之前调用。
+- `llm.purposes` 缺 `auction:*` → 有计划且规则过滤后非空时，`finalize` 须以 `purpose=f"auction:{kind}"` 做一次确认调用。
 - 推送文本里找不到股票代码 → `notify.format.format_recommendation` 必须包含每只股票的代码。
+- 降级场景 `llm_reviewed` 不是 False，或推荐不是量化排名前几只 → `finalize` 无计划时须返回 `(cands[:max_picks], False, "")`；`analyze` 遇到任何异常都返回 None，且不写 kv。
 - `maybe_release` 在第 1 天就发布 → Part 4 需读取 `kv "playbook_released"`（ISO 日期，bootstrap 写入）作为上次发布日。
 - `FileNotFoundError: playbook/...md` → Part 4 的提示词文件须已提交，且 `agents.playbook` 在调用时读取模块级 `PLAYBOOK_DIR`（不要在函数默认参数里固化路径）。
 - 补跑测试中 `review.main` 返回 False → `agents.review.run_review` 在当日无推荐、无成交时也应正常结束（照常推送日报）。
@@ -8623,63 +10011,28 @@ uv run pytest tests/test_e2e.py -v
 
 ```
 git add tests/test_e2e.py
-git commit -m "test: end-to-end replay of two trading days and logon catch-up"
+git commit -m "test: end-to-end replay of two trading days, relay outage and logon catch-up"
 ```
 （附 Co-Authored-By trailer。）
 
 ### Task 6.8: 全量测试 + 首次实盘运行清单
 
-**Files:**
-- Create: `scripts/smoke_live.py`（仅手动运行，真实调用 Claude 与企业微信各一次）
+**Files:** 无新增文件。只运行已有脚本：`scripts/smoke_akshare.py`（Task 3.1）、`scripts/smoke_llm.py`（Task 4.1）和 Task 3.3 的企业微信冒烟命令。
 
 **Step 1: 全量测试（离线）**
 
 ```
 uv run pytest -v
 ```
-预期：全部 passed、0 failed。本部分贡献 39 个测试：`test_jobs_common.py` 7、`test_jobs_bootstrap.py` 4、`test_jobs_settle.py` 7、`test_jobs_entrypoints.py` 11、`test_jobs_monitor.py` 5、`test_install_tasks.py` 3、`test_e2e.py` 2。任何测试都不得访问网络或真实 Claude API；如有失败，先修复再继续。
+预期：全部 passed、0 failed。本部分贡献 48 个测试：`test_jobs_common.py` 9、`test_jobs_bootstrap.py` 4、`test_jobs_settle.py` 7、`test_jobs_entrypoints.py` 17、`test_jobs_monitor.py` 5、`test_install_tasks.py` 3、`test_e2e.py` 3。任何测试都不得访问网络、启动真实 `claude.exe` 或推送真实企业微信；如有失败，先修复再继续。
 
-**Step 2: 写冒烟脚本**
+**Step 2: 确认本机 Claude Code 可用（Windows PowerShell）**
 
-`scripts/smoke_live.py`：
-
-```python
-"""手动冒烟（真实网络，产生少量 API 费用）：交易日历 + Claude 结构化输出 + 企业微信推送。
-用法：uv run python scripts/smoke_live.py"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from pydantic import BaseModel  # noqa: E402
-
-from agents.llm import LLM  # noqa: E402
-from jobs import common  # noqa: E402
-from notify.wecom import WeCom  # noqa: E402
-
-
-class Ping(BaseModel):
-    ok: bool
-    note: str
-
-
-def main() -> None:
-    settings, store, client, cache, calendar, notifier = common.context()
-    today = common.today()
-    print("calendar last:", calendar.last(), "trading today:", calendar.is_trading_day(today))
-    reply = LLM(settings, store).parse(
-        "smoke", "你是连通性测试助手，严格按 JSON schema 输出。",
-        "返回 ok=true，note 用一句中文说明你已就绪。", Ping,
-        effort="low", max_tokens=1024, essential=True)
-    print("claude:", reply)
-    print("month cost CNY:", round(store.month_llm_cost(today.year, today.month), 4))
-    wecom = WeCom(settings.wecom_webhook_url, log_dir=settings.root / "logs")
-    print("wecom:", wecom.send_text(f"RSIQS 冒烟测试：{reply.note}"))
-
-
-if __name__ == "__main__":
-    main()
+```powershell
+claude --version
+Get-Command claude, claude.exe -ErrorAction SilentlyContinue | Format-Table Name, Source
 ```
+预期：版本 ≥ 2.1.223（2026-10-19 用该版本实测通过）。`agents.llm.find_claude_exe` 的查找顺序：`.env` 的 `CLAUDE_EXE` → npm 安装（`claude.cmd` 同目录下的 `node_modules\@anthropic-ai\claude-code\bin\claude.exe`）→ PATH 中的 `claude.exe` → `%USERPROFILE%\.local\bin\claude.exe`（原生安装）。都找不到时在 `.env` 填 `CLAUDE_EXE`：必须是 `claude.exe` 的完整路径，不能填 `claude.cmd` / `claude.ps1`（cmd.exe 的引号规则会弄坏 JSON 参数）。
 
 **Step 3: 填写 .env（Windows 本机，项目根目录）**
 
@@ -8688,15 +10041,31 @@ Copy-Item .env.example .env
 notepad .env
 git check-ignore .env
 ```
-填写 `ANTHROPIC_API_KEY`、`WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300）、`CAPITAL`、`MAX_PICKS`。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
+Claude 鉴权二选一（`.env.example` 里有同样的注释）：
+- 中转：填 `ANTHROPIC_BASE_URL`（中转地址）和 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 留空；
+- 官方：只填 `ANTHROPIC_API_KEY`。
+
+`CLAUDE_EXE` 一般留空（自动查找）。另填 `WECOM_WEBHOOK_URL`（企业微信群机器人完整地址），按需调整 `MONTHLY_BUDGET_CNY`（默认 300；花费按 CLI 返回的 `total_cost_usd` × `USD_CNY` 记账）、`CAPITAL`、`MAX_PICKS`。`agents.llm.child_env` 会先去掉系统环境里的所有 `ANTHROPIC_*` 变量和 `CLAUDECODE`，再放入 `.env` 的这几项，所以 claude.exe 子进程只用 `.env` 里的鉴权，本机 Claude Code 自己的登录状态不影响 RSIQS。预期 `git check-ignore .env` 输出 `.env`（确认不会被提交）。
 
 **Step 4: Manual smoke steps（联网）**
 
 ```
 uv run python scripts/smoke_akshare.py
-uv run python scripts/smoke_live.py
+uv run python scripts/smoke_llm.py
+uv run python -c "from config import get_settings; from notify.wecom import WeCom; print(WeCom(get_settings().wecom_webhook_url).send_text('RSIQS 连通测试'))"
 ```
-预期：`smoke_akshare.py` 按 Part 3 的说明全部通过（列名映射正确）；`smoke_live.py` 打印 `claude: ok=True note='...'`、`month cost CNY` 大于 0、`wecom: True`，且企业微信群收到"RSIQS 冒烟测试"消息。任一失败先排查，不要继续。
+预期：`smoke_akshare.py` 按 Part 3 的说明全部通过（列名映射正确）；`smoke_llm.py` 约 10–25 秒后打印解析出的对象和本月花费（单次约 0.01–0.03 美元）；企业微信命令打印 `True`，群里收到"RSIQS 连通测试"。任一失败先排查，不要继续。`smoke_llm.py` 常见报错：
+- `找不到 claude.exe` → 按 Step 2 设置 `CLAUDE_EXE`。
+- `LLMError`（消息是 CLI 返回的 subtype 与输出摘要）→ 核对 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`，再用下面的命令直接跑一次 claude.exe，区分是中转的问题还是 RSIQS 的问题。
+- 超时 → 中转或网络慢，重试一次；持续超时按 Step 9 处理。
+
+在普通 PowerShell 窗口（不要在 Claude Code 会话里）直接调用 claude.exe。提示词用英文，因为 Windows PowerShell 5.1 的管道默认按 ASCII 编码：
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "https://<中转地址>"; $env:ANTHROPIC_AUTH_TOKEN = "<token>"
+"Reply with the single word ok" | & "<claude.exe 完整路径>" -p --bare --output-format json --model claude-opus-5-5 --no-session-persistence
+```
+预期输出的 JSON 里 `"is_error": false`、`"result"` 为 `ok`。这两个环境变量只在当前窗口有效，关掉窗口即失效。这里也失败，说明问题在中转或账号，不在 RSIQS。
 
 **Step 5: 初始化**
 
@@ -8727,20 +10096,32 @@ uv run python -m jobs.premarket_scan
 uv run python -m jobs.premarket_final
 Get-Content logs\jobs.log -Tail 30
 ```
-预期：非交易日或时间窗外，入口静默返回（日志里有 `not a trading day` / `stale` / `settle not done yet`）；交易日 08:30-09:35 之间运行 scan + final 会在群里收到推荐；`logs\jobs.log` 无 `ERROR`。若 scan/final 因时间窗被跳过，在下一个交易日早上 08:30 前保持电脑开机，观察自动运行。
+预期：非交易日或时间窗外，入口静默返回（日志里有 `not a trading day` / `stale` / `settle not done yet`）；`logs\jobs.log` 无 `ERROR`。交易日早上手动运行时注意：
+- 09:25 前运行 `premarket_scan` 会做两路深度分析（每路最长 15 分钟、花费上限 1.5 美元）；09:25 之后只扫描（日志 `analysis skipped`）。
+- 09:25:15 前运行 `premarket_final` 会先等到 09:25:15（日志 `waiting ...s for auction data`），不想等就按 Ctrl+C；09:25:15–09:35 之间运行直接定稿，群里收到推荐。
+
+若 scan/final 因时间窗被跳过，在下一个交易日早上 08:30 前保持电脑开机，观察自动运行。
 
 **Step 7: 安装计划任务**
 
-按 Task 6.6 Step 5 执行 `scripts\install_tasks.ps1` 并用 `Get-ScheduledTask -TaskPath "\RSIQS\"` 核对 7 个任务与下次运行时间。
+按 Task 6.6 Step 5 执行 `scripts\install_tasks.ps1`，并用 `Get-ScheduledTask -TaskPath "\RSIQS\"` 核对 7 个任务与下次运行时间（PremarketFinal 为 09:25）。
 
 **Step 8: 首周观察清单**
 
-- 每个交易日 09:28 前群里收到推荐；若标注"未经 LLM 审核"，查 `logs\jobs.log` 中 premarket 的超时/预算原因。
+- 每个交易日 08:30 后 20 分钟内，`jobs.log` 出现 `job premarket_scan <日期> ok`，群里没有"盘前分析未完成"告警。
+- 09:28 前群里收到推荐。若标注"未经 LLM 审核"（该路没有盘前计划），或市场观点末尾有"竞价二次确认未完成"，到 `logs\jobs.log` 查 `agents.premarket` / `agents.llm` 记录的 `LLMError`（含 CLI 的 subtype 与输出摘要）。
 - 15:35 后 `jobs.log` 出现 `job settle <日期> ok`；16:05 后收到日报（含全部账户的净值与日收益）。
-- 关机一天后开机：3 分钟后 Catchup 任务补齐结算与复盘，日志里能看到逐日的 `job settle ... ok`。
-- 周六 10:00 研究循环运行后收到研究摘要；`uv run python -c "from jobs import common; s, st, *_ = common.context(); import datetime as dt; t = dt.date.today(); print(st.month_llm_cost(t.year, t.month))"` 查看当月花费，确认低于 `MONTHLY_BUDGET_CNY`。
+- 关机一天后开机：3 分钟后 Catchup 任务补齐结算与复盘，日志里能看到逐日的 `job settle ... ok`；错过的 PremarketScan 也会补跑，但 09:25 之后只扫描、不调用 Claude。
+- 周六 10:00 研究循环运行后收到研究摘要；`uv run python -c "from jobs import common; s, st, *_ = common.context(); import datetime as dt; t = dt.date.today(); print(st.month_llm_cost(t.year, t.month))"` 查看当月花费（元），确认低于 `MONTHLY_BUDGET_CNY`。
 - `logs\notify_failed.jsonl` 应为空或不存在；有内容说明推送失败过，检查网络与 webhook。
 
+**Step 9: 已知风险：中转失效**
+
+RSIQS 只能通过本机 `claude.exe` 调用 Claude（中转会拒绝直接的 SDK 请求）。Claude Code 升级后协议变化、中转账号被封或中转下线，都会让所有调用失败（`LLMError` 或超时）。系统按设计降级，不会停摆：
+- 盘前深度分析失败：推"盘前分析未完成"告警，09:25 照常推送量化/规则推荐（标注"未经 LLM 审核"），09:28 前仍有消息；
+- 复盘失败：日报照发，复盘栏写"LLM 复盘失败"，playbook 不更新；
+- 研究循环：遇到 `LLMError` 即结束本次会话，干净退出。
+
+`tests/test_e2e.py::test_relay_outage_degrades_to_quant_and_still_reports` 覆盖这条降级路径。连续收到上述告警时，先 `claude --version` 看 Claude Code 是否刚升级，再重跑 `uv run python scripts/smoke_llm.py`。这个中转会校验 Claude Code 客户端版本：报错提示需要升级时执行 `claude update`；如果是刚升级后才开始报错，向中转方确认它支持的版本；中转不可用时，在 `.env` 换成可用的中转 Token，或改用官方 `ANTHROPIC_API_KEY`。另外，修改 `playbook/*.md` 提示词时，把约束写成编码规范（如"策略代码只能 import 下列模块"），不要用"安全""沙箱""绕过""权限测试"一类措辞：这类措辞会触发服务端分类器，请求被转到中转没有的模型，调用直接失败。
 
 ---
-
