@@ -75,6 +75,16 @@ def test_roundtrip_json():
     acc = _bought()
     restored = Account.from_dict(json.loads(json.dumps(acc.to_dict())))
     assert restored == acc
+    assert acc.last_trade_day is None
+    acc.last_trade_day = D2
+    restored = Account.from_dict(json.loads(json.dumps(acc.to_dict())))
+    assert restored == acc and restored.last_trade_day == D2
+
+
+def test_from_dict_without_last_trade_day():
+    d = _bought().to_dict()
+    del d["last_trade_day"]
+    assert Account.from_dict(d).last_trade_day is None
 
 
 def test_start_day_only_unlocks_positions_bought_earlier():

@@ -39,6 +39,7 @@ class Account:
     cash: float
     positions: dict[str, Position] = field(default_factory=dict)
     trades: list[Fill] = field(default_factory=list)
+    last_trade_day: date | None = None  # last day SimBroker.execute_day completed for this account
 
     def start_day(self, d: date) -> None:
         """T+1 unlock: only positions bought before ``d`` become sellable. Calling it again on the
@@ -91,8 +92,9 @@ class Account:
             d["entry_date"] = p.entry_date.isoformat()
             d["exit_date"] = p.exit_date.isoformat()
             positions[c] = d
+        last = self.last_trade_day.isoformat() if self.last_trade_day else None
         return {"name": self.name, "cash": self.cash, "positions": positions,
-                "trades": [t.to_dict() for t in self.trades]}
+                "trades": [t.to_dict() for t in self.trades], "last_trade_day": last}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Account":
@@ -103,5 +105,7 @@ class Account:
                 cost=float(p["cost"]), entry_date=date.fromisoformat(p["entry_date"]),
                 stop=float(p["stop"]), target=float(p["target"]),
                 exit_date=date.fromisoformat(p["exit_date"]))
+        last = d.get("last_trade_day")  # absent in accounts saved before this field existed
         return cls(name=d["name"], cash=float(d["cash"]), positions=positions,
-                   trades=[Fill.from_dict(t) for t in d.get("trades", [])])
+                   trades=[Fill.from_dict(t) for t in d.get("trades", [])],
+                   last_trade_day=date.fromisoformat(last) if last else None)
