@@ -1,7 +1,7 @@
 """研究循环：Claude 每轮返回分析和策略草稿（结构化输出，没有任何工具）。
 
 Claude 只能返回代码文本。命名规则、import 白名单（strategies.sandbox.check_source）、编译、
-写文件、子进程评估、评估次数上限、留出集只回传通过/不通过、会话前后的 engine/ 哈希校验和
+写文件、子进程评估、评估次数上限、留出集只回传通过/不通过、会话前、每次评估后和会话后的 engine/ 哈希校验和
 月度预算，全部由本模块的 Python 代码执行。
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tokenize
@@ -34,9 +35,11 @@ MAX_ROUNDS = 3
 MAX_DRAFTS_PER_ROUND = 3
 MAX_EVALS_PER_SESSION = 5
 EVAL_TIMEOUT = 1800  # 基线策略全量评估实测约 7 分钟
+EVAL_ERROR_CHARS = 2_000         # 评估错误原因的上限（另附至多 1500 字的出错位置）
 CONTEXT_MAX_CHARS = 60_000       # build_context 总长度上限（字符）
 FILE_MAX_CHARS = 15_000          # 背景里单个源码文件的上限
 TRIALS_IN_CONTEXT = 20
+STATUS_LIST_MAX = 300            # 每种状态最多列出的策略名
 BASELINE = "baseline_momo"
 INTERFACE_FILES = (
     ("strategies/base.py", "策略接口"),
@@ -77,9 +80,17 @@ def _strip_comments(src: str) -> str:
     return "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
 
 
+# 嵌入背景时替换的行：RESERVED 集合里的模块名会把提示词规范里要避开的词带进背景
+EMBED_REPLACE = {"strategies/base.py": (re.compile(r"(?m)^RESERVED = .*$"),
+                                        "RESERVED: set[str]  # strategies/ 下的保留模块名，不能用作策略名")}
+
+
 def _source_block(root: Path, rel: str, title: str) -> str:
     p = root / rel
     text = _strip_comments(p.read_text(encoding="utf-8")) if p.is_file() else "（文件不存在）"
+    if rel in EMBED_REPLACE:
+        pattern, repl = EMBED_REPLACE[rel]
+        text = pattern.sub(repl, text)
     if len(text) > FILE_MAX_CHARS:
         text = text[:FILE_MAX_CHARS] + "\n# ...（已截断）"
     return f"### {rel}（{title}）\n```python\n{text.rstrip()}\n```"
@@ -104,7 +115,10 @@ def _status_lines(store: Store) -> list[str]:
     out = []
     for st, cn in STATUS_CN.items():
         names = store.strategies_with_status(st)
-        shown = "、".join(names[:50]) + (f" 等 {len(names)} 个" if len(names) > 50 else "")
+        shown = "、".join(names[:STATUS_LIST_MAX])
+        if len(names) > STATUS_LIST_MAX:
+            shown += (f" 等 {len(names)} 个（没有全部列出：新名字请加上年月后缀，"
+                      f"例如 _{date.today():%y%m}）")
         out.append(f"- {cn}（{st}）：{shown or '无'}")
     return out
 
@@ -127,7 +141,7 @@ def build_context(settings: Settings, store: Store) -> str:
         f"- 切分 SPLITS：{json.dumps(splits, ensure_ascii=False)}",
         f"- 回测门槛 GATE（全部为 >= 比较；val_max_dd 为负数）：{json.dumps(GATE)}",
         f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
-        f"- 历史试验总数 n_trials：{store.trial_count()}（下一次评估计为第 {store.trial_count() + 1} 次）",
+        f"- 会话开始时的历史试验总数 n_trials：{store.trial_count()}（本会话每评估一次加 1，当前数字见本轮任务）",
         "",
         "## 策略代码可以 import 的模块（含其子模块）",
         "- " + ", ".join(sorted(ALLOWED_IMPORTS)),
@@ -195,6 +209,21 @@ def _last_json_line(stdout: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _strategy_frames(stderr: str, name: str) -> str:
+    """stderr 的 traceback 里属于 strategies/<name>.py 的帧（行号、函数、代码行），帮模型定位出错的行。
+    留出期的异常在评估器里直接按不通过处理、不写日志，这里只会有 train/val 段和加载时的出错位置。"""
+    lines = (stderr or "").splitlines()
+    pat = re.compile(r'File ".*?[\\/]strategies[\\/]' + re.escape(name) + r'\.py", line (\d+), in (\S+)')
+    out = []
+    for i, ln in enumerate(lines):
+        m = pat.search(ln)
+        if m:
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            code = "" if nxt.startswith("File ") else nxt
+            out.append(f"strategies/{name}.py 第 {m.group(1)} 行（{m.group(2)}）：{code[:200]}")
+    return "\n".join(out)[-1500:]
+
+
 def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) -> dict:
     """在子进程中运行 engine.run_eval；本次写入数据库的试验记录 gate_pass 且 holdout_pass 时设为 shadow。
 
@@ -214,7 +243,10 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
     report = _last_json_line(proc.stdout)
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
-            detail = str(report["error"])
+            detail = str(report["error"])[:EVAL_ERROR_CHARS]
+            frames = _strategy_frames(proc.stderr, name)
+            if frames:
+                detail += "\n出错位置：\n" + frames
         else:
             detail = (proc.stderr or proc.stdout or "无输出").strip()[-1500:]
         return {"ok": False, "report": None, "error": f"评估失败（退出码 {proc.returncode}）：{detail}"}
@@ -229,6 +261,8 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
 
 FEEDBACK_CODE_CHARS = 6_000      # 反馈里每个草稿代码的上限
 FEEDBACK_ANALYSIS_CHARS = 2_000  # 反馈里每轮分析的上限
+FEEDBACK_HYPOTHESIS_CHARS = 500  # 反馈里每个草稿假设的上限
+FEEDBACK_MESSAGE_CHARS = 2_000   # 反馈里处理结果的上限
 
 
 RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘前推荐与模拟交易系统：每个交易日开盘前，现任量化策略给出候选股票，LLM 层复核后推送不超过 5 只，模拟盘按开盘价成交。你的工作是提出并检验新的选股策略，让系统长期变得更好。
@@ -266,10 +300,10 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 4. 只 import 下列模块（及其子模块）：<<ALLOWED_IMPORTS>>。不要写 from __future__ import annotations。
 5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停：计算涨跌停价时把 view.asof 作为 d 传入，例如 limit_prices(code, name, prev_close, view.asof)，因为涨跌幅按当天的规则生效；判断是否涨停或跌停用 at_limit_up / at_limit_down，它们容忍一分钱的复权舍入误差。
 6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
-7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；self 只作为类中方法的第一个参数，只在方法体内直接给 self 的属性赋值（不在嵌套函数或 lambda 里），不给模块、类或其他对象的属性赋值；拼字符串用 f-string，不用 str.format；不访问 pd.api、pd.set_option、np.seterr（需要时用 np.errstate）；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、load、save 等读写函数。
+7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；open、input、compile、exec、eval、print、exit、quit、locals、globals、vars、breakpoint 这些内建名字连变量名、参数名也不能用（开盘价写成 open_px、h["open"] 或 bar.open）；self 只作为类中方法的第一个参数，只在方法体内直接给 self 的属性赋值（不在嵌套函数或 lambda 里），不给模块、类或其他对象的属性赋值；拼字符串用 f-string，任何对象的 .format 方法都不用（包括 str.format）；不访问 pd.api、pd.set_option、np.seterr（需要时用 np.errstate）；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、to_string、load、save 等读写或导出函数。
 8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
 9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
-10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。
+10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。已有策略很多、名单没有全部列出时，给名字加上年月后缀（例如 _2610）。
 
 # 工作方式
 - 本任务不使用工具：需要的接口说明、源码、门槛和试验记录都在用户消息里。你只需按 JSON Schema 返回 analysis、drafts、done。
@@ -316,11 +350,12 @@ def _outcome(res: dict) -> str:
 
 
 def _draft_block(res: dict, draft: Draft) -> str:
-    lines = [f"### 草稿 {res['name']}", f"假设：{res['hypothesis']}", f"处理：{res['message']}"]
+    lines = [f"### 草稿 {res['name']}", f"假设：{res['hypothesis'][:FEEDBACK_HYPOTHESIS_CHARS]}",
+             f"处理：{res['message'][:FEEDBACK_MESSAGE_CHARS]}"]
     if res["saved"] and res["ok"]:
         lines.append("评估报告：" + json.dumps(_rounded(res["report"]), ensure_ascii=False))
     elif res["saved"]:
-        lines.append(res["error"])
+        lines.append(res["error"][:EVAL_ERROR_CHARS + 1_600])  # 错误原因加出错位置
     code = draft.code
     if len(code) > FEEDBACK_CODE_CHARS:
         code = code[:FEEDBACK_CODE_CHARS] + "\n# ...（已截断）"
@@ -340,9 +375,10 @@ def _feedback(history: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _round_task(rnd_no: int, evals_left: int) -> str:
+def _round_task(rnd_no: int, evals_left: int, n_trials: int) -> str:
     lines = [f"# 本轮任务（第 {rnd_no}/{MAX_ROUNDS} 轮）",
-             f"本会话还可评估 {evals_left} 次，本轮最多处理 {MAX_DRAFTS_PER_ROUND} 个草稿；草稿数不要超过剩余评估次数。"]
+             f"本会话还可评估 {evals_left} 次，本轮最多处理 {MAX_DRAFTS_PER_ROUND} 个草稿；草稿数不要超过剩余评估次数。",
+             f"目前累计试验次数 n_trials：{n_trials}（下一次评估计为第 {n_trials + 1} 次）。"]
     if rnd_no == 1:
         lines.append("先在 analysis 里回顾现任策略和最近的试验记录，再提出有依据的新假设。"
                      "没有值得检验的想法时，返回 done=true 和空的 drafts。")
@@ -387,6 +423,7 @@ def _summary(today: date, out: dict, error: str) -> str:
 def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchRound,
                    evals: int, out: dict) -> tuple[list[dict], int]:
     """依次提交本轮至多 MAX_DRAFTS_PER_ROUND 个草稿：只在还有评估额度时提交，提交成功就立即评估。
+    每次评估后都校验 engine/：不符时不再处理后面的草稿，并把 out["engine_changed"] 置为 True。
 
     结果边做边记进 out：即使本地出错抛异常，已写入的文件也会照常提交。"""
     results = []
@@ -403,6 +440,9 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
             out["written"].append(res["name"])
             evals += 1  # 先计数：超时、失败同样消耗一次额度
             res.update(evaluate_strategy(settings, store, res["name"]))
+            if verify(Path(settings.root)):
+                out["engine_changed"] = True
+                break
     return results, evals
 
 
@@ -432,7 +472,8 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         context = build_context(settings, store)
         for rnd_no in range(1, MAX_ROUNDS + 1):
             feedback = _feedback(history) + "\n\n" if history else ""
-            user = f"{context}\n\n{feedback}{_round_task(rnd_no, MAX_EVALS_PER_SESSION - evals)}"
+            task = _round_task(rnd_no, MAX_EVALS_PER_SESSION - evals, store.trial_count())
+            user = f"{context}\n\n{feedback}{task}"
             try:
                 llm.check_budget(False)
                 remaining_usd = (settings.monthly_budget_cny - _month_cost(store)) / settings.usd_cny
@@ -451,22 +492,32 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             history.append({"round": rnd_no, "analysis": rnd.analysis, "results": results,
                             "drafts": rnd.drafts[:MAX_DRAFTS_PER_ROUND],
                             "ignored": max(0, len(rnd.drafts) - MAX_DRAFTS_PER_ROUND)})
-            if rnd.done or not rnd.drafts or evals >= MAX_EVALS_PER_SESSION:
-                break
+            if out.get("engine_changed") or rnd.done or not rnd.drafts or evals >= MAX_EVALS_PER_SESSION:
+                break  # engine/ 被改动：立即停止，不再请求 LLM，也不再评估
     except Exception as e:  # noqa: BLE001 — 写文件、数据库等本地故障：停止，但照常做会后校验与提交
         log.exception("research session failed")
         out["status"], error = "error", f"{type(e).__name__}: {e}"
     out["cost_cny"] = _month_cost(store) - cost0
 
+    out.pop("engine_changed", None)
     bad = verify(root)
     if bad:
+        # engine/ 被改动时得到的门槛结果不可信：本次进入影子盘的策略改回 candidate，不参与前向模拟
+        reverted = [n for n in out["written"] if store.get_status(n) == "shadow"]
+        for n in reverted:
+            store.set_status(n, "candidate", today)
         notifier.send_text(format_alert(
             "研究会话后 engine/ 校验不符，未提交 git",
-            "\n".join(bad) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"))
+            "\n".join(bad) + "\n本次写入的策略：" + ("、".join(out["written"]) or "无") + "（请人工检查）"
+            + (f"\n已从影子盘改回 candidate：{'、'.join(reverted)}" if reverted else "")))
         return {**out, "status": "integrity_failed"}
 
     saved = [r for r in out["results"] if r["saved"]]
+    text = _summary(today, out, error)
     if saved:
-        git_commit([f"strategies/{r['name']}.py" for r in saved], _commit_message(today, saved))
-    notifier.send_text(_summary(today, out, error))
+        paths = [f"strategies/{r['name']}.py" for r in saved]
+        if not git_commit(paths, _commit_message(today, saved)):
+            log.warning("research commit failed: %s", paths)
+            text += "\n注意：git 提交失败，请人工提交：" + "、".join(paths)
+    notifier.send_text(text)
     return out

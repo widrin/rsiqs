@@ -22,7 +22,8 @@ SOURCES = ["strategies/base.py", "strategies/baseline_momo.py",
            "engine/types.py", "engine/dataview.py", "engine/rules.py"]
 # 提示词里不能出现的措辞（会触发分类器，导致调用失败）
 BANNED_WORDS = ["安全", "沙箱", "绕过", "权限", "漏洞", "攻击", "注入", "逃逸", "恶意",
-                "sandbox", "bypass", "security", "permission", "exploit", "jailbreak", "escape", "malicious"]
+                "sandbox", "bypass", "security", "permission", "exploit", "jailbreak", "escape", "malicious",
+                "attack", "inject", "vulnerab"]
 
 
 def src(name: str, extra: str = "") -> str:
@@ -326,3 +327,80 @@ def test_default_llm_is_built_from_settings(env, monkeypatch):
     monkeypatch.setattr(research, "LLM", lambda settings, store: seen.append((settings, store)) or fake)
     out = run_research(e.settings, e.store, e.notifier)
     assert seen == [(e.settings, e.store)] and len(fake.calls) == 1 and out["status"] == "ok"
+
+
+def test_failed_eval_still_counts_toward_cap(env):
+    e = env
+    e.evals.outcomes["a_one"] = {"error": "KeyError: 'close'"}  # run_eval 报错，没有写入试验记录
+    llm = make_llm(e, rnd(d("a_one")), rnd(done=True))
+    out = run(e, llm)
+    assert out["results"][0]["ok"] is False and "KeyError" in out["results"][0]["error"]
+    assert "还可评估 4 次" in llm.calls[1]["user"]       # 失败同样消耗一次额度
+
+
+def test_local_error_stops_and_commits_earlier_drafts(env, monkeypatch):
+    e = env
+    real = research.submit_draft
+
+    def flaky(settings, store, draft):
+        if draft.name == "b_two":
+            raise OSError("磁盘已满")
+        return real(settings, store, draft)
+
+    monkeypatch.setattr(research, "submit_draft", flaky)
+    out = run(e, make_llm(e, rnd(d("a_one"), d("b_two"), d("c_three"))))
+    assert out["status"] == "error" and e.evals.names == ["a_one"]
+    assert e.commits[0][0] == ["strategies/a_one.py"]
+    msg = e.notifier.sent[-1]
+    assert "告警" in msg and "OSError" in msg and "磁盘已满" in msg
+
+
+def test_feedback_truncates_long_code_and_hypothesis(env):
+    e = env
+    long = Draft(name="long_one", hypothesis="长" * 3000, code=src("long_one", extra="X = 1\n" * 3000))
+    llm = make_llm(e, rnd(long), rnd(done=True))
+    run(e, llm)
+    fb = llm.calls[1]["user"]
+    assert "已截断" in fb and "长" * (research.FEEDBACK_HYPOTHESIS_CHARS + 1) not in fb
+    assert len(fb) < len(llm.calls[0]["user"]) + research.FEEDBACK_CODE_CHARS + 3000
+
+
+def test_context_built_once_and_round_task_has_current_n_trials(env, monkeypatch):
+    e = env
+    built = []
+    real = research.build_context
+    monkeypatch.setattr(research, "build_context", lambda s, st: built.append(1) or real(s, st))
+    llm = make_llm(e, rnd(d("a_one")), rnd(done=True))
+    run(e, llm)
+    assert built == [1]
+    assert "n_trials：0（下一次评估计为第 1 次）" in llm.calls[0]["user"]
+    assert "n_trials：1（下一次评估计为第 2 次）" in llm.calls[1]["user"]
+
+
+def test_engine_change_mid_session_stops_and_reverts_shadow(env):
+    e = env
+    for n in ("a_one", "b_two"):
+        e.evals.outcomes[n] = report(n, gate=True, holdout=True)
+    e.evals.side_effect = lambda name: _touch_engine(e.root) if name == "a_one" else None
+    llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
+    out = run(e, llm)
+    assert out["status"] == "integrity_failed" and set(out) == {"status", "rounds", "written", "results",
+                                                               "cost_cny", "analysis"}
+    assert e.evals.names == ["a_one"] and len(llm.calls) == 1   # 不再评估、不再请求 LLM
+    assert e.store.get_status("a_one") == "candidate"           # 不参与前向模拟
+    assert e.store.strategies_with_status("shadow") == [] and e.commits == []
+    assert "已从影子盘改回 candidate：a_one" in e.notifier.sent[-1]
+
+
+def test_commit_failure_is_reported(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(research, "git_commit", lambda paths, message: False)
+    out = run(e, make_llm(e, rnd(d("a_one"), done=True)))
+    assert out["status"] == "ok"
+    assert "git 提交失败，请人工提交：strategies/a_one.py" in e.notifier.sent[-1]
+
+
+def test_system_prompt_explains_reserved_names_and_suffix():
+    assert "open_px" in RESEARCH_SYSTEM and "连变量名" in RESEARCH_SYSTEM
+    assert "to_string" in RESEARCH_SYSTEM and ".format" in RESEARCH_SYSTEM
+    assert "年月后缀" in RESEARCH_SYSTEM

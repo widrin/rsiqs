@@ -272,3 +272,50 @@ def test_build_context_incumbent_source_and_length_cap(env, monkeypatch):
     assert len(ctx) <= research.CONTEXT_MAX_CHARS
     monkeypatch.setattr(research, "CONTEXT_MAX_CHARS", 3000)  # 总长度上限
     assert len(build_context(settings, store)) <= 3000
+
+
+# 提示词里不能出现的措辞（会触发分类器，导致调用失败）；背景里的源码也算
+CONTEXT_BANNED = ["安全", "沙箱", "绕过", "权限", "漏洞", "攻击", "注入", "逃逸", "恶意",
+                  "sandbox", "bypass", "security", "permission", "exploit", "jailbreak", "escape", "malicious",
+                  "attack", "inject", "vulnerab"]
+
+
+def test_build_context_wording_including_embedded_source(env):
+    settings, store = env
+    ctx = build_context(settings, store)
+    assert not [w for w in CONTEXT_BANNED if w in ctx.lower()]
+    assert "RESERVED: set[str]" in ctx                 # 保留模块名那一行换成了中性说明
+
+
+def test_build_context_status_list_cap(env, monkeypatch):
+    settings, store = env
+    names = [f"cand_{i:03d}" for i in range(60)]
+    for n in names:
+        store.set_status(n, "candidate", date(2026, 10, 2))
+    ctx = build_context(settings, store)
+    assert all(n in ctx for n in names)                # 60 个都列出
+    monkeypatch.setattr(research, "STATUS_LIST_MAX", 5)
+    ctx = build_context(settings, store)
+    assert "cand_004" in ctx and "cand_005" not in ctx and "等 60 个" in ctx and "年月后缀" in ctx
+
+
+def test_evaluate_uses_utf8_and_reports_stderr(written):
+    settings, store = written
+    calls = []
+    evaluate_strategy(settings, store, "probe_one", runner=fake_runner("", calls=calls, stderr="出错了"))
+    assert calls[0][1]["encoding"] == "utf-8"
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner("", stderr="Traceback: 出错了"))
+    assert "出错了" in out["error"]
+
+
+def test_evaluate_error_includes_strategy_frames(written):
+    settings, store = written
+    stderr = ("ERROR:root:评估 probe_one 失败\nTraceback (most recent call last):\n"
+              '  File "C:\\proj\\engine\\backtest.py", line 88, in run\n    picks = strategy.select(view)\n'
+              '  File "C:\\proj\\strategies\\probe_one.py", line 12, in select\n'
+              '    x = h["close"].iloc[-21]\n        ^^^^^^^^^^^^^^^^^^^^^^\n'
+              "IndexError: single positional indexer is out-of-bounds\n")
+    out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(
+        '{"error": "IndexError: single positional indexer is out-of-bounds"}\n', returncode=1, stderr=stderr))
+    assert 'strategies/probe_one.py 第 12 行（select）：x = h["close"].iloc[-21]' in out["error"]
+    assert "backtest.py" not in out["error"]           # 只给策略文件里的帧
