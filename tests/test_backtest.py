@@ -168,22 +168,21 @@ def test_nan_close_falls_back_to_last_finite_close():
 
 
 class PanelProbe:
-    """测试专用：直接读改编后的私有面板（策略源码检查不允许这样写），确认面板已截断到本段末尾。"""
+    """测试专用：记下每天策略经 history 能看到的最后一行，以及 asof。"""
     name = "probe"
 
     def __init__(self):
-        self.max_seen = None
+        self.seen = []
 
     def select(self, view):
-        panel = view._DataView__panel
-        self.max_seen = max(df.index.max() for df in panel.values())
+        self.seen.append((view.asof, max(view.history(c).index.max() for c in view.codes())))
         return []
 
 
-def test_strategy_never_receives_data_after_segment_end():
+def test_strategy_never_receives_data_after_asof():
     probe = PanelProbe()
     run_backtest(probe, _panel(), NAMES, CAL, DAYS[2], DAYS[10], BENCH)
-    assert probe.max_seen == IDX[10]
+    assert probe.seen and all(last == pd.Timestamp(asof) for asof, last in probe.seen)
 
 
 def test_day_bars_matches_bars_for_day():

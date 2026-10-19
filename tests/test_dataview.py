@@ -51,8 +51,22 @@ def test_asof_readonly_and_state_sealed(view):
     with pytest.raises(AttributeError):
         view.asof = date(2030, 1, 1)
     assert not hasattr(view, "_panel") and not hasattr(view, "panel")
-    # 改编后的名字仍然存在：挡住它靠的是策略源码检查（Task 3.6）和 run_backtest 按段截断的面板
-    assert hasattr(view, "_DataView__panel")
+    # 面板只在闭包里：实例上没有任何属性能取到它（改编后的名字、format 字段、反射都不行）
+    assert not hasattr(view, "_DataView__panel")
+    assert all("panel" not in n for n in dir(view))
+    with pytest.raises(AttributeError):
+        "{0._DataView__panel}".format(view)
+
+
+def test_no_reference_to_future_rows_reachable(view):
+    import gc
+    for name in dir(view):
+        if not name.startswith("__"):
+            attr = getattr(type(view), name, None)
+            if isinstance(attr, property) or callable(attr):
+                continue
+            assert not isinstance(getattr(view, name), (dict, pd.DataFrame)), name
+    assert pd.Timestamp("2026-01-14") not in pd.concat([view.history(c) for c in view.codes()]).index
     with pytest.raises(TypeError):
         vars(view)  # 无 __dict__
 

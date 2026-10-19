@@ -13,39 +13,42 @@ class LookaheadError(Exception):
 
 
 class DataView:
-    # 私有状态用双下划线（名字改编为 _DataView__xxx）且无 __dict__。改编后的名字仍可访问，挡住它的是
-    # 策略源码检查（Task 3.6 禁止任何含 "__" 的属性、名字和标识符式字符串），以及 run_backtest
-    # 只把截断到本段末尾的面板交给 DataView（训练、验证段看不到之后的数据）。
-    __slots__ = ("__panel", "__names", "__asof", "__ts", "__codes")
+    # 面板只保存在方法的闭包里，实例上没有任何能取到它的属性：改编后的私有名字、str.format 的字段
+    # （"{0._DataView__panel}"）都拿不到 asof 之后的数据。闭包本身只能经 __closure__ 这类双下划线属性
+    # 取到，Task 3.6 的源码检查禁止任何含 "__" 的名字、属性和字符串。没有 __dict__，实例只读。
+    __slots__ = ("asof", "codes", "name", "history", "bar_on")
 
     def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str], asof: date):
-        self.__panel = panel
-        self.__names = names
-        self.__asof = asof
-        self.__ts = pd.Timestamp(asof)
+        ts = pd.Timestamp(asof)
         # 只列出 asof 时已经有数据的股票：之后才上市的代码本身就是未来信息
-        self.__codes = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= self.__ts)
+        listed = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= ts)
 
-    @property
-    def asof(self) -> date:
-        return self.__asof
+        def codes() -> list[str]:
+            return list(listed)
 
-    def codes(self) -> list[str]:
-        return list(self.__codes)
+        def name(code: str) -> str:
+            return names.get(code, "")
 
-    def name(self, code: str) -> str:
-        return self.__names.get(code, "")
+        def history(code: str, n: int | None = None) -> pd.DataFrame:
+            df = panel[code]
+            end = int(df.index.searchsorted(ts, side="right"))  # 索引升序
+            start = 0 if n is None else max(end - n, 0)
+            return df.iloc[start:end].copy()
 
-    def history(self, code: str, n: int | None = None) -> pd.DataFrame:
-        df = self.__panel[code]
-        end = int(df.index.searchsorted(self.__ts, side="right"))  # 索引升序
-        start = 0 if n is None else max(end - n, 0)
-        return df.iloc[start:end].copy()
+        def bar_on(code: str, d: date) -> Bar:
+            if d > asof:
+                raise LookaheadError(f"{code} {d} > asof {asof}")
+            row = panel[code].loc[pd.Timestamp(d)]  # 无数据 -> KeyError
+            return Bar(code=code, date=d, open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
+                       close=float(row["close"]), prev_close=float(row["prev_close"]), volume=float(row["volume"]),
+                       amount=float(row["amount"]), name=names.get(code, ""))
 
-    def bar_on(self, code: str, d: date) -> Bar:
-        if d > self.__asof:
-            raise LookaheadError(f"{code} {d} > asof {self.__asof}")
-        row = self.__panel[code].loc[pd.Timestamp(d)]  # 无数据 -> KeyError
-        return Bar(code=code, date=d, open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
-                   close=float(row["close"]), prev_close=float(row["prev_close"]), volume=float(row["volume"]),
-                   amount=float(row["amount"]), name=self.name(code))
+        for attr, value in (("asof", asof), ("codes", codes), ("name", name), ("history", history),
+                            ("bar_on", bar_on)):
+            object.__setattr__(self, attr, value)
+
+    def __setattr__(self, key, value):
+        raise AttributeError("DataView is read-only")
+
+    def __delattr__(self, key):
+        raise AttributeError("DataView is read-only")
