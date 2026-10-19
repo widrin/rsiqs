@@ -433,6 +433,11 @@ def test_commit_failure_is_reported(env, monkeypatch):
     assert "git 提交失败，请人工提交：strategies/a_one.py" in e.notifier.sent[-1]
 
 
+def test_system_prompt_states_forward_history_limit():
+    from agents.premarket import HISTORY_DAYS
+    assert f"最近 {HISTORY_DAYS} 个自然日" in RESEARCH_SYSTEM and "n 不要超过 250" in RESEARCH_SYSTEM
+
+
 def test_system_prompt_explains_reserved_names_and_suffix():
     assert "open_px" in RESEARCH_SYSTEM and "连变量名" in RESEARCH_SYSTEM
     assert "to_string" in RESEARCH_SYSTEM and ".format" in RESEARCH_SYSTEM

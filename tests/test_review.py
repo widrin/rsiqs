@@ -247,6 +247,18 @@ def test_commit_counts_only_effective_changes(env):
     assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
 
 
+def test_git_failure_is_noted_in_report(env, monkeypatch):
+    monkeypatch.setattr(playbook, "git_commit", lambda paths, message: False)
+    run(env, FakeLLM(OUTPUT))
+    assert "git 提交失败" in env["notifier"].sent[0]
+
+
+def test_retired_quant_account_not_in_report(env):
+    env["store"].set_status("baseline_momo", "retired", D)
+    run(env, FakeLLM(ReviewOutput(summary="s", lessons=[])))
+    assert "q:baseline_momo" not in env["notifier"].sent[0]
+
+
 def test_report_marks_accounts_without_todays_nav(env):
     env["store"].record_nav("q:late", PREV, 500_000.0)
     env["store"].save_account(Account(name="q:late", cash=500_000.0))

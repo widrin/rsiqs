@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 CANDIDATE_COUNT = 15
 NEWS_LIMIT = 30
 STOCK_NEWS_LIMIT = 3
-HISTORY_DAYS = 400       # 自然日，约 270 个交易日，够常见的一年期因子
+HISTORY_DAYS = 550       # 自然日，约 370 个交易日；结算（jobs.settle）用同一个值，同一策略两处选股一致
 PRICE_BAND = 0.5         # 计划价位须在量化 entry_max 的 ±50% 内
 ANALYZE_TIMEOUT = 900.0  # 08:30 深度分析单次上限（秒）
 AUCTION_TIMEOUT = 90.0   # 09:25 竞价确认单次上限（秒）
@@ -104,7 +104,7 @@ AUCTION_SYSTEM = """你是 A 股集合竞价复核员。08:30 的盘前深度分
 输出要求：note 用一两句话概括今日竞价情况（60 字以内）；picks 对列出的每只股票各给一条，code 与输入完全一致，reason 40 字以内。"""
 
 
-# ---------- 08:30 scan（与上一版相同） ----------
+# ---------- 08:30 scan ----------
 
 def _safe(fn, default):
     """资讯类抓取失败不阻断盘前流程。"""
@@ -147,7 +147,8 @@ def scan(d: dt.date, settings: Settings, store: Store, cache: BarCache, client: 
     cand = [p.code for p in picks]
     context = {
         "news": _jsonable(_safe(lambda: client.news_global(NEWS_LIMIT), [])),
-        "notices": _notices(client, [asof, d], cand),  # 晚间公告可能记在次日，两天都取
+        # 晚间公告可能记在次日：取上一交易日到今天的每个自然日，周一、节后才不会漏掉周末和假期的公告
+        "notices": _notices(client, [asof + dt.timedelta(days=k) for k in range((d - asof).days + 1)], cand),
         "stock_news": {c: _jsonable(_safe(lambda c=c: client.stock_news(c, limit=STOCK_NEWS_LIMIT), [])
                                     [:STOCK_NEWS_LIMIT]) for c in cand},
         "stats": {c: _stats(view, c) for c in cand},

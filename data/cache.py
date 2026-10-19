@@ -1,5 +1,6 @@
 # data/cache.py
-"""SQLite 日线缓存：按股票增量更新，产出 DataView 用的 panel；另存已实施的分红送转。
+"""SQLite 日线缓存：按股票增量更新前复权日线，产出 DataView 用的 panel；另存结算用的不复权日线
+（bar_raw：update_raw、raw_bars、last_raw_close）和已实施的分红送转。
 
 前复权价会在除权后整体变化。增量更新时从已存的最后 OVERLAP_ROWS 行开始取，重叠部分的价格差超过
 ADJ_TOL 就说明复权基准变了，删掉这只股票重新全量下载，避免在除权日留下跳变（昨收错位）。

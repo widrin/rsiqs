@@ -48,6 +48,10 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         return False
     if now.time() > STALE_AFTER:
         common.log.info("premarket_final %s: stale at %s, skipped", d, now.time())
+        key = f"premarket_stale_alerted:{d.isoformat()}"
+        if not store.job_done("premarket_final", d) and not store.kv_get(key) and notifier.send_text(format_alert(
+                "盘前推荐未推送", f"09:25–09:35 期间电脑没有运行（{now:%H:%M} 才启动），今日没有推送推荐")):
+            store.kv_set(key, True)
         return False
     ready = datetime.combine(d, READY_AT)
     wait = (ready - now).total_seconds() - (_time.monotonic() - t0)

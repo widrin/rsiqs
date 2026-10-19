@@ -1,4 +1,4 @@
-"""16:00 盘后复盘：对比两套 LLM 账户的推荐与实际，经验只写入 candidate playbook，并推送日报。"""
+"""16:05 盘后复盘：对比两套 LLM 账户的推荐与实际，经验只写入 candidate playbook，并推送日报。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -93,6 +93,8 @@ def _effective_changes(old: dict, new: dict) -> tuple[int, int]:
 def _report_rows(store: Store, d: dt.date) -> list[dict]:
     rows = []
     for name in store.list_accounts():
+        if name.startswith("q:") and store.get_status(name[2:]) == "retired":
+            continue  # 已退役的量化账户不再结算，不列进日报
         nav = store.nav_series(name)
         if nav.empty:
             continue
@@ -156,8 +158,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
                 parts += [f"补充证据 {evidence} 条"] if evidence else []
                 parts += [] if changed or evidence else ["复盘整理规则"]
 
-    if parts:
-        playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts))
+    if parts and not playbook.git_commit(PLAYBOOK_FILES, f"playbook: {d.isoformat()} " + "；".join(parts)):
+        summary = f"{summary}\n注意：playbook 的 git 提交失败（见日志），请人工提交 playbook/。"
     if release:
         summary = f"{summary}\n{release}"
     if bad:

@@ -233,6 +233,19 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is False
 
 
+def test_git_commit_has_timeout_and_skips_signing(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append((args, kw))
+        raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+
+    monkeypatch.setattr(playbook.subprocess, "run", fake_run)
+    assert playbook.git_commit(["playbook/active.json"], "m") is False  # 超时不抛异常
+    args, kw = calls[0]
+    assert kw["timeout"] == playbook.GIT_TIMEOUT and "commit.gpgsign=false" in args
+
+
 def test_git_commit_outside_repo_returns_false(tmp_path, monkeypatch):
     monkeypatch.setattr(playbook, "ROOT", tmp_path)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))

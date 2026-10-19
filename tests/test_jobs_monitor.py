@@ -32,7 +32,7 @@ def make_store(*positions):
     for code, stop, target in positions:
         acc.positions[code] = Position(code=code, name="测试", qty=1000, available=1000,
                                        cost=10.0, entry_date=date(2026, 10, 12), stop=stop,
-                                       target=target, exit_date=date(2026, 10, 19))
+                                       target=target, exit_date=date(2026, 10, 30))
     store.save_account(acc)
     return store
 
@@ -107,6 +107,34 @@ def test_previous_day_ex_not_yet_settled_uses_adjusted_levels():
     old = DivCache({"600001": [(date(2026, 10, 9), 0.0, 0.5)]})
     assert check_once(D, make_store(("600001", 9.3, 11.0)), SpotClient([row("600001", 9.5, 9.6)]),
                       NullNotifier(), old) == []
+
+
+def test_position_due_today_is_not_monitored():
+    store = make_store(("600001", 9.3, 11.0))
+    acc = store.load_account("h:active")
+    acc.positions["600001"].exit_date = D  # 今天到期：开盘已按到期卖出
+    store.save_account(acc)
+    assert check_once(D, store, SpotClient([row("600001", 9.0, 9.0)]), NullNotifier()) == []
+
+
+class RawDivCache(DivCache):
+    def __init__(self, events, last_close):
+        super().__init__(events)
+        self.last_close = last_close
+
+    def last_raw_close(self, code, d):
+        return self.last_close
+
+
+def test_unexplained_ex_gap_does_not_alert_stop():
+    store = make_store(("600001", 9.3, 11.0))
+    cache = RawDivCache({}, (date(2026, 10, 15), 10.0))  # 昨收 10.0，今天参考昨收 5.0：疑似 10 转 10，没有记录
+    out = check_once(D, store, SpotClient([row("600001", 4.9, 5.0, prev_close=5.0)]), NullNotifier(), cache)
+    assert len(out) == 1 and "疑似除权" in out[0] and "触发止损" not in out[0]
+    explained = RawDivCache({"600001": [(D, 0.0, 1.0)]}, (date(2026, 10, 15), 10.0))  # 有记录：按换算后的价位
+    out = check_once(D, make_store(("600001", 9.3, 11.0)), SpotClient([row("600001", 4.5, 5.0, prev_close=5.0)]),
+                     NullNotifier(), explained)
+    assert len(out) == 1 and "触发止损" in out[0]
 
 
 def test_missing_quote_is_logged_once(caplog):

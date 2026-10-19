@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from agents.llm import LLM, BudgetExceeded
 from agents.playbook import git_commit
+from agents.premarket import HISTORY_DAYS
 from config import Settings
 from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
@@ -231,10 +232,20 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
     """在子进程中运行 engine.run_eval；本次写入数据库的试验记录 gate_pass 且 holdout_pass 时设为 shadow。
 
     策略代码和评估器在同一个子进程里，stdout 可能被伪造，所以报告只用于展示，是否通过以子进程写入的
-    试验记录为准。返回 {"ok": bool, "report": dict | None, "error": str}；任何失败都不抛异常。"""
+    试验记录为准。返回 {"ok": bool, "report": dict | None, "error": str}；任何失败都不抛异常。
+    子进程超时被杀、崩溃或加载策略就出错时没有写试验记录：这里补记一条未通过的试验，跑不完的评估同样计入
+    n_trials（无法启动评估进程不算）。"""
+    before = store.trial_count(name)
+    out = _evaluate(settings, store, name, runner, before)
+    if not out["ok"] and out.get("count", True) and store.trial_count(name) == before:
+        store.add_trial(name, {"incomplete": out["error"][:200]}, None, None, False, None)
+    out.pop("count", None)
+    return out
+
+
+def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) -> dict:
     run = runner or subprocess.run
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}  # Windows 管道默认是 ANSI 代码页
-    before = store.trial_count(name)
     try:
         proc = run([sys.executable, "-m", "engine.run_eval", name], cwd=str(settings.root),
                    capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -242,7 +253,7 @@ def evaluate_strategy(settings: Settings, store: Store, name: str, runner=None) 
     except subprocess.TimeoutExpired:
         return {"ok": False, "report": None, "error": f"评估超时（{EVAL_TIMEOUT} 秒），请简化计算"}
     except OSError as e:
-        return {"ok": False, "report": None, "error": f"无法启动评估进程：{e}"}
+        return {"ok": False, "report": None, "error": f"无法启动评估进程：{e}", "count": False}
     report = _last_json_line(proc.stdout)
     if proc.returncode != 0 or report is None or "error" in report or "gate_pass" not in report:
         if report and report.get("error"):
@@ -304,7 +315,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 5. 只通过 view 取数：view.codes()、view.name(code)、view.history(code, n)、view.bar_on(code, d)。history 只含 asof 及以前的行，列为 open、high、low、close、volume（手）、amount（元）、prev_close。用 engine.rules 判断 ST 和涨跌停：计算涨跌停价时把 view.asof 作为 d 传入，例如 limit_prices(code, name, prev_close, view.asof)，因为涨跌幅按当天的规则生效；判断是否涨停或跌停用 at_limit_up / at_limit_down，它们容忍一分钱的复权舍入误差。
 6. 策略是纯计算：不读写文件、不联网、不打印；结果可复现，不用随机数，不依赖当前时间；select 不依赖上一次调用留下的状态。
 7. 写法保持直接：不用 getattr、setattr、vars、globals、operator.attrgetter 这类反射写法，不用 eval、exec、open，也不用 pandas 的 eval、query；不写 print、exit，也不 raise SystemExit；open、input、compile、exec、eval、print、exit、quit、locals、globals、vars、breakpoint 这些内建名字连变量名、参数名也不能用（开盘价写成 open_px、h["open"] 或 bar.open）；self 只作为类中方法的第一个参数，只在方法体内直接给 self 的属性赋值（不在嵌套函数或 lambda 里），不给模块、类或其他对象的属性赋值；拼字符串用 f-string，任何对象的 .format 方法都不用（包括 str.format）；不访问 pd.api、pd.set_option、np.seterr（需要时用 np.errstate）；名字、属性和字符串里都不出现双下划线（例如 super().__init__()、__name__、对象的私有属性；定义 __init__ 方法本身没问题）；pandas 和 numpy 只做计算，不调用 read_*、to_csv、to_string、load、save 等读写或导出函数。
-8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。
+8. 注意速度：一次评估要回放约 2,600 个交易日、每天约 800 只股票，并且有时间上限；基线策略每天对每只股票取 60 行做几次 pandas 运算，全程约 7 分钟。用 view.history(code, n) 只取需要的最近 n 行，避免每天对整段历史重复计算。上线后（盘前选股和每日结算）view 只有最近 <<HISTORY_DAYS>> 个自然日（约 370 个交易日）的数据：n 不要超过 250，也不要用不带 n 的整段历史算统计量，否则回测和上线后的选股结果会不一样。
 9. Pick 字段：code、name、score、entry_max（可接受的最高买入价，通常比最近收盘价高 2% 到 3%）、stop、target（须满足 stop < entry_max < target）、hold_days（正整数），以及中文 reason（选股依据，会推送给用户）。
 10. name 须匹配 ^[a-z][a-z0-9_]{2,40}$，并且是一个新名字：不能与用户消息里列出的任何已有策略重名，也不能与 strategies/ 下已有的模块重名。已有策略很多、名单没有全部列出时，给名字加上年月后缀（例如 _2610）。
 
@@ -320,7 +331,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 - analysis：中文。先回顾现任策略、试验记录和上一轮结果，再说明本轮每个假设的逻辑和预期；最后一轮或准备结束时，总结结论和下次研究的方向。
 - drafts：0 个或多个 Draft（name、hypothesis、code）。
 - done：之后不需要再来一轮时为 true（本轮的草稿照常处理）；想根据本轮评估结果继续迭代时为 false。
-""".replace("<<ALLOWED_IMPORTS>>", ", ".join(sorted(ALLOWED_IMPORTS)))
+""".replace("<<ALLOWED_IMPORTS>>", ", ".join(sorted(ALLOWED_IMPORTS))).replace("<<HISTORY_DAYS>>", str(HISTORY_DAYS))
 
 
 def _month_cost(store: Store) -> float:

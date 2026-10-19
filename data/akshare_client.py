@@ -241,6 +241,9 @@ class AkClient:
                 log.warning("个股报价 %s 失败: %s", code, e)
                 continue
             kv = dict(zip(df["item"], df["value"]))
+            missing = [k for k in BID_ASK_COLS if k not in kv]
+            if missing:  # 字段改名不能静默变成 NaN：竞价过滤和盘中监控会悄悄失效
+                raise DataError(f"stock_bid_ask_em 缺少字段 {missing}（AKShare 可能改了字段名，更新 BID_ASK_COLS）")
             row = {"code": str(code).zfill(6), "name": ""}
             # 停牌时报价为 "-"：转成 NaN
             row.update({v: float(pd.to_numeric(kv.get(k), errors="coerce")) for k, v in BID_ASK_COLS.items()})

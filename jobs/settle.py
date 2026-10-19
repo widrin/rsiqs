@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 
+from agents.premarket import HISTORY_DAYS
 from data.akshare_client import DataError
 from engine import promotion
 from engine.backtest import bars_for_day
@@ -17,7 +18,7 @@ from notify.format import format_alert
 from strategies.base import load_strategy
 
 CORE_ACCOUNTS = (*common.LLM_ACCOUNTS, common.BENCH_ACCOUNT)
-LOOKBACK_CAL_DAYS = 550  # 约 370 个交易日，供策略计算因子
+LOOKBACK_CAL_DAYS = HISTORY_DAYS  # 约 370 个交易日，供策略计算因子；与盘前扫描一致，同一策略两处选股相同
 MIN_COVERAGE = 0.9       # 当日有日线的股票占比低于此值视为数据未更新（股票池里同时停牌的很少超过几十只）
 KIND_CN = {"promote": "晋升", "demote": "降级", "retire": "淘汰"}
 BIG_EX_GAP = 0.03       # 参考昨收比上一收盘低这么多、又没有分红记录：多半是送转或大额派息的记录还没到
@@ -32,10 +33,16 @@ def pending_days(store, calendar, now: datetime) -> list[date]:
     return calendar.between(start, end) if start <= end else []
 
 
+def live_accounts(store) -> list[str]:
+    """仍在结算的账户：已退役策略的 q: 账户不再结算，持仓冻结，不计入股票池和分红刷新。"""
+    return [n for n in store.list_accounts()
+            if not (n.startswith("q:") and store.get_status(n[2:]) == "retired")]
+
+
 def tracked_codes(store) -> list[str]:
-    """股票池 ∪ 各账户持仓（股票池变动后旧持仓仍能按规则退出）。"""
+    """股票池 ∪ 各在结算账户的持仓（股票池变动后旧持仓仍能按规则退出）。"""
     codes = set(store.kv_get("universe") or [])
-    for name in store.list_accounts():
+    for name in live_accounts(store):
         acc = store.load_account(name)
         if acc is not None:
             codes.update(acc.positions)
@@ -75,7 +82,7 @@ def refresh_data(codes: list[str], end: date, client, cache) -> None:
 def refresh_dividends(store, client, cache, d: date | None = None) -> list[str]:
     """刷新所有账户持仓股票，以及 d 日盘前推荐股票的分红送转记录（新浪），返回获取失败的代码。"""
     held = set()
-    for name in store.list_accounts():
+    for name in live_accounts(store):
         acc = store.load_account(name)
         if acc is not None:
             held.update(acc.positions)
@@ -156,13 +163,15 @@ def _settled(store, name: str, d: date) -> bool:
 
 
 def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset(),
-               run_date: date | None = None) -> list[str]:
+               run_date: date | None = None, warnings: list[str] | None = None) -> list[str]:
     """结算单个交易日；已记录 d 日净值的账户跳过（幂等）。返回警告列表。
 
     前复权日线只给策略算因子：除权后它会整体变化，多日补跑时较早的日子已经是之后的复权基准。撮合和估值用
     不复权日线（cache.raw_bars），持仓在除权除息日按分红记录调整。div_failed 是今天分红记录获取失败的代码；
-    run_date 是实际运行的日期（默认今天），用来判断为等分红记录已经暂停了几天。"""
+    run_date 是实际运行的日期（默认今天），用来判断为等分红记录已经暂停了几天。warnings 由调用方传入时，
+    中途暂停（抛异常）之前已结算账户的警告也留在里面，不随异常丢掉。"""
     run_date = run_date or common.today()
+    warnings = [] if warnings is None else warnings
     codes = tracked_codes(store)
     # 当天盘前推荐的代码也载入（盘前扫描用实时股票池，可能有 kv universe 之外的新成分股），只用于撮合检查
     recs = recommended_codes(store, [d])
@@ -178,7 +187,7 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合。选股范围是股票池加持仓，不含当天 LLM 推荐的代码
     tracked = set(codes)
     view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
-    broker, per_pick, warnings = SimBroker(), settings.capital / settings.max_picks, []
+    broker, per_pick = SimBroker(), settings.capital / settings.max_picks
 
     def raw_bars(codes) -> dict:
         need = sorted(set(codes))
@@ -268,9 +277,12 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
 
 def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_failed=frozenset(),
                       run_date: date | None = None) -> None:
-    warnings = settle_day(d, settings, store, cache, calendar, div_failed, run_date)
-    if warnings:
-        notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
+    warnings: list[str] = []
+    try:
+        settle_day(d, settings, store, cache, calendar, div_failed, run_date, warnings=warnings)
+    finally:  # 暂停时已结算账户的警告（除权调整等）也要推出去：重跑时这些账户会跳过，不再生成
+        if warnings:
+            notifier.send_text(format_alert(f"结算警告 {d.isoformat()}", "\n".join(warnings)))
     for ev in promotion.decide(store, d, calendar):
         notifier.send_text(format_alert(f"策略{KIND_CN.get(ev.kind, ev.kind)}",
                                         f"{ev.strategy}：{ev.detail}"))
@@ -280,6 +292,14 @@ def main(now: datetime | None = None) -> list[date]:
     """补跑所有待结算交易日；返回本次结算成功的日期。某日失败即停止（次日依赖前日持仓）。"""
     now = now or datetime.now()
     settings, store, client, cache, calendar, notifier = common.context()
+    with common.job_lock("settle_main") as got:  # 复盘等这把锁：结算跑完再判断是否已结算
+        if not got:
+            common.log.info("settle: running in another process")
+            return []
+        return _settle_pending(now, settings, store, client, cache, calendar, notifier)
+
+
+def _settle_pending(now, settings, store, client, cache, calendar, notifier) -> list[date]:
     days = pending_days(store, calendar, now)
     if not days:
         return []

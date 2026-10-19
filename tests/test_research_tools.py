@@ -201,6 +201,18 @@ def test_evaluate_timeout(written):
     out = evaluate_strategy(settings, store, "probe_one", runner=slow)
     assert out["ok"] is False and out["report"] is None and "超时" in out["error"]
     assert store.get_status("probe_one") == "candidate"
+    trial = store.last_trial("probe_one")  # 跑不完的评估同样计入 n_trials
+    assert store.trial_count() == 1 and trial["gate_pass"] is False and trial["holdout_pass"] is None
+
+
+def test_evaluate_cannot_start_is_not_counted(written):
+    settings, store = written
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("python 不存在")
+
+    evaluate_strategy(settings, store, "probe_one", runner=missing)
+    assert store.trial_count() == 0
 
 
 def test_evaluate_cannot_start(written):

@@ -65,7 +65,7 @@ def test_two_trading_days_full_cycle(world):
 
         n0, slept = len(notifier.sent), []
         assert premarket_final.main(now=at(day, 9, 25), sleep=slept.append) is True
-        assert slept == [15.0]                                 # 等到 09:25:15 再定稿
+        assert slept == pytest.approx([15.0], abs=0.5)         # 等到 09:25:15 再定稿
         recs, meta = store.load_recommendation(day, "h:active")
         assert recs and len(recs) <= world["settings"].max_picks and meta["llm_reviewed"] is True
         pushed = notifier.sent[n0:]

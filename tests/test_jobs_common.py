@@ -64,6 +64,28 @@ def test_run_job_skips_while_another_process_holds_the_lock(tmp_path, monkeypatc
         assert got
 
 
+def test_job_lock_waits_for_release(tmp_path, monkeypatch):
+    import threading
+    import time as _t
+
+    monkeypatch.setattr(common, "LOCK_DIR", tmp_path / "locks")
+    released = threading.Event()
+
+    def holder():
+        with common.job_lock("settle_main"):
+            released.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    _t.sleep(0.2)
+    with common.job_lock("settle_main", wait=0) as got:
+        assert got is False
+    threading.Timer(0.5, released.set).start()
+    with common.job_lock("settle_main", wait=10) as got:  # 等到别的进程结算完
+        assert got is True
+    th.join()
+
+
 def test_run_job_alerts_once_per_job_and_day(monkeypatch):
     store, notifier = Store(":memory:"), NullNotifier()
     monkeypatch.setattr(common, "today", lambda: D)

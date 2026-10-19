@@ -430,6 +430,33 @@ def test_unexplained_ex_without_record_warns(env):
     assert any("可能是配股" in str(m) for m in env["notifier"].sent)
 
 
+def test_warnings_before_a_pause_are_not_lost(env, monkeypatch):
+    dates, store = env["dates"], env["store"]
+    settle.main(now=at(dates[101], 16))
+    real_run = settle.settle_day
+
+    def pausing(d, *a, warnings=None, **k):
+        warnings.append("前面已结算账户的除权调整")
+        raise settle.DataError("后面的账户要等分红记录")
+
+    monkeypatch.setattr(settle, "settle_day", pausing)
+    assert settle.main(now=at(dates[102], 16)) == []
+    assert any("前面已结算账户的除权调整" in str(m) for m in env["notifier"].sent)
+    monkeypatch.setattr(settle, "settle_day", real_run)
+
+
+def test_retired_account_not_tracked(env):
+    dates, store = env["dates"], env["store"]
+    settle.main(now=at(dates[101], 16))
+    from engine.ledger import Account, Position
+    acc = Account(name="q:old_one", cash=0.0)
+    acc.positions["688999"] = Position(code="688999", name="退役持仓", qty=100, available=100, cost=10.0,
+                                       entry_date=dates[90], stop=1.0, target=99.0, exit_date=dates[120])
+    store.save_account(acc)
+    store.set_status("old_one", "retired", dates[100])
+    assert "688999" not in settle.tracked_codes(store)
+
+
 def test_late_bonus_share_record_pauses_until_it_arrives(env):
     dates, store, client = env["dates"], env["store"], env["client"]
     settle.main(now=at(dates[101], 16))  # h:active 于 dates[101] 买入 600001

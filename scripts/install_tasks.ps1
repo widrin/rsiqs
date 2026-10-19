@@ -31,17 +31,18 @@ function New-RetryTrigger([string]$At) {
     $t
 }
 
-function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $false) {
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable:$Available -MultipleInstances IgnoreNew `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $false, [bool]$Wake = $false) {
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable:$Available -WakeToRun:$Wake `
+        -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
     Register-ScheduledTask -TaskPath $Folder -TaskName $Name -Trigger $Trigger -Action $Action `
         -Settings $settings -Principal $principal -Description "RSIQS $Name" -Force | Out-Null
     Write-Host "registered $Folder$Name"
 }
 
-Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true
-Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true
+# The two premarket tasks wake the computer from sleep (needs "Allow wake timers" in the power plan).
+Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
+Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
 Register-Rsiqs "Monitor"        (New-WeekdayTrigger "09:30") (New-JobAction "monitor") $true
 Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle") $true
 Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review") $true

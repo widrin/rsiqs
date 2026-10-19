@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time as _time
 import traceback
 from contextlib import contextmanager
 from datetime import date, datetime, time
@@ -41,19 +42,24 @@ else:
 
 
 @contextmanager
-def job_lock(job: str):
+def job_lock(job: str, wait: float = 0.0):
     """跨进程互斥：同名任务同一时刻只有一个进程在跑（例如开机补跑与定时任务重叠）。拿到锁时 yield True，
-    别的进程正持有时 yield False。锁由操作系统随进程退出释放，进程被杀也不会留下残锁。"""
+    别的进程持有、且 wait 秒内没有释放时 yield False。锁由操作系统随进程退出释放，进程被杀也不会留下残锁。"""
     if LOCK_DIR is None:
         yield True
         return
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = _time.monotonic() + wait
     with open(LOCK_DIR / f"{job}.lock", "a+b") as f:
-        try:
-            _lock(f)
-        except OSError:
-            yield False
-            return
+        while True:
+            try:
+                _lock(f)
+                break
+            except OSError:
+                if _time.monotonic() >= deadline:
+                    yield False
+                    return
+                _time.sleep(1.0)
         try:
             yield True
         finally:

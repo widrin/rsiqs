@@ -333,6 +333,13 @@ def test_spot_for_codes_all_failing_raises(monkeypatch):
         AkClient(wait=0).spot(["600000", "000001"])
 
 
+def test_spot_for_codes_renamed_field_raises(monkeypatch):
+    renamed = {("开盘价" if k == "今开" else k): v for k, v in BID_ASK.items()}
+    fake_ak(monkeypatch, stock_bid_ask_em=lambda symbol: _bid_ask(renamed))
+    with pytest.raises(DataError, match="今开"):  # 不能静默变成 NaN
+        AkClient().spot(["600000"])
+
+
 def test_spot_for_codes_streams_rows_into_sink(monkeypatch):
     fake_ak(monkeypatch, stock_bid_ask_em=lambda symbol: _bid_ask(BID_ASK))
     rows = []

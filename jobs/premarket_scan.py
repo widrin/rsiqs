@@ -47,13 +47,17 @@ def main(now: datetime | None = None) -> bool:
         scan(d, settings, store, client, cache, calendar)
         if now.time() >= ANALYZE_CUTOFF:
             common.log.info("premarket_scan %s: started at %s, analysis skipped", d, now.time())
+            status["skipped"] = True
             return
         # 扫描本身可能要几分钟：按实际经过的时间算出分析开始的时刻
         status.update(analyze_all(d, settings, store, now + timedelta(seconds=_time.monotonic() - t0)))
 
     ok = common.run_job("premarket_scan", d, job, store, notifier)
-    failed = sorted(k for k, done in status.items() if not done)
+    failed = sorted(k for k, done in status.items() if not done and k != "skipped")
     cands = store.load_candidates(d)
+    if status and cands is not None and not cands[0]:  # 本次扫描完成但现任策略一只都没选出来
+        notifier.send_text(format_alert("盘前没有候选", f"现任量化策略 {common.incumbent_strategy(store)} 今天"
+                                        "没有选出任何股票，09:25 将推送\"今日无推荐\"；请检查数据或策略"))
     if failed and cands is not None and cands[0]:  # 策略当天没选出候选时不做分析，这不算未完成
         notifier.send_text(format_alert(
             "盘前分析未完成", f"9:25 将按量化/规则推荐（未完成：{'、'.join(failed)}）"))

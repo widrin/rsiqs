@@ -141,7 +141,8 @@ class Store:
         self._exec("UPDATE trials SET holdout_pass=? WHERE id=?", (int(bool(holdout_pass)), int(trial_id)))
 
     def void_trial(self, trial_id: int) -> None:
-        """作废一次试验（评估规则在评估期间被改动）：仍计入 n_trials，但门槛和留出期都记为未通过。"""
+        """作废一次试验（评估规则在评估期间被改动，或研究会话中 engine/ 哈希校验不符）：仍计入 n_trials，
+        但门槛和留出期都记为未通过。"""
         self._exec("UPDATE trials SET gate_pass=0, holdout_pass=0 WHERE id=?", (int(trial_id),))
 
     def trial_count(self, strategy: str | None = None) -> int:

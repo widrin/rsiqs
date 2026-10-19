@@ -78,12 +78,13 @@ def test_scan_alerts_when_analysis_incomplete_but_job_ok(env):
     assert "candidate" in msg and "active" not in msg
 
 
-def test_scan_without_candidates_does_not_alert(env):
+def test_scan_without_candidates_alerts_once_about_the_strategy(env):
     d = env["dates"][10]
     env["scan_picks"].clear()
     env["analysis"].update(active=False, candidate=False)  # 没有候选时 run_analyze 不做分析
     assert premarket_scan.main(now=at(d, 8, 30)) is True
-    assert env["notifier"].sent == []
+    [msg] = env["notifier"].sent  # 只说没有候选，不说"盘前分析未完成"
+    assert "盘前没有候选" in msg and "盘前分析未完成" not in msg
 
 
 def test_scan_analyze_crash_counts_as_incomplete(env, monkeypatch):
@@ -217,6 +218,9 @@ def test_final_stale_after_0935(env):
     assert premarket_final.main(now=at(d, 9, 36), sleep=env["slept"].append) is False
     assert env["calls"] == [] and env["slept"] == []
     assert not env["store"].job_done("premarket_final", d)
+    assert premarket_final.main(now=at(d, 10, 0), sleep=env["slept"].append) is False  # 再次补跑：只提醒一次
+    [msg] = env["notifier"].sent
+    assert "盘前推荐未推送" in msg and "09:36" in msg
 
 
 def test_final_skips_non_trading_day_without_waiting(env):
@@ -257,6 +261,15 @@ def test_review_requires_settle_and_runs_once(env):
     assert review.main(now=at(d, 16, 5)) is True
     assert review.main(now=at(d, 16, 30)) is True  # 已复盘 -> 跳过
     assert env["calls"] == [("review", d, "LLM")]
+
+
+def test_review_backfills_settled_days_without_review(env):
+    dates = env["dates"]
+    env["store"].mark_job("review", dates[6], "ok")
+    for d in dates[7:11]:  # 结算暂停后一次补完 4 天
+        env["store"].mark_job("settle", d, "ok")
+    assert review.main(now=at(dates[10], 16, 5)) is True
+    assert [c[1] for c in env["calls"]] == dates[8:11]  # 最多 3 天，按日期顺序
 
 
 def test_review_before_close_targets_previous_day(env):

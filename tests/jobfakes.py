@@ -75,9 +75,8 @@ def prepare_root(tmp: Path, monkeypatch) -> Path:
         shutil.copy(md, tmp / "playbook" / md.name)
     monkeypatch.setattr(pb, "PLAYBOOK_DIR", tmp / "playbook")
     monkeypatch.setattr(pb, "git_commit", lambda *a, **k: False)
-    import agents.review as rv
-    if hasattr(rv, "git_commit"):
-        monkeypatch.setattr(rv, "git_commit", lambda *a, **k: False)
+    import agents.research as rs  # research 用 from-import 绑定了 git_commit，要单独打桩
+    monkeypatch.setattr(rs, "git_commit", lambda *a, **k: False)
     return tmp
 
 

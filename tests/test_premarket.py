@@ -282,6 +282,14 @@ def test_run_analyze_timeout_capped_by_deadline(store):
     assert llm2.calls == []  # 剩余时间不够一次分析：不发起
 
 
+def test_scan_fetches_notices_for_every_day_since_last_session(monkeypatch):
+    seen = []
+    monkeypatch.setattr(premarket, "_notices", lambda client, days, codes: seen.extend(days) or [])
+    monday = dt.date(2026, 10, 19)
+    premarket.scan(monday, settings(), Store(":memory:"), FakeCache(), FakeAk(), FakeStrategy(), CAL)
+    assert seen == [dt.date(2026, 10, 16), dt.date(2026, 10, 17), dt.date(2026, 10, 18), monday]
+
+
 def test_confidence_normalized_to_unit_interval():
     assert pp("600001", conf=85).confidence == pytest.approx(0.85)  # 百分数
     assert pp("600001", conf=-1).confidence == 0.0 and pp("600001", conf=1.0).confidence == 1.0
