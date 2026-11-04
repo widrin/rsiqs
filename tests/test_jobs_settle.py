@@ -54,6 +54,10 @@ def test_catch_up_multiple_missed_days(env):
                for f in active.trades)
     assert store.load_account("q:baseline_momo").trades  # 量化账户按策略自行选股成交
     assert store.load_account("h:candidate").trades == []  # 无推荐 -> 不交易
+    # 买入推送给实盘模拟账户，量化/候选账户不推：补跑 4 天也只有 h:active 那一笔
+    buys = [m for m in env["notifier"].sent if "买入 600001" in m]
+    assert len(buys) == 1
+    assert "成本" in buys[0] and "止损" in buys[0] and "止盈" in buys[0]
     bench = store.nav_series("bench:csi300")
     expected = env["settings"].capital * env["index"].iloc[104] / env["index"].iloc[100]
     assert bench.iloc[-1] == pytest.approx(expected)
