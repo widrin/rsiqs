@@ -49,7 +49,7 @@ uv run python -c "from config import get_settings; from notify.wecom import WeCo
 uv run python -m jobs.bootstrap
 ```
 
-首次需下载约 800 只股票自 2015-06-01 起的日线，约 30–60 分钟；中断后重跑为增量。
+首次需下载约 800 只股票自 2015-06-01 起的日线，约 1 小时（数据源限流触发新浪回退时更久）；中断后重跑为增量。
 会创建 4 个模拟账户、现任策略、playbook 与 `.integrity/manifest.json`，并在群里推送完成消息。
 
 ### 测试
@@ -62,7 +62,8 @@ uv run pytest
 
 ## 日常运行：Windows 计划任务
 
-本机已注册 8 个任务：位于根路径 `\`、名称前缀 `RSIQS_`、SYSTEM 身份，统一经 `scripts\run_job.ps1` 进入仓库目录后调用 `uv`：
+本机已注册 8 个任务：位于根路径 `\`、名称前缀 `RSIQS_`、SYSTEM 身份，统一经 `scripts\run_job.ps1`
+进入仓库目录后调用仓库 `.venv` 的 python（不依赖 `uv` 在 PATH 中）：
 
 | 任务 | 触发 | 入口 | 作用 |
 |---|---|---|---|
@@ -82,9 +83,8 @@ Get-ScheduledTask | Where-Object TaskName -Like 'RSIQS_*' | Format-Table TaskNam
 schtasks /query /fo LIST | Select-String 'RSIQS_' -Context 1,3
 ```
 
-注意：`scripts\install_tasks.ps1` / `uninstall_tasks.ps1` 仍是早期版本（注册到 `\RSIQS\` 文件夹、当前用户身份、7 个任务且无 doctor），
-与本机实际注册的任务不一致。**不要直接运行安装脚本**，否则会再注册一套同名不同路径的任务造成重复执行；卸载脚本也删不到现有任务。
-确需重建时先按上表核对；把脚本对齐后再执行更稳妥。
+注意：安装/卸载脚本按上表配置写成（`scripts\install_tasks.ps1` 注册、`scripts\uninstall_tasks.ps1` 卸载），
+注册 SYSTEM 任务需要**管理员 PowerShell**。重装或迁移机器时以脚本为准，注册后用上面的命令核对触发时间。
 
 非交易日由代码自行跳过；同一任务同一时刻只有一个进程在跑（`logs/locks/*.lock` 跨进程互斥），
 所以开机补跑与定时任务重叠不会互相干扰。
@@ -146,7 +146,7 @@ docs/plans/  设计文档与实施计划
 
 ```powershell
 Get-Content logs\jobs.log -Tail 50              # 先看日志
-Get-ScheduledTask -TaskPath "\RSIQS\"           # 看任务状态与下次运行时间
+Get-ScheduledTask | Where-Object TaskName -Like 'RSIQS_*'   # 看任务状态与下次运行时间
 uv run python -m jobs.doctor                    # 跑一次体检
 uv run python -c "from pathlib import Path; from engine.integrity import verify; print(verify(Path('.')))"
 ```
@@ -154,7 +154,7 @@ uv run python -c "from pathlib import Path; from engine.integrity import verify;
 常见现象：
 
 - **群里没收到消息**：`WECOM_WEBHOOK_URL` 为空或填错；用上面的一行连通测试确认。
-- **任务没执行**：任务仅在用户登录时运行，且需要 `uv` 在 PATH 中；确认 `uv --version` 可用后重跑安装脚本。
+- **任务没执行**：任务以 SYSTEM 身份运行、不依赖登录状态；用上面的查询命令确认任务存在且 `schtasks /run /tn RSIQS_settle` 手动触发一次，再看日志。
 - **`engine/` 完整性告警**：`engine/` 是锁定区，改动后 `research` 会空转（exit 0 但无产出）。确认改动无误后人工重写清单并提交。
 - **日志出现东财限流、切换新浪**：`push2` 反复请求会延长封禁，不要连续手动重跑盘前任务。
 - **启动即报 `LLM_BASE_URL` 为空**：`.env` 未填或系统环境变量把它覆盖成了空值。

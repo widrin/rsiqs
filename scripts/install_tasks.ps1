@@ -1,31 +1,34 @@
-# Register RSIQS scheduled tasks for the current user (run only while logged on).
+# Register the 8 RSIQS scheduled tasks exactly as documented in README (see the scheduled-tasks table):
+# root path "\", RSIQS_ prefix, SYSTEM identity, every action goes through scripts\run_job.ps1
+# (repo venv python, no uv needed on PATH). Requires an ELEVATED PowerShell (SYSTEM registration).
 # Usage (repo root): powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tasks.ps1
-# Re-running is safe: -Force overwrites existing task definitions.
-# PremarketFinal fires at 09:25; the job itself waits until 09:25:15 for auction data.
-# Settle and Review repeat every 20 minutes for 5 hours: a failed or not-yet-ready run is retried the same
-# evening (jobs are idempotent and exit at once when already done). A running instance is not stopped when
-# the repetition window ends. StartWhenAvailable covers wake-up from sleep; overlapping runs (with Catchup at
-# logon) are serialized by the per-job file lock in jobs.common.run_job. A missed Saturday Research is skipped.
+# Re-running is safe: -Force overwrites existing definitions.
+# Triggers (non-trading days are skipped by the jobs themselves):
+#   PremarketScan  weekdays 08:30 (wake from sleep)      PremarketFinal weekdays 09:25 (wake)
+#   Monitor        daily 09:30 + every 2 min for 5h30m   Settle daily 15:35 + every 20 min for 1h30m
+#   Review         daily 16:05 + every 20 min for 1h30m  Doctor daily 07:30
+#   Research       Saturday 10:00 (missed run is skipped by the job)
+#   BootCatchup    at system start: settle then review (actions run sequentially)
+# Overlapping runs are serialized by the per-job file lock in jobs.common.
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$Uv = (Get-Command uv -ErrorAction Stop).Source
-$Folder = "\RSIQS\"
-$User = "$env:USERDOMAIN\$env:USERNAME"
-$Weekdays = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+$Runner = Join-Path $Root "scripts\run_job.ps1"
 
-function New-JobAction([string]$Job) {
-    New-ScheduledTaskAction -Execute $Uv -WorkingDirectory $Root `
-        -Argument "run --project `"$Root`" python -m jobs.$Job"
+function New-JobAction([string]$Jobs) {
+    New-ScheduledTaskAction -Execute "powershell.exe" -WorkingDirectory $Root `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Runner`" $Jobs"
 }
 
 function New-WeekdayTrigger([string]$At) {
-    New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Weekdays -At $At
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At $At
 }
 
-function New-RetryTrigger([string]$At) {
-    $t = New-WeekdayTrigger $At
-    $r = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes 20) `
-        -RepetitionDuration (New-TimeSpan -Hours 5)).Repetition
+function New-RetryTrigger([string]$At, [int]$EveryMin, [int]$ForMin) {
+    # Daily trigger + repetition; Repetition is built on a -Once trigger and copied over
+    # (PS 5.1 cannot set Repetition directly on a daily trigger).
+    $t = New-ScheduledTaskTrigger -Daily -At $At
+    $r = (New-ScheduledTaskTrigger -Once -At $At -RepetitionInterval (New-TimeSpan -Minutes $EveryMin) `
+        -RepetitionDuration (New-TimeSpan -Minutes $ForMin)).Repetition
     $r.StopAtDurationEnd = $false
     $t.Repetition = $r
     $t
@@ -34,24 +37,21 @@ function New-RetryTrigger([string]$At) {
 function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $false, [bool]$Wake = $false) {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable:$Available -WakeToRun:$Wake `
         -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
-    Register-ScheduledTask -TaskPath $Folder -TaskName $Name -Trigger $Trigger -Action $Action `
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount
+    Register-ScheduledTask -TaskName "RSIQS_$Name" -Trigger $Trigger -Action $Action `
         -Settings $settings -Principal $principal -Description "RSIQS $Name" -Force | Out-Null
-    Write-Host "registered $Folder$Name"
+    Write-Host "registered \RSIQS_$Name"
 }
 
-# The two premarket tasks wake the computer from sleep (needs "Allow wake timers" in the power plan).
-Register-Rsiqs "PremarketScan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
-Register-Rsiqs "PremarketFinal" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
-Register-Rsiqs "Monitor"        (New-WeekdayTrigger "09:30") (New-JobAction "monitor") $true
-Register-Rsiqs "Settle"         (New-RetryTrigger "15:35") (New-JobAction "settle") $true
-Register-Rsiqs "Review"         (New-RetryTrigger "16:05") (New-JobAction "review") $true
-Register-Rsiqs "Research" (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "10:00") `
-    (New-JobAction "research")
+Register-Rsiqs "premarket_scan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
+Register-Rsiqs "premarket_final" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
+Register-Rsiqs "monitor"         (New-RetryTrigger "09:30" 2 330)  (New-JobAction "monitor")
+Register-Rsiqs "settle"          (New-RetryTrigger "15:35" 20 90)  (New-JobAction "settle")
+Register-Rsiqs "review"          (New-RetryTrigger "16:05" 20 90)  (New-JobAction "review")
+Register-Rsiqs "doctor"          (New-ScheduledTaskTrigger -Daily -At "07:30") (New-JobAction "doctor")
+Register-Rsiqs "research"        (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "10:00") `
+                                 (New-JobAction "research")
+Register-Rsiqs "boot_catchup"    (New-ScheduledTaskTrigger -AtStartup) (New-JobAction "settle,review")
 
-# Catch-up after boot/logon: settle first, then review (actions run sequentially).
-$logon = New-ScheduledTaskTrigger -AtLogOn -User $User
-$logon.Delay = "PT3M"
-Register-Rsiqs "Catchup" $logon @((New-JobAction "settle"), (New-JobAction "review"))
-
-Get-ScheduledTask -TaskPath $Folder | Select-Object TaskName, State | Format-Table -AutoSize
+Get-ScheduledTask | Where-Object TaskName -Like 'RSIQS_*' |
+    Select-Object TaskName, State | Format-Table -AutoSize

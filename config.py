@@ -14,7 +14,7 @@ class Settings:
     ark_api_key: str = field(repr=False)  # LLM 服务商的 API Key（.env）
     wecom_webhook_url: str = field(repr=False)
     db_path: str = "data/rsiqs.sqlite"
-    ark_model: str = "doubao-seed-1-6-flash-250715"  # 模型 ID 或推理接入点 ep-xxx
+    ark_model: str = "doubao-seed-2-1-lite-260915"  # 模型 ID 或推理接入点 ep-xxx
     llm_base_url: str = ""  # OpenAI 兼容 base_url，必填（__post_init__ 校验非空，不回退默认服务商）
     capital: float = 500_000.0
     max_picks: int = 5
@@ -57,7 +57,7 @@ def get_settings(env_file: Path | None = None) -> Settings:
         ark_api_key=env("ARK_API_KEY", ""),
         wecom_webhook_url=env("WECOM_WEBHOOK_URL", ""),
         db_path=env("DB_PATH", "data/rsiqs.sqlite"),
-        ark_model=env("ARK_MODEL", "doubao-seed-1-6-flash-250715"),
+        ark_model=env("ARK_MODEL", "doubao-seed-2-1-lite-260915"),
         llm_base_url=env("LLM_BASE_URL", ""),
         capital=_num(env, "CAPITAL", "500000", float),
         max_picks=_num(env, "MAX_PICKS", "5", int),

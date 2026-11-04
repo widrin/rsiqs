@@ -29,7 +29,7 @@ def test_defaults(monkeypatch):
     s = config.get_settings()
     assert s.ark_api_key == "" and s.wecom_webhook_url == ""
     assert s.db_path == "data/rsiqs.sqlite"
-    assert s.ark_model == "doubao-seed-1-6-flash-250715"
+    assert s.ark_model == "doubao-seed-2-1-lite-260915"
     assert s.llm_base_url == ARK_URL
     assert s.capital == 500_000.0 and s.max_picks == 5
     assert (s.root / "config.py").exists()
@@ -62,7 +62,7 @@ def test_empty_env_falls_back_to_defaults(monkeypatch):
     s = config.get_settings()
     assert s.ark_api_key == ""
     assert s.db_path == "data/rsiqs.sqlite"
-    assert s.ark_model == "doubao-seed-1-6-flash-250715"
+    assert s.ark_model == "doubao-seed-2-1-lite-260915"
     assert s.llm_base_url == ARK_URL
     assert s.capital == 500_000.0 and s.max_picks == 5
 
@@ -139,7 +139,7 @@ def test_both_empty_fall_back_to_default(monkeypatch, tmp_path):
     monkeypatch.setenv("CAPITAL", "")
     s = config.get_settings(_env_file(tmp_path, "CAPITAL=", "ARK_MODEL=  ",
                                       f"LLM_BASE_URL={ARK_URL}", "MAX_PICKS"))
-    assert s.capital == 500_000.0 and s.ark_model == "doubao-seed-1-6-flash-250715" and s.max_picks == 5
+    assert s.capital == 500_000.0 and s.ark_model == "doubao-seed-2-1-lite-260915" and s.max_picks == 5
 
 
 def test_get_settings_does_not_write_environment(monkeypatch, tmp_path):
