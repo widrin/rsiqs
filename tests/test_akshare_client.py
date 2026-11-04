@@ -68,11 +68,71 @@ def test_daily_bars_normalizes_chinese_columns(monkeypatch):
     fake_ak(monkeypatch, stock_zh_a_hist=hist)
     df = AkClient().daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
     assert seen == {"symbol": "600000", "period": "daily", "start_date": "20260105",
-                    "end_date": "20260106", "adjust": "qfq", "timeout": akc.HTTP_TIMEOUT}
+                    "end_date": "20260106", "adjust": "qfq"}
     assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
     assert df["date"].tolist() == [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")]
     assert df["close"].tolist() == [10.2, 10.3]
     assert df["volume"].dtype == float
+
+
+def test_daily_bars_falls_back_to_sina_and_converts_volume(monkeypatch):
+    def em_fail(**kw):
+        raise ConnectionError("push2 rate limited")
+
+    raw = pd.DataFrame({
+        "date": ["2026-01-06", "2026-01-05"], "open": [10.1, 10.0], "high": [10.5, 10.4],
+        "low": [10.0, 9.9], "close": [10.3, 10.2], "volume": [120000, 100000],
+        "amount": [1.2e6, 1.0e6], "outstanding_share": [1.0, 1.0], "turnover": [0.01, 0.01],
+    })
+    seen = {}
+
+    def sina(**kw):
+        seen.update(kw)
+        return raw
+
+    fake_ak(monkeypatch, stock_zh_a_hist=em_fail, stock_zh_a_daily=sina)
+    df = AkClient().daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert seen == {"symbol": "sh600000", "start_date": "20260105", "end_date": "20260106", "adjust": "qfq"}
+    assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
+    assert df["volume"].tolist() == [1000.0, 1200.0]  # 新浪单位为股，除以 100 拉齐成手
+
+
+def test_sina_symbol_prefix():
+    assert akc._sina_symbol("600000") == "sh600000"
+    assert akc._sina_symbol("000001") == "sz000001"
+    assert akc._sina_symbol("300999") == "sz300999"
+    assert akc._sina_symbol("920000") == "bj920000"
+
+
+SINA_RAW = pd.DataFrame({
+    "date": ["2026-01-06", "2026-01-05"], "open": [10.1, 10.0], "high": [10.5, 10.4],
+    "low": [10.0, 9.9], "close": [10.3, 10.2], "volume": [120000, 100000],
+    "amount": [1.2e6, 1.0e6], "outstanding_share": [1.0, 1.0], "turnover": [0.01, 0.01],
+})
+
+
+def test_daily_bars_breaker_skips_em_until_cooldown_ends(monkeypatch, no_sleep):
+    calls = []
+
+    def em_fail(**kw):
+        calls.append(1)
+        raise ConnectionError("rate limited")
+
+    fake_ak(monkeypatch, stock_zh_a_hist=em_fail,
+            stock_zh_a_daily=lambda **kw: SINA_RAW)
+    c = AkClient(wait=0)
+    c.daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))  # with_retry 3 次全失败即触发熔断
+    assert len(calls) == 3 and c._em_skip_until > akc.time.time()
+    c.daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))  # 冷却期内：不再打东财
+    assert len(calls) == 3
+
+    c._em_skip_until = 0.0  # 模拟冷却结束，东财已恢复
+    fake_ak(monkeypatch, stock_zh_a_hist=lambda **kw: pd.DataFrame({
+        "日期": ["2026-01-06"], "股票代码": ["600000"], "开盘": [10.1], "收盘": [10.3],
+        "最高": [10.5], "最低": [10.0], "成交量": [1200], "成交额": [1.2e6], "振幅": [1.0]}),
+        stock_zh_a_daily=lambda **kw: pytest.fail("should use EM again"))
+    c.daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert c._em_fail_streak == 0  # 一次成功即清零计数
 
 
 def test_raw_bars_unadjusted_with_reference_prev_close(monkeypatch):
@@ -95,6 +155,30 @@ def test_raw_bars_unadjusted_with_reference_prev_close(monkeypatch):
     raw2 = raw.iloc[:1].assign(收盘=1523.45, 最高=1530.0, 最低=1500.0, 开盘=1505.0, 涨跌幅=1.56, 涨跌额=23.45)
     fake_ak(monkeypatch, stock_zh_a_hist=lambda **kw: raw2)
     assert AkClient().raw_bars("600519", date(2026, 1, 6), date(2026, 1, 6))["prev_close"].tolist() == [1500.0]
+
+
+def test_raw_bars_falls_back_to_sina_with_shifted_prev_close(monkeypatch, no_sleep):
+    def em_fail(**kw):
+        raise ConnectionError("rate limited")
+
+    raw = pd.DataFrame({  # 新浪默认不复权；7 日是除权日，推算的参考昨收（10.30）会偏高——东财恢复后增量修正
+        "date": ["2026-01-05", "2026-01-06", "2026-01-07"], "open": [10.0, 10.1, 6.95],
+        "high": [10.4, 10.5, 7.1], "low": [9.9, 10.0, 6.9], "close": [10.2, 10.3, 7.0],
+        "volume": [100000, 120000, 150000], "amount": [1.0e6, 1.2e6, 1.05e6],
+        "outstanding_share": [1.0, 1.0, 1.0], "turnover": [0.01, 0.01, 0.01]})
+    seen = {}
+
+    def sina(**kw):
+        seen.update(kw)
+        return raw
+
+    fake_ak(monkeypatch, stock_zh_a_hist=em_fail, stock_zh_a_daily=sina)
+    df = AkClient(wait=0).raw_bars("600000", date(2026, 1, 6), date(2026, 1, 7))
+    assert seen["start_date"] == "20251230"  # 向前多取 RAW_PREV_BUFFER 个自然日，保证有前一根收盘
+    assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
+    assert df["date"].tolist() == [pd.Timestamp("2026-01-06"), pd.Timestamp("2026-01-07")]  # 缓冲行已裁掉
+    assert df["prev_close"].tolist() == [10.2, 10.3]  # 前一根收盘
+    assert df["volume"].tolist() == [1200.0, 1500.0]  # 股 -> 手
 
 
 def test_daily_bars_empty_and_bad_columns(monkeypatch):

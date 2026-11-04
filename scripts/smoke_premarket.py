@@ -1,4 +1,4 @@
-"""手动冒烟：手选 3 只股票作为候选，走一遍 analyze（真实 Claude 深度分析）和 finalize（真实竞价快照 + 竞价确认）。
+"""手动冒烟：手选 3 只股票作为候选，走一遍 analyze（真实大模型深度分析）和 finalize（真实竞价快照 + 竞价确认）。
 运行：uv run python scripts/smoke_premarket.py [HH:MM]
 可选参数 HH:MM：analyze 完成后等到当天该时刻再 finalize（交易日 09:15 前启动并传 09:26，可验证真实竞价数据）。
 结果写入临时 sqlite，不影响正式库，也不推送。
@@ -57,7 +57,6 @@ def main() -> None:
     print("market_view:", view)
     for p in out:
         print(" ", p)
-    print(f"本次花费约 {llm.month_cost():.3f} 元")
 
 
 if __name__ == "__main__":

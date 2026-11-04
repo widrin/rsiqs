@@ -198,12 +198,11 @@ def test_fake_llm_dispatch_and_scripted_failure():
                                    stop=9.3, target=11.0, hold_days=5, reason="量化")], {})
     llm = FakeLLM(store, fail={"auction": LLMError("中转不可用")})
     llm.day = D
-    plan = llm.parse("analyze:active", "s", "u", PremarketPlan, effort="high",
-                     max_budget_usd=1.5, essential=True)
+    plan = llm.parse("analyze:active", "s", "u", PremarketPlan, timeout=900.0)
     assert [(p.code, p.action, p.entry_max) for p in plan.picks] == [("600001", "keep", 10.3)]
     assert llm.parse("review", "s", "u", ReviewOutput).lessons[0].evidence
     assert llm.parse("research", "s", "u", ResearchRound).done is True
     with pytest.raises(LLMError):
         llm.parse("auction:active", "s", "u", AuctionCheck)
     assert llm.purposes == ["analyze:active", "review", "research", "auction:active"]
-    assert llm.calls[0]["max_budget_usd"] == 1.5 and llm.calls[0]["essential"] is True
+    assert llm.calls[0]["timeout"] == 900.0

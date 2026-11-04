@@ -1,5 +1,5 @@
 """端到端：bootstrap -> 扫描+深度分析 -> 竞价定稿推送 -> 结算 -> 复盘 -> 次日。
-全程无网络、不启动 claude.exe（FakeLLM），时间全部通过 main(now=...) 注入。"""
+全程无网络、不请求方舟 API（FakeLLM），时间全部通过 main(now=...) 注入。"""
 from datetime import datetime, time
 
 import pytest
@@ -93,7 +93,6 @@ def test_two_trading_days_full_cycle(world):
     assert active["rules"] == [] and active["version"] == 1   # 未满 10 个交易日，不发布
     assert {"analyze:active", "analyze:candidate", "auction:active", "auction:candidate",
             "review"} <= set(llm.purposes)
-    assert all(c["essential"] for c in llm.calls if c["purpose"] != "review")  # 盘前不受月预算限制
 
 
 def test_relay_outage_degrades_to_quant_and_still_reports(world):

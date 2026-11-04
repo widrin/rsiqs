@@ -1,8 +1,8 @@
-"""研究循环：Claude 每轮返回分析和策略草稿（结构化输出，没有任何工具）。
+"""研究循环：LLM 每轮返回分析和策略草稿（结构化输出，没有任何工具）。
 
-Claude 只能返回代码文本。命名规则、import 白名单（strategies.sandbox.check_source）、编译、
-写文件、子进程评估、评估次数上限、留出集只回传通过/不通过、会话前、每次评估后和会话后的 engine/ 哈希校验和
-月度预算，全部由本模块的 Python 代码执行。
+模型只能返回代码文本。命名规则、import 白名单（strategies.sandbox.check_source）、编译、
+写文件、子进程评估、评估次数上限、留出集只回传通过/不通过、会话前和每次评估后的 engine/ 哈希校验，
+全部由本模块的 Python 代码执行。
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from agents.llm import LLM, BudgetExceeded
+from agents.llm import LLM
 from agents.playbook import git_commit
 from agents.premarket import HISTORY_DAYS
 from config import Settings
@@ -341,11 +341,6 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 """.replace("<<ALLOWED_IMPORTS>>", ", ".join(sorted(ALLOWED_IMPORTS))).replace("<<HISTORY_DAYS>>", str(HISTORY_DAYS))
 
 
-def _month_cost(store: Store) -> float:
-    t = date.today()
-    return store.month_llm_cost(t.year, t.month)
-
-
 def _rounded(obj, nd: int = 4):
     if isinstance(obj, float):
         return round(obj, nd)
@@ -420,11 +415,10 @@ def _commit_message(today: date, saved: list[dict]) -> str:
 
 
 def _summary(today: date, out: dict, error: str) -> str:
-    label = {"ok": "完成", "budget_exceeded": "本月 LLM 预算用完，提前结束",
-             "llm_error": "Claude 调用失败，提前结束", "error": "本地处理出错，提前结束"}[out["status"]]
+    label = {"ok": "完成", "llm_error": "LLM 调用失败，提前结束", "error": "本地处理出错，提前结束"}[out["status"]]
     saved = [r for r in out["results"] if r["saved"]]
     other = [r for r in out["results"] if not r["saved"]]
-    lines = [f"轮数 {out['rounds']}｜评估 {len(saved)} 次｜花费 {out['cost_cny']:.2f} 元"]
+    lines = [f"轮数 {out['rounds']}｜评估 {len(saved)} 次"]
     if error:
         lines.append(f"原因：{error[:300]}")
     if saved:
@@ -477,10 +471,10 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
 
 
 def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
-    """一次研究会话（最多 MAX_ROUNDS 轮）。返回 status/rounds/written/results/cost_cny/analysis。"""
+    """一次研究会话（最多 MAX_ROUNDS 轮）。返回 status/rounds/written/results/analysis。"""
     root = Path(settings.root)
     today = date.today()
-    out = {"status": "ok", "rounds": 0, "written": [], "results": [], "cost_cny": 0.0, "analysis": ""}
+    out = {"status": "ok", "rounds": 0, "written": [], "results": [], "analysis": ""}
 
     bad = verify(root)
     if bad:
@@ -488,13 +482,6 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
         return {**out, "status": "integrity_failed"}
 
     llm = llm or LLM(settings, store)
-    try:
-        llm.check_budget(False)
-    except BudgetExceeded as e:
-        notifier.send_text(f"RSIQS 研究会话 {today.isoformat()} 跳过：{e}")
-        return {**out, "status": "budget_exceeded"}
-
-    cost0 = _month_cost(store)
     error = ""
     history: list[dict] = []
     evals = 0
@@ -505,14 +492,8 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
             task = _round_task(rnd_no, MAX_EVALS_PER_SESSION - evals, store.trial_count())
             user = f"{context}\n\n{feedback}{task}"
             try:
-                llm.check_budget(False)
-                remaining_usd = (settings.monthly_budget_cny - _month_cost(store)) / settings.usd_cny
                 rnd = llm.parse(purpose="research", system=RESEARCH_SYSTEM, user=user, schema=ResearchRound,
-                                effort="high", timeout=1800.0, max_budget_usd=min(3.0, remaining_usd),
-                                essential=False)
-            except BudgetExceeded as e:
-                out["status"], error = "budget_exceeded", str(e)
-                break
+                                timeout=1800.0)
             except Exception as e:  # noqa: BLE001 — LLMError、超时、输出不合 schema 都在这里收口
                 log.warning("research round %d failed: %s: %s", rnd_no, type(e).__name__, e)
                 out["status"], error = "llm_error", f"{type(e).__name__}: {e}"
@@ -530,7 +511,6 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
     except Exception as e:  # noqa: BLE001 — 写文件、数据库等本地故障：停止，但照常做会后校验与提交
         log.exception("research session failed")
         out["status"], error = "error", f"{type(e).__name__}: {e}"
-    out["cost_cny"] = _month_cost(store) - cost0
 
     out.pop("setup_error", None)
     mid = out.pop("engine_changed", None) or []

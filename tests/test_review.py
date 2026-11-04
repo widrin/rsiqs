@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from agents import playbook, review
-from agents.llm import LLM, BudgetExceeded, LLMError
+from agents.llm import LLM, LLMError
 from agents.review import Lesson, ReviewOutput
 from config import Settings
 from engine.calendar import TradingCalendar
@@ -23,7 +23,8 @@ ACCOUNTS = ["q:baseline_momo", "h:active", "h:candidate", "bench:csi300"]
 
 
 def settings() -> Settings:
-    return Settings(anthropic_api_key="k", wecom_webhook_url="", root=Path("."))
+    return Settings(ark_api_key="k", wecom_webhook_url="", root=Path("."),
+                    llm_base_url="https://llm.invalid/v1")
 
 
 def pick(code):
@@ -48,10 +49,8 @@ class FakeLLM:
         self.result = result
         self.calls = []
 
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0,
-              essential=False):
-        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
-                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
+    def parse(self, purpose, system, user, schema, timeout=120.0):
+        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, timeout=timeout))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -120,8 +119,8 @@ def test_review_applies_lessons_to_candidate_only(env):
     llm = FakeLLM(OUTPUT)
     run(env, llm)
     call = llm.calls[0]
-    assert call["purpose"] == "review" and call["essential"] is False and call["effort"] == "medium"
-    assert call["timeout"] == review.REVIEW_TIMEOUT and call["max_budget_usd"] == review.REVIEW_BUDGET_USD
+    assert call["purpose"] == "review"
+    assert call["timeout"] == review.REVIEW_TIMEOUT == 300.0
     assert call["schema"] is ReviewOutput and call["system"] == "复盘系统提示"
     user = call["user"]
     for s in ("600001", "600002", "600003", "10.62", "BUY", "止盈", "旧规则", "未经 LLM 审核"):
@@ -154,17 +153,8 @@ def test_review_caps_lessons(env):
     assert len(playbook.load("candidate")["rules"]) == 1 + review.MAX_LESSONS
 
 
-def test_review_budget_exceeded_still_pushes_report(env):
-    run(env, FakeLLM(BudgetExceeded("over")))
-    assert len(env["notifier"].sent) == 1
-    assert "预算" in env["notifier"].sent[0] and "h:active" in env["notifier"].sent[0]
-    assert playbook.load("candidate")["rules"] == playbook.load("active")["rules"]
-    assert env["commits"] == []
-    assert env["releases"] == [D]  # 发布判断不依赖 LLM
-
-
 @pytest.mark.parametrize("exc", [LLMError("review: error_during_execution"),
-                                 subprocess.TimeoutExpired(["claude.exe"], 300.0), ValueError("bad")])
+                                 subprocess.TimeoutExpired(["traecli.exe"], 300.0), ValueError("bad")])
 def test_review_llm_failure_still_pushes_report(env, exc):
     run(env, FakeLLM(exc))
     assert len(env["notifier"].sent) == 1 and "复盘失败" in env["notifier"].sent[0]
@@ -307,24 +297,23 @@ def test_review_without_recommendations_skips_llm(env):
 
 
 def test_review_through_real_llm_wrapper(env, tmp_path):
-    """真实 LLM 封装 + 假 claude.exe 子进程：run_review 传给 parse 的参数必须被真实签名接受。"""
-    exe = tmp_path / "bin" / "claude.exe"
-    exe.parent.mkdir()
-    exe.write_bytes(b"")
+    """真实 LLM 封装 + 假 requests.post：run_review 传给 parse 的参数必须被真实签名接受。"""
     calls = []
 
-    def runner(args, **kw):
-        calls.append((args, kw))
-        out = {"type": "result", "subtype": "success", "is_error": False, "result": "",
-               "structured_output": OUTPUT.model_dump(), "total_cost_usd": 0.05,
-               "usage": {"input_tokens": 900, "output_tokens": 300}}
-        return SimpleNamespace(returncode=0, stdout=json.dumps(out).encode("utf-8"), stderr=b"")
+    def post(url, **kw):
+        calls.append((url, kw))
+        body = {"choices": [{"message": {"role": "assistant",
+                                         "content": json.dumps(OUTPUT.model_dump(), ensure_ascii=False)},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 300}}
+        return SimpleNamespace(status_code=200, text=json.dumps(body, ensure_ascii=False))
 
-    s = Settings(anthropic_api_key="k", wecom_webhook_url="", root=tmp_path, claude_exe=str(exe))
-    review.run_review(D, s, env["store"], LLM(s, env["store"], runner=runner), env["cache"], env["notifier"], CAL)
-    args, kw = calls[0]
-    assert args[args.index("--effort") + 1] == "medium"
-    assert args[args.index("--max-budget-usd") + 1] == f"{review.REVIEW_BUDGET_USD:.2f}"
-    assert kw["timeout"] == review.REVIEW_TIMEOUT and "600001" in kw["input"].decode("utf-8")
+    s = Settings(ark_api_key="k", wecom_webhook_url="", root=tmp_path,
+                 llm_base_url="https://llm.invalid/v1")
+    review.run_review(D, s, env["store"], LLM(s, env["store"], post=post), env["cache"], env["notifier"], CAL)
+    (url, kw), = calls
+    assert kw["timeout"] == review.REVIEW_TIMEOUT
+    assert kw["json"]["messages"][0]["content"].startswith("复盘系统提示")
+    assert "600001" in kw["json"]["messages"][1]["content"]
     assert [r["text"] for r in playbook.load("candidate")["rules"]] == ["旧规则", "主板竞价高开超过 5% 的候选否决"]
     assert "今日 600001 高开 6% 买入后回落。" in env["notifier"].sent[0]

@@ -9,7 +9,7 @@ import pandas as pd
 from pydantic import BaseModel
 
 from agents import playbook
-from agents.llm import LLM, BudgetExceeded
+from agents.llm import LLM
 from config import Settings
 from data.cache import BarCache
 from engine.calendar import TradingCalendar
@@ -22,8 +22,7 @@ LLM_ACCOUNTS = ("h:active", "h:candidate")
 MAX_LESSONS = 3
 BAR_LOOKBACK_DAYS = 10
 PLAYBOOK_FILES = ["playbook/active.json", "playbook/candidate.json"]
-REVIEW_TIMEOUT = 300.0  # claude.exe 子进程超时（秒）；复盘没有硬性截止时间
-REVIEW_BUDGET_USD = 1.0  # 单次复盘调用的 --max-budget-usd
+REVIEW_TIMEOUT = 300.0  # 方舟请求超时（秒）；复盘没有硬性截止时间
 
 
 class Lesson(BaseModel):
@@ -149,11 +148,8 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         try:
             out = llm.parse(purpose="review", system=playbook.load_prompt("review"),
                             user=_build_prompt(d, cand, sections, _bar_lines(cache, codes, d)),
-                            schema=ReviewOutput, effort="medium", timeout=REVIEW_TIMEOUT,
-                            max_budget_usd=REVIEW_BUDGET_USD, essential=False)
-        except BudgetExceeded:
-            summary = "本月 LLM 预算已用完，今日未做 LLM 复盘。"
-        except Exception as e:  # noqa: BLE001 - LLMError（CLI 报错/拒答/无结构化输出）、超时等：日报照发
+                            schema=ReviewOutput, timeout=REVIEW_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - LLMError（CLI 报错/拒答/无可解析 JSON）、超时等：日报照发
             log.warning("review LLM failed: %r", e)
             summary = f"LLM 复盘失败（{type(e).__name__}），今日 playbook 未更新。"
         else:

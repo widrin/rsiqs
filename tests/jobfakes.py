@@ -1,4 +1,4 @@
-"""jobs 测试共享假对象：不联网、不启动 claude.exe、不推送企业微信。"""
+"""tests 测试共享假对象：不联网、不请求方舟 API、不推送企业微信。"""
 from __future__ import annotations
 
 import shutil
@@ -54,13 +54,11 @@ def make_index(dates: list[date]) -> pd.Series:
 
 
 def make_settings(root: Path) -> Settings:
-    """claude_exe 指向一个空文件：万一某个测试漏打桩 common.make_llm，真实 LLM 在启动
-    子进程时立即报错，不会联网，也不会用到本机真实的 Claude Code。"""
-    stub = root / "bin" / "claude.exe"
-    stub.parent.mkdir(parents=True, exist_ok=True)
-    stub.write_bytes(b"")
-    return Settings(anthropic_api_key="test-key", wecom_webhook_url="", root=root,
-                    claude_exe=str(stub))
+    """ark_api_key 留空：万一某个测试漏打桩 common.make_llm，真实 LLM.parse 会在发请求前
+    因未配置 Key 立即抛 LLMError，不会联网，也不会用到本机任何真实凭据。
+    base_url 指向 .invalid 域名（保留域，DNS 必然失败）：双保险。"""
+    return Settings(ark_api_key="", wecom_webhook_url="", root=root,
+                    llm_base_url="https://llm.invalid/v1")
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -205,8 +203,8 @@ class FakeCache:
 
 
 class FakeLLM:
-    """agents.llm.LLM 替身：parse 同签名，按 schema 分派；不联网、不启动 claude.exe、不计费。
-    fail = {purpose 前缀: 异常}：命中的调用先记录再抛出（模拟中转失效、超时、拒答）。"""
+    """agents.llm.LLM 替身：parse 同签名，按 schema 分派；不联网、不请求方舟、不计费。
+    fail = {purpose 前缀: 异常}：命中的调用先记录再抛出（模拟 CLI 故障、超时、拒答）。"""
 
     def __init__(self, store: Store | None = None, fail: dict | None = None):
         self.store = store
@@ -218,25 +216,17 @@ class FakeLLM:
     def purposes(self) -> list[str]:
         return [c["purpose"] for c in self.calls]
 
-    def check_budget(self, essential):
-        return None
-
-    def month_cost(self) -> float:
-        return 0.0
-
     def _candidates(self) -> list:
         loaded = self.store.load_candidates(self.day) if self.store is not None and self.day else None
         return loaded[0] if loaded else []
 
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0,
-              max_budget_usd=1.0, essential=False):
+    def parse(self, purpose, system, user, schema, timeout=120.0):
         from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
         from agents.research import ResearchRound
         from agents.review import Lesson, ReviewOutput
 
         self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema,
-                               effort=effort, timeout=timeout, max_budget_usd=max_budget_usd,
-                               essential=essential))
+                               timeout=timeout))
         for prefix, exc in self.fail.items():
             if purpose.startswith(prefix):
                 raise exc

@@ -105,7 +105,7 @@ def incumbent_strategy(store: Store) -> str:
 
 
 def make_llm(settings, store: Store):
-    """LLM 工厂：agents.llm.LLM（经本机 claude.exe 无头模式调用 Claude）；测试中打桩为 FakeLLM。"""
+    """LLM 工厂：agents.llm.LLM（直连火山方舟 OpenAI 兼容 API）；测试中打桩为 FakeLLM。"""
     from agents.llm import LLM
 
     return LLM(settings, store)

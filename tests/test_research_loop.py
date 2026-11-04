@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agents import research
-from agents.llm import BudgetExceeded, LLMError
+from agents.llm import LLMError
 from agents.research import RESEARCH_SYSTEM, Draft, ResearchRound, run_research
 from config import Settings
 from engine import integrity
@@ -59,29 +59,19 @@ def report(name, gate=False, holdout=None):
 
 
 class FakeLLM:
-    """按顺序返回预设结果（ResearchRound 或异常）；像真 LLM 一样先查预算，成功后记账。"""
+    """按顺序返回预设结果（ResearchRound 或异常）；像真 LLM 一样成功后记账。"""
 
-    def __init__(self, settings, store, script, round_cost=0.5):
-        self.settings, self.store = settings, store
+    def __init__(self, store, script):
+        self.store = store
         self.script = list(script)
-        self.round_cost = round_cost
         self.calls: list[dict] = []
 
-    def check_budget(self, essential):
-        t = date.today()
-        if not essential and self.store.month_llm_cost(t.year, t.month) >= self.settings.monthly_budget_cny:
-            raise BudgetExceeded("本月 LLM 预算已用完")
-
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0,
-              max_budget_usd=1.0, essential=False):
-        assert max_budget_usd > 0, "单次预算必须为正"
-        self.check_budget(essential)
-        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
-                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
+    def parse(self, purpose, system, user, schema, timeout=120.0):
+        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, timeout=timeout))
         item = self.script.pop(0)
         if isinstance(item, BaseException):
             raise item
-        self.store.add_llm_usage(purpose, 1000, 200, self.round_cost)
+        self.store.add_llm_usage(purpose, 1000, 200, 0.0)
         return item
 
 
@@ -112,8 +102,8 @@ def env(tmp_path, monkeypatch):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(PROJECT / rel, tmp_path / rel)
     integrity.write_manifest(tmp_path)  # 真实清单：之后 verify(tmp_path) == []
-    settings = Settings(anthropic_api_key="", wecom_webhook_url="", monthly_budget_cny=50.0,
-                        usd_cny=7.2, root=tmp_path)
+    settings = Settings(ark_api_key="", wecom_webhook_url="", root=tmp_path,
+                        llm_base_url="https://llm.invalid/v1")
     store = Store(":memory:")
     store.set_status("baseline_momo", "incumbent", date(2026, 10, 1))
     commits = []
@@ -127,8 +117,8 @@ def env(tmp_path, monkeypatch):
                            evals=fake_eval, root=tmp_path)
 
 
-def make_llm(e, *script, cost=0.5) -> FakeLLM:
-    return FakeLLM(e.settings, e.store, script, round_cost=cost)
+def make_llm(e, *script) -> FakeLLM:
+    return FakeLLM(e.store, script)
 
 
 def run(e, llm):
@@ -157,10 +147,8 @@ def test_multi_round_feedback_contains_previous_results(env):
     first, second = llm.calls
     for c in llm.calls:
         assert c["purpose"] == "research" and c["system"] == RESEARCH_SYSTEM
-        assert c["schema"] is ResearchRound and c["effort"] == "high"
-        assert c["timeout"] == 1800.0 and c["essential"] is False
+        assert c["schema"] is ResearchRound and c["timeout"] == 1800.0
         assert "class Strategy(Protocol)" in c["user"]  # 每轮都带完整背景
-    assert first["max_budget_usd"] == 3.0                 # 预算充足时取上限 3 美元
     assert "前几轮" not in first["user"]
     fb = second["user"]
     assert "第一轮：换手动量" in fb
@@ -228,39 +216,8 @@ def test_stops_after_max_rounds(env):
     assert e.evals.names == ["a_one", "b_two", "c_three"]
 
 
-def test_budget_exceeded_mid_session_stops_and_keeps_earlier_work(env):
-    e = env
-    llm = make_llm(e, rnd(d("a_one")), rnd(d("b_two")), cost=60.0)  # 第 1 轮就花掉 60 元 > 预算 50 元
-    out = run(e, llm)
-    assert out["status"] == "budget_exceeded" and out["rounds"] == 1 and len(llm.calls) == 1
-    assert out["cost_cny"] == pytest.approx(60.0)
-    assert e.commits[0][0] == ["strategies/a_one.py"]
-    assert "预算" in e.notifier.sent[-1]
-
-
-def test_budget_exhausted_before_start_skips_session(env):
-    e = env
-    e.store.add_llm_usage("premarket:active", 0, 0, 50.0)
-    llm = make_llm(e, rnd(d("a_one")))
-    out = run(e, llm)
-    assert out == {"status": "budget_exceeded", "rounds": 0, "written": [], "results": [],
-                   "cost_cny": 0.0, "analysis": ""}
-    assert llm.calls == [] and e.evals.names == [] and e.commits == []
-    assert len(e.notifier.sent) == 1 and "跳过" in e.notifier.sent[0]
-
-
-def test_max_budget_usd_and_cost_follow_month_budget(env):
-    e = env
-    e.store.add_llm_usage("review", 0, 0, 40.0)  # 本月已花 40 元，剩 10 元
-    llm = make_llm(e, rnd(d("a_one")), rnd(done=True), cost=0.5)
-    out = run(e, llm)
-    assert llm.calls[0]["max_budget_usd"] == pytest.approx(10.0 / 7.2)
-    assert llm.calls[1]["max_budget_usd"] == pytest.approx(9.5 / 7.2)
-    assert out["cost_cny"] == pytest.approx(1.0)  # 本次会话的月度花费增量
-
-
 @pytest.mark.parametrize("exc", [LLMError("research: error_during_execution 中转返回 502"),
-                                 subprocess.TimeoutExpired("claude.exe", 1800)])
+                                 subprocess.TimeoutExpired("traecli.exe", 1800)])
 def test_llm_failure_aborts_cleanly(env, exc):
     e = env
     out = run(e, make_llm(e, exc))
@@ -272,10 +229,10 @@ def test_llm_failure_aborts_cleanly(env, exc):
 
 def test_llm_failure_in_later_round_still_commits_earlier_drafts(env):
     e = env
-    out = run(e, make_llm(e, rnd(d("a_one")), LLMError("research: error_max_budget_usd")))
+    out = run(e, make_llm(e, rnd(d("a_one")), LLMError("research: 中转返回 502")))
     assert out["status"] == "llm_error" and out["rounds"] == 1 and out["written"] == ["a_one"]
     assert e.commits[0][0] == ["strategies/a_one.py"]
-    assert "error_max_budget_usd" in e.notifier.sent[-1]
+    assert "中转返回 502" in e.notifier.sent[-1]
 
 
 def _touch_engine(root):
@@ -309,8 +266,8 @@ def test_commit_summary_and_return_shape(env):
     e.evals.outcomes["a_one"] = report("a_one", gate=True, holdout=True)
     llm = make_llm(e, rnd(d("a_one"), d("b_two"), done=True, analysis="结论：a_one 值得进影子盘观察"))
     out = run(e, llm)
-    assert set(out) == {"status", "rounds", "written", "results", "cost_cny", "analysis"}
-    assert out["written"] == ["a_one", "b_two"] and out["cost_cny"] == pytest.approx(0.5)
+    assert set(out) == {"status", "rounds", "written", "results", "analysis"}
+    assert out["written"] == ["a_one", "b_two"]
     assert e.store.get_status("a_one") == "shadow" and e.store.get_status("b_two") == "candidate"
     paths, message = e.commits[0]
     assert paths == ["strategies/a_one.py", "strategies/b_two.py"]
@@ -318,7 +275,7 @@ def test_commit_summary_and_return_shape(env):
     assert "进入影子盘" in message
     summary = e.notifier.sent[-1]
     assert "研究会话" in summary and "a_one" in summary and "进入影子盘" in summary
-    assert "0.50 元" in summary and "结论：a_one 值得进影子盘观察" in summary
+    assert "轮数 1｜评估 2 次" in summary and "结论：a_one 值得进影子盘观察" in summary
 
 
 def test_default_llm_is_built_from_settings(env, monkeypatch):
@@ -394,7 +351,7 @@ def test_engine_change_mid_session_stops_and_reverts_shadow(env):
     llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
     out = run(e, llm)
     assert out["status"] == "integrity_failed" and set(out) == {"status", "rounds", "written", "results",
-                                                               "cost_cny", "analysis"}
+                                                               "analysis"}
     assert e.evals.names == ["a_one"] and len(llm.calls) == 1   # 不再评估、不再请求 LLM
     assert e.store.get_status("a_one") == "candidate"           # 不参与前向模拟
     assert e.store.strategies_with_status("shadow") == [] and e.commits == []
@@ -439,7 +396,7 @@ def test_setup_error_stops_the_session_with_alert(env, monkeypatch):
     llm = make_llm(e, rnd(d("a_one"), d("b_two")), rnd(d("c_three")))
     out = run(e, llm)
     assert out["status"] == "error" and e.evals.names == ["a_one"] and len(llm.calls) == 1  # 不再评估、不再请求 LLM
-    assert set(out) == {"status", "rounds", "written", "results", "cost_cny", "analysis"}
+    assert set(out) == {"status", "rounds", "written", "results", "analysis"}
     assert e.store.trial_count() == 0
     msg = e.notifier.sent[-1]
     assert "告警" in msg and "评估环境出错" in msg and "a_one" in msg

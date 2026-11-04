@@ -39,7 +39,8 @@ def env(tmp_path):
     for rel in SOURCES:  # 用真实源码搭一个临时项目根目录
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(PROJECT / rel, tmp_path / rel)
-    settings = Settings(anthropic_api_key="", wecom_webhook_url="", root=tmp_path)
+    settings = Settings(ark_api_key="", wecom_webhook_url="", root=tmp_path,
+                        llm_base_url="https://llm.invalid/v1")
     store = Store(":memory:")
     store.set_status("baseline_momo", "incumbent", date(2026, 10, 1))
     return settings, store

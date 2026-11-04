@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from agents import playbook, premarket
-from agents.llm import BudgetExceeded, LLMError
+from agents.llm import LLMError
 from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
 from pydantic import ValidationError
 from config import Settings
@@ -22,12 +22,13 @@ D = dt.date(2026, 10, 16)
 PREV = dt.date(2026, 10, 15)
 CODES = [f"600{i:03d}" for i in range(20)]
 CAL = TradingCalendar(pd.bdate_range("2026-09-01", "2026-12-31").date)
-LLM_ERRORS = [LLMError("cli error"), BudgetExceeded("budget"), subprocess.TimeoutExpired("claude.exe", 90.0),
+LLM_ERRORS = [LLMError("cli error"), subprocess.TimeoutExpired("traecli.exe", 90.0),
               ValueError("bad output")]
 
 
 def settings(**kw) -> Settings:
-    base = dict(anthropic_api_key="k", wecom_webhook_url="", root=Path("."), max_picks=3)
+    base = dict(ark_api_key="k", wecom_webhook_url="", root=Path("."), max_picks=3,
+                llm_base_url="https://llm.invalid/v1")
     base.update(kw)
     return Settings(**base)
 
@@ -118,10 +119,8 @@ class FakeLLM:
         self.results = results
         self.calls = []
 
-    def parse(self, purpose, system, user, schema, effort="medium", timeout=120.0, max_budget_usd=1.0,
-              essential=False):
-        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, effort=effort,
-                               timeout=timeout, max_budget_usd=max_budget_usd, essential=essential))
+    def parse(self, purpose, system, user, schema, timeout=120.0):
+        self.calls.append(dict(purpose=purpose, system=system, user=user, schema=schema, timeout=timeout))
         r = self.results[purpose]
         if isinstance(r, Exception):
             raise r
@@ -221,7 +220,6 @@ def test_analyze_saves_plan_and_drops_non_candidates(store):
     assert premarket.load_plan(store, D, "candidate") is None
     call = llm.calls[0]
     assert call["schema"] is PremarketPlan and call["system"] == "盘前系统提示"
-    assert call["effort"] == "high" and call["essential"] is True and call["max_budget_usd"] == 1.5
     assert call["timeout"] == premarket.ANALYZE_TIMEOUT == 900.0
     for s in ("ACTIVE规则", "600005", "关于股东减持计划的公告", "600001 中标大单", "隔夜美股收涨", "涨停 11.00",
               "买≤10.30（+3.0%）"):
@@ -431,7 +429,6 @@ def test_finalize_confirm_vetoes_but_never_adds(store):
     assert reviewed is True and view == "偏强（竞价确认：竞价平稳）"
     call = llm.calls[0]
     assert call["system"] == premarket.AUCTION_SYSTEM and call["schema"] is AuctionCheck
-    assert call["effort"] == "low" and call["essential"] is True and call["max_budget_usd"] == 0.3
     assert call["timeout"] == premarket.AUCTION_TIMEOUT == 90.0
     for s in ("600001", "600003", "竞价 10.20（+2.00%）", "500.00万", "占20日均额 2.50%", "涨停 11.00",
               "计划理由600002", "偏强", "有竞价 6 只：高开 6"):  # 竞价概况只统计候选（只取候选的报价）

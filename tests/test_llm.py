@@ -1,14 +1,12 @@
-import datetime as dt
 import json
-import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 from pydantic import BaseModel, Field
 
 from agents import llm as llm_mod
-from agents.llm import LLM, BudgetExceeded, LLMError, build_args, child_env, find_claude_exe, strict_schema
+from agents.llm import LLM, LLMError, strict_schema
 from config import Settings
 from engine.store import Store
 
@@ -27,49 +25,41 @@ class Outer(BaseModel):
 GOOD = {"view": "震荡", "items": [{"code": "600000", "score": 0.7}], "note": ""}
 SYSTEM = "你是测试助手。\n只输出 JSON。"
 USER = "请分析 600000 浦发银行的竞价情况"
-NPM_EXE = Path("node_modules/@anthropic-ai/claude-code/bin/claude.exe")
 
 
-def cli_output(structured=GOOD, *, is_error=False, subtype="success", result="", cost=0.0215):
-    """claude -p --output-format json 的 stdout 结构（字段与实测一致）。"""
-    return {"type": "result", "subtype": subtype, "is_error": is_error, "result": result,
-            "structured_output": structured, "total_cost_usd": cost, "duration_ms": 15000, "num_turns": 2,
-            "usage": {"input_tokens": 1200, "cache_creation_input_tokens": 3000,
-                      "cache_read_input_tokens": 500, "output_tokens": 350}}
+def ark_body(content=None, *, usage=None):
+    """方舟 /chat/completions 200 响应体（字段与 API 文档一致）。"""
+    if content is None:
+        content = json.dumps(GOOD, ensure_ascii=False)
+    return {"id": "c-1", "choices": [{"message": {"role": "assistant", "content": content},
+                                      "finish_reason": "stop"}],
+            "usage": usage or {"prompt_tokens": 4700, "completion_tokens": 350,
+                               "prompt_tokens_details": {"cached_tokens": 0}}}
 
 
-class FakeRunner:
-    """subprocess.run 替身：记录参数，在调用期间读出系统提示词文件，返回预设 stdout。"""
+class FakePost:
+    """requests.post 替身：记录参数，返回预设响应（.status_code/.text，llm 用 json.loads 解析）。"""
 
-    def __init__(self, payload=None, returncode=0, stdout=None, exc=None):
-        self.stdout = stdout if stdout is not None else json.dumps(payload or cli_output()).encode("utf-8")
-        self.returncode = returncode
+    def __init__(self, *, status=200, body=None, text=None, exc=None):
+        if body is None and text is None and exc is None:
+            body = ark_body()
+        self.status = status
+        self.text = text if text is not None else json.dumps(body, ensure_ascii=False)
         self.exc = exc
-        self.calls: list[tuple[list[str], dict]] = []
-        self.system_seen: list[bytes] = []
+        self.calls: list[tuple[str, dict]] = []
 
-    def __call__(self, args, **kwargs):
-        self.calls.append((args, kwargs))
-        self.system_seen.append(Path(args[args.index("--system-prompt-file") + 1]).read_bytes())
+    def __call__(self, url, **kwargs):
+        self.calls.append((url, kwargs))
         if self.exc is not None:
             raise self.exc
-        return SimpleNamespace(args=args, returncode=self.returncode, stdout=self.stdout, stderr=b"")
-
-    def system_file(self, i=0) -> Path:
-        args = self.calls[i][0]
-        return Path(args[args.index("--system-prompt-file") + 1])
+        return SimpleNamespace(status_code=self.status, text=self.text)
 
 
 def make_settings(root, **kw) -> Settings:
-    base = dict(anthropic_api_key="", wecom_webhook_url="", root=root, usd_cny=7.2)
+    base = dict(ark_api_key="ark-key", wecom_webhook_url="", root=root,
+                llm_base_url="https://ark.cn-beijing.volces.com/api/v3")
     base.update(kw)
     return Settings(**base)
-
-
-def touch(p: Path) -> Path:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(b"")
-    return p
 
 
 @pytest.fixture
@@ -79,17 +69,7 @@ def store():
 
 @pytest.fixture
 def settings(tmp_path):
-    return make_settings(tmp_path, claude_exe=str(touch(tmp_path / "bin" / "claude.exe")))
-
-
-@pytest.fixture
-def no_claude(monkeypatch, tmp_path):
-    """隔离本机安装：shutil.which 只认测试登记的路径，家目录指向 tmp_path/home。"""
-    found: dict[str, str] = {}
-    monkeypatch.setattr(llm_mod.shutil, "which", lambda name: found.get(name))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    return found
+    return make_settings(tmp_path)
 
 
 def usage_rows(store):
@@ -97,8 +77,13 @@ def usage_rows(store):
 
 
 def this_month_cost(store):
+    import datetime as dt
     t = dt.date.today()
     return store.month_llm_cost(t.year, t.month)
+
+
+def chat_url(settings: Settings) -> str:
+    return settings.llm_base_url.rstrip("/") + "/chat/completions"
 
 
 def test_strict_schema_nested():
@@ -110,218 +95,105 @@ def test_strict_schema_nested():
     assert sorted(inner["required"]) == ["code", "score"]
 
 
-def test_build_args_is_the_verified_command(tmp_path):
-    s = make_settings(tmp_path)
-    args = build_args(s, r"C:\cc\claude.exe", tmp_path / "sys.md", '{"type": "object"}', "high", 1.5)
-    assert args == [r"C:\cc\claude.exe", "-p", "--bare", "--output-format", "json",
-                    "--model", "claude-opus-5-5", "--effort", "high", "--tools", "",
-                    "--no-session-persistence", "--setting-sources", "", "--max-budget-usd", "1.50",
-                    "--system-prompt-file", str(tmp_path / "sys.md"), "--json-schema", '{"type": "object"}']
-    with pytest.raises(ValueError):
-        build_args(s, "claude.exe", "sys.md", "{}", "extreme", 1.0)
-
-
-def test_child_env_strips_claudecode_and_inherited_anthropic_vars(monkeypatch, tmp_path):
-    monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "inherited-key")
-    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-other")
-    monkeypatch.setenv("RSIQS_KEEP_ME", "yes")
-    relay = make_settings(tmp_path, anthropic_base_url="https://relay.example.invalid", anthropic_auth_token="tok")
-    env = child_env(relay)
-    assert "CLAUDECODE" not in env and env["RSIQS_KEEP_ME"] == "yes"
-    assert {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")} == {
-        "ANTHROPIC_BASE_URL": "https://relay.example.invalid", "ANTHROPIC_AUTH_TOKEN": "tok"}
-    official = child_env(make_settings(tmp_path, anthropic_api_key="sk-test"))
-    assert {k: v for k, v in official.items() if k.startswith("ANTHROPIC_")} == {"ANTHROPIC_API_KEY": "sk-test"}
-
-
-def test_parse_runs_cli_and_returns_model(store, settings, tmp_path):
-    runner = FakeRunner()
-    out = LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, effort="low", timeout=30.0)
+def test_parse_posts_ark_request_and_returns_model(store, settings):
+    post = FakePost()
+    out = LLM(settings, store, post=post).parse("unit", SYSTEM, USER, Outer, timeout=30.0)
     assert isinstance(out, Outer) and out.view == "震荡" and out.items[0].code == "600000"
-    assert len(runner.calls) == 1
-    args, kw = runner.calls[0]
-    assert args[0] == settings.claude_exe and args[1:3] == ["-p", "--bare"]
-    assert args[args.index("--tools") + 1] == ""
-    assert args[args.index("--model") + 1] == "claude-opus-5-5"
-    assert args[args.index("--effort") + 1] == "low"
-    assert args[args.index("--max-budget-usd") + 1] == "1.00"
-    schema_json = args[args.index("--json-schema") + 1]
-    assert schema_json == json.dumps(strict_schema(Outer), ensure_ascii=True)
-    assert schema_json.isascii() and "股票代码" in json.loads(schema_json)["$defs"]["Inner"]["properties"]["code"][
-        "description"]
-    assert args == build_args(settings, settings.claude_exe, runner.system_file(), schema_json, "low", 1.0)
-    assert kw["input"] == USER.encode("utf-8")
-    assert kw["capture_output"] is True and kw["timeout"] == 30.0 and kw["cwd"] == str(tmp_path)
-    assert runner.system_seen == [SYSTEM.encode("utf-8")]  # 调用期间文件内容 == 系统提示词
-    assert runner.system_file().suffix == ".md" and not runner.system_file().exists()  # 调用后删除
+    assert len(post.calls) == 1
+    url, kw = post.calls[0]
+    assert url == chat_url(settings)
+    assert kw["headers"] == {"Authorization": "Bearer ark-key"}
+    assert kw["timeout"] == 30.0
+    payload = kw["json"]
+    assert payload["model"] == settings.ark_model
+    assert payload["messages"] == [{"role": "system", "content": SYSTEM},
+                                   {"role": "user", "content": USER}]
+    assert payload["thinking"] == llm_mod.THINKING and payload["max_tokens"] == llm_mod.MAX_TOKENS
+    rf = payload["response_format"]
+    assert rf["type"] == "json_schema" and rf["json_schema"]["name"] == "Outer"
+    assert rf["json_schema"]["schema"] == strict_schema(Outer)
+    assert "股票代码" in rf["json_schema"]["schema"]["$defs"]["Inner"]["properties"]["code"]["description"]
 
 
-def test_parse_passes_child_env(monkeypatch, store, tmp_path):
-    monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://inherited.invalid")
-    s = make_settings(tmp_path, claude_exe=str(touch(tmp_path / "claude.exe")), anthropic_api_key="sk-test")
-    runner = FakeRunner()
-    LLM(s, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
-    env = runner.calls[0][1]["env"]
-    assert "CLAUDECODE" not in env
-    assert {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")} == {"ANTHROPIC_API_KEY": "sk-test"}
+def test_custom_base_url_switches_provider(store, tmp_path):
+    s = make_settings(tmp_path, llm_base_url="https://api.deepseek.com/v1/")
+    post = FakePost()
+    LLM(s, store, post=post).parse("unit", SYSTEM, USER, Outer)
+    assert post.calls[0][0] == "https://api.deepseek.com/v1/chat/completions"  # 结尾斜杠已去掉
 
 
-def test_usage_tokens_and_cost_recorded(store, settings):
-    LLM(settings, store, runner=FakeRunner()).parse("unit", SYSTEM, USER, Outer, max_budget_usd=0.3)
+def test_usage_tokens_recorded_cost_is_zero(store, settings):
+    body = ark_body(usage={"prompt_tokens": 4700, "completion_tokens": 350})
+    LLM(settings, store, post=FakePost(body=body)).parse("unit", SYSTEM, USER, Outer)
     [(purpose, tokens_in, tokens_out, cost)] = usage_rows(store)
-    assert (purpose, tokens_in, tokens_out) == ("unit", 1200 + 3000 + 500, 350)
-    assert cost == pytest.approx(0.0215 * 7.2)
-    assert this_month_cost(store) == pytest.approx(0.0215 * 7.2)
+    assert (purpose, tokens_in, tokens_out, cost) == ("unit", 4700, 350, 0.0)
+    assert this_month_cost(store) == 0.0  # 方舟价格随模型变动，不在此折算，只记 token
 
 
-def test_cli_error_raises_but_usage_recorded(store, settings):
-    runner = FakeRunner(cli_output(structured=None, is_error=True, subtype="error_max_budget_usd",
-                                   result="Reached maximum budget", cost=0.5), returncode=1)
-    with pytest.raises(LLMError, match="error_max_budget_usd"):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
-    assert this_month_cost(store) == pytest.approx(0.5 * 7.2)
-    assert not runner.system_file().exists()
+def test_extract_json_tolerates_markdown_fence():
+    text = "说明如下：\n```json\n" + json.dumps(GOOD) + "\n```"
+    assert llm_mod._extract_json(text) == GOOD
 
 
-NO_STRUCTURED = {k: v for k, v in cli_output().items() if k != "structured_output"}
-
-
-@pytest.mark.parametrize("payload, returncode", [
-    (cli_output(is_error=True, result="Claude 拒绝回答"), 0),  # is_error
-    (cli_output(), 1),  # 退出码非 0
-    (cli_output(structured=None, result="纯文本回答"), 0),  # structured_output 为 null
-    (NO_STRUCTURED, 0),  # 没有 structured_output 字段
+@pytest.mark.parametrize("status, text", [
+    (401, '{"error":{"message":"invalid api key"}}'),
+    (429, '{"error":{"message":"rate limit"}}'),
+    (500, 'internal error'),
 ])
-def test_cli_failures_raise_llm_error(store, settings, payload, returncode):
-    with pytest.raises(LLMError):
-        LLM(settings, store, runner=FakeRunner(payload, returncode=returncode)).parse("unit", SYSTEM, USER, Outer)
-    assert len(usage_rows(store)) == 1
+def test_http_error_raises_llm_error_without_usage(store, settings, status, text):
+    with pytest.raises(LLMError, match=f"HTTP {status}"):
+        LLM(settings, store, post=FakePost(status=status, text=text)).parse("unit", SYSTEM, USER, Outer)
+    assert usage_rows(store) == []  # 非 200 没有产出，不记账
 
 
-@pytest.mark.parametrize("stdout", [b"", b"Error: something went wrong", b"\xff\xfe\x00", b"[1, 2]"])
-def test_non_json_stdout_raises_llm_error(store, settings, stdout):
-    runner = FakeRunner(stdout=stdout, returncode=1)
-    with pytest.raises(LLMError):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
-    assert usage_rows(store) == []
-    assert not runner.system_file().exists()
+@pytest.mark.parametrize("content", [
+    "纯文本回答，没有 JSON",
+    "{'view': 单引号坏 JSON}",
+])
+def test_200_without_json_raises_llm_error_and_records_usage(store, settings, content):
+    with pytest.raises(LLMError, match="没有可解析的 JSON"):
+        LLM(settings, store, post=FakePost(body=ark_body(content=content))).parse("unit", SYSTEM, USER, Outer)
+    assert len(usage_rows(store)) == 1  # 200 已产出 token，先记账再解析
 
 
 def test_structured_output_failing_validation_raises_llm_error(store, settings):
-    runner = FakeRunner(cli_output(structured={"view": 1}))
+    post = FakePost(body=ark_body(content=json.dumps({"view": 1})))
     with pytest.raises(LLMError, match="Outer"):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
+        LLM(settings, store, post=post).parse("unit", SYSTEM, USER, Outer)
     assert len(usage_rows(store)) == 1
 
 
-def test_timeout_propagates_and_cleans_up(store, settings):
-    runner = FakeRunner(exc=subprocess.TimeoutExpired(["claude.exe"], 5.0))
-    with pytest.raises(subprocess.TimeoutExpired):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, timeout=5.0, max_budget_usd=0.3)
-    assert runner.system_seen == [SYSTEM.encode("utf-8")] and not runner.system_file().exists()
-    # 超时时服务端可能已经计费，CLI 来不及报告：按单次上限保守记一笔，月度预算不会少算
+def test_missing_choices_raises_llm_error_after_usage(store, settings):
+    post = FakePost(body={"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 0}})
+    with pytest.raises(LLMError, match="choices"):
+        LLM(settings, store, post=post).parse("unit", SYSTEM, USER, Outer)
+    assert len(usage_rows(store)) == 1
+
+
+def test_non_json_body_raises_llm_error_without_usage(store, settings):
+    with pytest.raises(LLMError, match="响应不是 JSON"):
+        LLM(settings, store, post=FakePost(text="<html>网关错误</html>")).parse("unit", SYSTEM, USER, Outer)
+    assert usage_rows(store) == []
+
+
+def test_timeout_records_zero_usage(store, settings):
+    post = FakePost(exc=requests.ReadTimeout("read timed out"))
+    with pytest.raises(LLMError, match="超时"):
+        LLM(settings, store, post=post).parse("unit", SYSTEM, USER, Outer, timeout=5.0)
     [(purpose, _, _, cost)] = usage_rows(store)
-    assert purpose == "unit:timeout" and cost == pytest.approx(0.3 * 7.2)
+    assert purpose == "unit:timeout" and cost == 0.0  # 请求已发出，服务端可能已计费
 
 
-def test_launch_failure_raises_llm_error(store, settings):
-    runner = FakeRunner(exc=FileNotFoundError(2, "系统找不到指定的文件。"))
-    with pytest.raises(LLMError, match="claude.exe"):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
-    assert not runner.system_file().exists() and usage_rows(store) == []
+def test_connection_error_raises_llm_error_without_usage(store, settings):
+    with pytest.raises(LLMError, match="网络错误"):
+        LLM(settings, store, post=FakePost(exc=requests.ConnectionError("refused"))).parse(
+            "unit", SYSTEM, USER, Outer)
+    assert usage_rows(store) == []
 
 
-def test_budget_exceeded_non_essential_skips_runner(no_claude, store, tmp_path):
-    store.add_llm_usage("old", 0, 0, 300.0)
-    runner = FakeRunner()
-    llm = LLM(make_settings(tmp_path, monthly_budget_cny=300.0), store, runner=runner)
-    with pytest.raises(BudgetExceeded):  # 先查预算：连 claude.exe 都不用找
+def test_missing_key_raises_llm_error_before_request(store, tmp_path):
+    post = FakePost()
+    llm = LLM(make_settings(tmp_path, ark_api_key=""), store, post=post)
+    with pytest.raises(LLMError, match="ARK_API_KEY"):
         llm.parse("unit", SYSTEM, USER, Outer)
-    assert runner.calls == []
-
-
-def test_budget_exceeded_essential_passes(store, settings):
-    store.add_llm_usage("old", 0, 0, 300.0)
-    runner = FakeRunner()
-    assert LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, essential=True).view == "震荡"
-    assert len(runner.calls) == 1
-
-
-def test_exe_resolved_lazily_and_cached(monkeypatch, store, settings):
-    lookups = []
-    monkeypatch.setattr(llm_mod, "find_claude_exe", lambda s: lookups.append(s) or s.claude_exe)
-    runner = FakeRunner()
-    llm = LLM(settings, store, runner=runner)
-    assert lookups == []  # 构造时不查找
-    llm.parse("a", SYSTEM, USER, Outer)
-    llm.parse("b", SYSTEM, USER, Outer)
-    assert len(lookups) == 1 and len(runner.calls) == 2
-
-
-def test_missing_exe_raises_llm_error_at_parse(no_claude, store, tmp_path):
-    runner = FakeRunner()
-    llm = LLM(make_settings(tmp_path), store, runner=runner)  # 找不到 claude.exe 也能构造
-    with pytest.raises(LLMError, match="CLAUDE_EXE"):
-        llm.parse("unit", SYSTEM, USER, Outer)
-    assert runner.calls == [] and usage_rows(store) == []
-
-
-def test_find_settings_value_wins(no_claude, tmp_path):
-    mine = touch(tmp_path / "custom" / "claude.exe")
-    no_claude["claude.exe"] = str(touch(tmp_path / "other" / "claude.exe"))
-    assert find_claude_exe(make_settings(tmp_path, claude_exe=str(mine))) == str(mine)
-    with pytest.raises(LLMError, match="CLAUDE_EXE"):
-        find_claude_exe(make_settings(tmp_path, claude_exe=str(tmp_path / "nope" / "claude.exe")))
-
-
-def test_find_settings_wrapper_maps_to_npm_exe(no_claude, tmp_path):
-    exe = touch(tmp_path / "npm" / NPM_EXE)
-    cmd = touch(tmp_path / "npm" / "claude.cmd")
-    assert find_claude_exe(make_settings(tmp_path, claude_exe=str(cmd))) == str(exe)
-    with pytest.raises(LLMError, match="CLAUDE_EXE"):
-        find_claude_exe(make_settings(tmp_path, claude_exe=str(touch(tmp_path / "x" / "claude.ps1"))))
-
-
-def test_find_npm_wrapper_on_path_resolves_to_sibling_exe(no_claude, tmp_path):
-    no_claude["claude"] = str(touch(tmp_path / "nodejs" / "claude.CMD"))
-    exe = touch(tmp_path / "nodejs" / NPM_EXE)
-    no_claude["claude.exe"] = str(touch(tmp_path / "other" / "claude.exe"))
-    assert find_claude_exe(make_settings(tmp_path)) == str(exe)  # npm 旁的 exe 优先
-
-
-def test_find_never_returns_wrapper(no_claude, tmp_path):
-    wrapper = str(touch(tmp_path / "nodejs" / "claude.cmd"))  # npm 目录残缺：没有 bin/claude.exe
-    no_claude["claude"] = wrapper
-    no_claude["claude.exe"] = wrapper
-    with pytest.raises(LLMError, match="CLAUDE_EXE"):
-        find_claude_exe(make_settings(tmp_path))
-
-
-def test_find_path_exe_then_native_install_then_error(no_claude, tmp_path):
-    on_path = str(touch(tmp_path / "bin" / "claude.exe"))
-    no_claude.update({"claude": on_path, "claude.exe": on_path})  # 原生安装在 PATH 上
-    assert find_claude_exe(make_settings(tmp_path)) == on_path
-    no_claude.clear()
-    native = touch(tmp_path / "home" / ".local" / "bin" / "claude.exe")
-    assert find_claude_exe(make_settings(tmp_path)) == str(native)
-    native.unlink()
-    with pytest.raises(LLMError, match="找不到 claude.exe"):
-        find_claude_exe(make_settings(tmp_path))
-
-
-def test_cli_error_reason_from_errors_field(store, settings):
-    out = {k: v for k, v in cli_output(structured=None, is_error=True, subtype="error_during_execution").items()
-           if k != "result"}
-    out["errors"] = ["API Error: 400 model not available"]
-    runner = FakeRunner(out, returncode=1)
-    with pytest.raises(LLMError, match="model not available"):
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer)
-
-
-def test_tiny_budget_is_budget_exceeded(store, settings):
-    runner = FakeRunner()
-    with pytest.raises(BudgetExceeded):  # --max-budget-usd 0.00 会被 CLI 拒绝
-        LLM(settings, store, runner=runner).parse("unit", SYSTEM, USER, Outer, max_budget_usd=0.004)
-    assert runner.calls == []
+    assert post.calls == [] and usage_rows(store) == []

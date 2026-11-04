@@ -1,4 +1,4 @@
-"""盘前两段式：08:30 scan 出量化候选并抓资讯，随后 analyze 让 Claude 深度分析并写下竞价条件；
+"""盘前两段式：08:30 scan 出量化候选并抓资讯，随后 analyze 让大模型深度分析并写下竞价条件；
 09:25 集合竞价结束后 run_final 先按条件做规则过滤，再做一次只能否决的竞价确认，09:28 前推送。"""
 from __future__ import annotations
 
@@ -311,7 +311,7 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
             return None
         raw = llm.parse(purpose=f"analyze:{playbook_kind}", system=playbook.load_prompt("premarket"),
                         user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx), schema=PremarketPlan,
-                        effort="high", timeout=timeout, max_budget_usd=1.5, essential=True)
+                        timeout=timeout)
         codes = {p.code for p in cands}
         picks: list[PlannedPick] = []
         for pp in raw.picks:
@@ -449,8 +449,8 @@ def finalize(d: dt.date, settings: Settings, store: Store, llm: LLM, client: AkC
     try:
         check = llm.parse(purpose=f"auction:{playbook_kind}", system=AUCTION_SYSTEM,
                           user=_auction_prompt(d, plan, prelim, ctx, spot), schema=AuctionCheck,
-                          effort="low", timeout=timeout, max_budget_usd=0.3, essential=True)
-    except Exception as e:  # noqa: BLE001 - 超时/预算/CLI 报错/校验失败：按规则过滤结果
+                          timeout=timeout)
+    except Exception as e:  # noqa: BLE001 - 超时/CLI 报错/校验失败：按规则过滤结果
         log.warning("premarket auction check %s failed, using rule-filtered picks: %r", playbook_kind, e)
         return base
     vetoed = {x.code.strip() for x in check.picks if x.action == "veto"}

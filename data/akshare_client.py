@@ -6,7 +6,7 @@
 import logging
 import socket
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import akshare as ak
 import pandas as pd
@@ -22,6 +22,9 @@ SPOT_EM_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": 
 SPOT_SINA_COLS = {"代码": "code", "名称": "name", "今开": "open", "昨收": "prev_close",
                   "最新价": "last", "涨跌幅": "pct", "成交量": "volume", "成交额": "amount", "最高": "high"}
 SINA_VOLUME_DIVISOR = 100.0  # 新浪成交量单位为股，东财为手
+# 新浪日线（stock_zh_a_daily）返回英文列，只取与东财日线对应的 7 列
+SINA_DAILY_COLS = {"date": "date", "open": "open", "high": "high", "low": "low",
+                   "close": "close", "volume": "volume", "amount": "amount"}
 CONS_CODE_COL = "成分券代码"
 CLS_COLS = {"标题": "title", "内容": "content", "发布日期": "date", "发布时间": "time"}
 STOCK_NEWS_COLS = {"新闻标题": "title", "新闻内容": "content", "发布时间": "time"}
@@ -31,16 +34,19 @@ NUMERIC = ["open", "high", "low", "close", "volume", "amount", "prev_close", "la
 # 东财个股报价（stock_bid_ask_em，item/value 两列）：盘前定稿和盘中监控只需要少数代码，不必翻全市场
 BID_ASK_COLS = {"今开": "open", "昨收": "prev_close", "最新": "last", "涨幅": "pct", "总手": "volume",
                 "金额": "amount", "最高": "high"}
-HTTP_TIMEOUT = 15.0  # 支持 timeout 参数的接口（stock_zh_a_hist）单次请求的超时，秒
 SOCKET_TIMEOUT = 30.0  # 兜底：akshare 多数接口内部用不带 timeout 的 requests.get，连接卡住时会无限阻塞
 CONNECT_TIMEOUT = 5.0
+# 东财日线熔断：连续失败这么多次后冷却一段时间不再请求东财（反复打限流中的接口会延长封禁），日线直走新浪
+EM_FAIL_LIMIT = 3
+EM_COOLDOWN = 1800.0
+RAW_PREV_BUFFER = 7  # 新浪不复权回退时向前多取的自然日数：保证增量窗口也有前一根收盘来推算参考昨收
 
 
 def _install_requests_default_timeout() -> None:
     """给不带 timeout 的 requests 请求补上默认超时（只装一次）。
 
     socket.setdefaulttimeout 管不到 requests：timeout=None 时 urllib3 会对新建的 socket 显式 settimeout(None)。
-    已经传了 timeout 的调用（企业微信推送、stock_zh_a_hist）不受影响。"""
+    已经显式传了 timeout 的调用不受影响。"""
     send = requests.adapters.HTTPAdapter.send
     if getattr(send, "_umberfell_default_timeout", False):
         return
@@ -88,6 +94,15 @@ def _fmt(d: date) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _sina_symbol(code: str) -> str:
+    """新浪日线接口的代码带交易所前缀：6 开头沪市，0/3 开头深市，其余（43/83/92 等）按北交所处理。"""
+    if code.startswith("6"):
+        return f"sh{code}"
+    if code.startswith(("0", "3")):
+        return f"sz{code}"
+    return f"bj{code}"
+
+
 def _records(df: pd.DataFrame, limit: int) -> list[dict]:
     return [{"title": str(r.title), "content": str(r.content), "time": str(r.time)}
             for r in df.head(limit).itertuples(index=False)]
@@ -110,6 +125,8 @@ class AkClient:
     def __init__(self, attempts: int = 3, wait: float = 2.0):
         self.attempts = attempts
         self.wait = wait
+        self._em_fail_streak = 0
+        self._em_skip_until = 0.0
         _install_requests_default_timeout()
         if socket.getdefaulttimeout() is None:
             socket.setdefaulttimeout(SOCKET_TIMEOUT)
@@ -117,34 +134,93 @@ class AkClient:
     def _call(self, fn, *args, **kwargs):
         return with_retry(fn, *args, attempts=self.attempts, wait=self.wait, **kwargs)
 
+    def _em_allow(self) -> bool:
+        """熔断冷却期已过才允许请求东财。"""
+        return time.time() >= self._em_skip_until
+
+    def _em_note(self, ok: bool) -> None:
+        """记录一次东财调用结果：成功清零计数；失败按底层请求计（with_retry 已重试 attempts 次），
+        达到 EM_FAIL_LIMIT 后熔断 EM_COOLDOWN——反复打限流中的接口会把封禁越打越长。"""
+        if ok:
+            self._em_fail_streak = 0
+            return
+        self._em_fail_streak += self.attempts
+        if self._em_fail_streak >= EM_FAIL_LIMIT:
+            self._em_skip_until = time.time() + EM_COOLDOWN
+            log.warning("东财连续 %d 次请求失败，%.0f 分钟内日线直接走新浪（避免延长限流）",
+                        self._em_fail_streak, EM_COOLDOWN / 60)
+
     def trade_calendar(self) -> list[date]:
         df = self._call(ak.tool_trade_date_hist_sina)
         return sorted({pd.Timestamp(x).date() for x in df["trade_date"]})
 
     def daily_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
-        df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="qfq", timeout=HTTP_TIMEOUT)
+        """前复权日线：东财 stock_zh_a_hist，限流/异常时切新浪 stock_zh_a_daily。
+
+        东财连续失败达到 EM_FAIL_LIMIT 后熔断 EM_COOLDOWN：冷却期内不再请求东财，
+        日线全部直走新浪（全量回填 800 股时每只都重试东财会把限流越打越长）。
+        冷却结束后第一次尝试若仍失败会立即重新熔断；一次成功即清零计数。
+
+        新浪列名为英文、成交量单位是股（东财为手），除以 SINA_VOLUME_DIVISOR 拉齐。两家的前复权
+        算法略有差异，回测评估只要求同一只股票的序列内部一致，混合来源可接受。"""
+        sina = True
+        if self._em_allow():
+            try:
+                df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
+                                start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
+                sina = False
+                self._em_note(True)
+            except Exception as e:  # noqa: BLE001 - 东财限流/接口异常时都走新浪回退
+                self._em_note(False)
+                log.warning("东财日线失败(%s)，切换新浪: %s", code, e)
+        if sina:
+            df = self._call(ak.stock_zh_a_daily, symbol=_sina_symbol(code),
+                            start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
         cols = ["date", "open", "high", "low", "close", "volume", "amount"]
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
-        out = _pick(df, DAILY_COLS, f"stock_zh_a_hist({code})")
+        out = _pick(df, SINA_DAILY_COLS if sina else DAILY_COLS, f"daily_bars({code})")
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+        if sina:
+            out["volume"] = out["volume"] / SINA_VOLUME_DIVISOR
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def raw_bars(self, code: str, start: date, end: date) -> pd.DataFrame:
         """不复权日线，供模拟盘结算撮合与估值：date open high low close volume amount prev_close。
 
-        不复权价格不会因为之后的除权而改变。prev_close = 收盘 - 涨跌额，即交易所当天的参考昨收；除权除息日
-        就是除权参考价，涨跌停区间据此计算才与交易所一致。涨跌额精确到分；涨跌幅只有两位小数，高价股反推
-        的误差可达几角。"""
+        不复权价格不会因为之后的除权而改变。东财为主：prev_close = 收盘 - 涨跌额，即交易所当天的参考
+        昨收；除权除息日就是除权参考价，涨跌停区间据此计算才与交易所一致。涨跌额精确到分；涨跌幅只有
+        两位小数，高价股反推的误差可达几角。
+
+        东财限流/异常时切新浪 stock_zh_a_daily（默认不复权）：新浪没有涨跌额，参考昨收用前一根收盘
+        推算——向前多取 RAW_PREV_BUFFER 个自然日，保证增量窗口（可能只有一天）也有前一根；停牌多日
+        的股票参考昨收就是停牌前收盘，语义一致。推算的参考昨收在除权日会偏差（偏高），结算的除权检查
+        会漏检：东财恢复后重跑结算增量即可修正，依赖它的场景只有东财不可用时的结算兜底。"""
         cols = ["date", "open", "high", "low", "close", "volume", "amount", "prev_close"]
-        df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                        start_date=_fmt(start), end_date=_fmt(end), adjust="", timeout=HTTP_TIMEOUT)
+        sina = True
+        if self._em_allow():
+            try:
+                df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
+                                start_date=_fmt(start), end_date=_fmt(end), adjust="")
+                sina = False
+                self._em_note(True)
+            except Exception as e:  # noqa: BLE001
+                self._em_note(False)
+                log.warning("东财不复权日线失败(%s)，切换新浪: %s", code, e)
+        if sina:
+            df = self._call(ak.stock_zh_a_daily, symbol=_sina_symbol(code),
+                            start_date=_fmt(start - timedelta(days=RAW_PREV_BUFFER)),
+                            end_date=_fmt(end))
         if df is None or df.empty:
             return pd.DataFrame(columns=cols)
-        out = _pick(df, RAW_COLS, f"stock_zh_a_hist({code}, 不复权)")
+        out = _pick(df, SINA_DAILY_COLS if sina else RAW_COLS, f"raw_bars({code})")
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
-        out["prev_close"] = (out["close"] - out["change"]).round(2)
+        if sina:
+            out["volume"] = out["volume"] / SINA_VOLUME_DIVISOR
+            out["prev_close"] = out["close"].shift(1).round(2)
+            out = out[out["date"] >= pd.Timestamp(start)]  # 去掉用于推算前收盘的前置缓冲
+        else:
+            out["prev_close"] = (out["close"] - out["change"]).round(2)
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
