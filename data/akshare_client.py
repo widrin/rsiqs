@@ -285,15 +285,32 @@ class AkClient:
             raise DataError("交易所股票简称列表全部获取失败")
         return out
 
-    def spot(self, codes: list[str] | None = None, sink: list | None = None) -> pd.DataFrame:
+    def spot(self, codes: list[str] | None = None, sink: list | None = None,
+             fallback: bool = False) -> pd.DataFrame:
         """实时快照（竞价时段的"今开"即竞价价）。
 
         给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
         和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空；一只都取不到时抛
         DataError。sink 不为 None 时每取到一只就追加一行（dict），调用方超时后可以用已取到的部分。
+        fallback=True 时对仍然缺报价的代码回退到全市场快照（东财失败会自动切新浪，一次将近一分钟）：
+        盘中监控容忍这个耗时，09:25 定稿有 09:28 的时限，宁可当缺失处理，所以默认不开。
         不给 codes 时取全市场：东财失败切新浪。"""
         if codes is not None:
-            return self._spot_codes(codes, sink)
+            try:
+                out = self._spot_codes(codes, sink)
+            except DataError:
+                if not fallback:
+                    raise
+                out = pd.DataFrame(sink or [], columns=SPOT_COLS)
+            if not fallback:
+                return out
+            have = {str(c).zfill(6) for c in out["code"]}
+            missing = [c for c in codes if str(c).zfill(6) not in have]
+            if missing:
+                out = pd.concat([out, self._snapshot_rows(missing)], ignore_index=True)
+            if codes and out.empty:
+                raise DataError(f"个股报价全部获取失败（{len(codes)} 只，含全市场快照回退）")
+            return out[SPOT_COLS]
         try:
             out = _pick(self._call(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
         except Exception as e:  # noqa: BLE001
@@ -307,6 +324,16 @@ class AkClient:
         out["code"] = out["code"].astype(str).str.zfill(6)
         out["name"] = out["name"].astype(str)
         return out[SPOT_COLS].reset_index(drop=True)
+
+    def _snapshot_rows(self, codes: list[str]) -> pd.DataFrame:
+        """从全市场快照挑出这些代码（东财失败会自动切新浪）。快照本身失败时返回空表，按缺报价处理。"""
+        try:
+            full = self.spot()
+        except Exception as e:  # noqa: BLE001 - 回退失败不应掩盖原来的缺报价
+            log.warning("个股报价回退全市场快照失败: %s", e)
+            return pd.DataFrame(columns=SPOT_COLS)
+        wanted = {str(c).zfill(6) for c in codes}
+        return full[full["code"].isin(wanted)]
 
     def _spot_codes(self, codes: list[str], sink: list | None = None) -> pd.DataFrame:
         rows = [] if sink is None else sink

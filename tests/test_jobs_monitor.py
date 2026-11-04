@@ -14,10 +14,11 @@ D = date(2026, 10, 16)
 class SpotClient:
     def __init__(self, rows):
         self.df, self.n = pd.DataFrame(rows), 0
+        self.fallback = False
 
-    def spot(self, codes=None):
+    def spot(self, codes=None, fallback=False):
         self.n += 1
-        self.codes = codes
+        self.codes, self.fallback = codes, fallback
         return self.df.copy()
 
 
@@ -60,6 +61,7 @@ def test_stop_target_zhaban_alerts_deduped_per_day():
     assert "浮动盈亏 +1200 元（+12.0%）" in text
     assert "600004" not in text
     assert client.codes == ["600001", "600002", "600003", "600004"]  # 只取持仓的报价
+    assert client.fallback is True                    # 东财限流时允许回退全市场快照
     assert check_once(D, store, client, n) == []          # 同日同事件不重复
     assert len(n.sent) == 3
     assert len(check_once(date(2026, 10, 19), store, client, n)) == 3  # 新的一天重新计
@@ -166,6 +168,31 @@ def test_missing_quote_is_logged_once(caplog):
         for _ in range(2):
             assert check_once(D, store, SpotClient([row("600002", 9.0, 9.0)]), NullNotifier()) == []
     assert caplog.text.count("no quote for 600001") == 1
+
+
+def test_missing_quote_alerts_once_after_three_checks():
+    store = make_store(("600001", 9.3, 11.0))
+    client = SpotClient([])
+    n = NullNotifier()
+    assert check_once(D, store, client, n) == []  # 单次失败只记日志
+    assert check_once(D, store, client, n) == []
+    out = check_once(D, store, client, n)         # 连续 3 次：今天这只没有止损止盈保护
+    assert len(out) == 1 and out[0].startswith("【RSIQS 告警】")
+    assert "行情缺失" in out[0] and "600001" in out[0]
+    assert check_once(D, store, client, n) == []  # 同一天只提醒一次
+    assert len(n.sent) == 1
+
+
+def test_missing_quote_alert_resets_after_quote_returns():
+    store = make_store(("600001", 9.3, 11.0))
+    n = NullNotifier()
+    check_once(D, store, SpotClient([]), n)
+    check_once(D, store, SpotClient([]), n)
+    check_once(D, store, SpotClient([row("600001", 10.0, 10.0)]), n)  # 有报价：连续计数清零
+    assert check_once(D, store, SpotClient([]), n) == []              # 重新从 1 开始
+    out = check_once(D, store, SpotClient([]), n)
+    out2 = check_once(D, store, SpotClient([]), n)
+    assert out == [] and len(out2) == 1 and "行情缺失" in out2[0]
 
 
 def test_no_positions_skips_spot_call():

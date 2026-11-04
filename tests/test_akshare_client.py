@@ -361,6 +361,50 @@ def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
     assert AkClient().spot([]).empty and list(AkClient().spot([]).columns) == SPOT_COLS
 
 
+def test_spot_for_codes_falls_back_to_full_market_snapshot(monkeypatch):
+    def down(symbol):
+        raise ConnectionError("东财限流")
+
+    fake_ak(monkeypatch, stock_bid_ask_em=down, stock_zh_a_spot_em=lambda: EM_SPOT,
+            stock_zh_a_spot=lambda: pytest.fail("东财快照可用，不该切新浪"))
+    df = AkClient(wait=0).spot(["600000", "300750"], fallback=True)
+    assert set(df["code"]) == {"600000", "300750"}
+    r = df.set_index("code").loc["600000"]
+    assert (r["prev_close"], r["last"], r["high"]) == (10.3, 10.5, 10.6)
+
+
+def test_spot_for_codes_fallback_fills_only_missing(monkeypatch):
+    def quote(symbol):
+        if symbol == "600000":
+            return _bid_ask(BID_ASK)
+        raise ConnectionError("down")
+
+    fake_ak(monkeypatch, stock_bid_ask_em=quote, stock_zh_a_spot_em=lambda: EM_SPOT,
+            stock_zh_a_spot=lambda: pytest.fail("东财快照可用，不该切新浪"))
+    df = AkClient(wait=0).spot(["600000", "300750"], fallback=True).set_index("code")
+    assert df.loc["600000", "last"] == 10.3 and df.loc["600000", "name"] == ""  # 个股报价没有名称
+    assert df.loc["300750", "name"] == "宁德时代"                              # 缺的这只由快照补上
+
+
+def test_spot_for_codes_without_fallback_still_raises(monkeypatch):
+    def down(symbol):
+        raise ConnectionError("down")
+
+    fake_ak(monkeypatch, stock_bid_ask_em=down,
+            stock_zh_a_spot_em=lambda: pytest.fail("未开启 fallback 时不应取全市场快照"))
+    with pytest.raises(DataError, match="个股报价全部获取失败"):
+        AkClient(wait=0).spot(["600000"])
+
+
+def test_spot_for_codes_raises_when_snapshot_also_fails(monkeypatch):
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    fake_ak(monkeypatch, stock_bid_ask_em=down, stock_zh_a_spot_em=down, stock_zh_a_spot=down)
+    with pytest.raises(DataError, match="含全市场快照回退"):
+        AkClient(wait=0).spot(["600000"], fallback=True)
+
+
 def test_names_from_exchange_lists(monkeypatch):
     sh = {"主板A股": pd.DataFrame({"证券代码": ["600000"], "证券简称": ["浦发银行"]}),
           "科创板": pd.DataFrame({"证券代码": ["688001"], "证券简称": ["华兴源创"]})}
