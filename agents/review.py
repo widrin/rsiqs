@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from typing import Literal
 
 import pandas as pd
@@ -13,6 +14,7 @@ from agents.llm import LLM
 from config import Settings
 from data.cache import BarCache
 from engine.calendar import TradingCalendar
+from engine.ledger import ex_rights_price
 from engine.store import Store
 from notify.format import format_daily_report
 
@@ -109,6 +111,43 @@ def _report_rows(store: Store, d: dt.date) -> list[dict]:
     return rows
 
 
+def _close_info(cache: BarCache, code: str, d: dt.date) -> tuple[float | None, float | None]:
+    """收盘价与当日涨跌：优先 d 日的不复权 K 线；停牌时取最近收盘，跨除权时换算到除权后（与结算估值一致）。"""
+    bar = cache.raw_bars([code], d).get(code)
+    if bar is not None and math.isfinite(bar.close) and bar.close > 0:
+        day_ret = bar.close / bar.prev_close - 1.0 if bar.prev_close > 0 else None
+        return bar.close, day_ret
+    last = cache.last_raw_close(code, d)
+    if last is None:
+        return None, None
+    t, price = last
+    for ex, cash, ratio in cache.dividends(code):
+        if t < ex <= d:
+            price = ex_rights_price(price, cash, ratio)
+    return price, None
+
+
+def _holding_rows(store: Store, cache: BarCache, d: dt.date) -> list[dict]:
+    """各在结算账户的收盘持仓及浮动盈亏（相对成本，含费用）。已退役的量化账户冻结的持仓不列。"""
+    rows = []
+    for name in store.list_accounts():
+        if name.startswith("q:") and store.get_status(name[2:]) == "retired":
+            continue
+        acc = store.load_account(name)
+        if acc is None or not acc.positions:
+            continue
+        for code in sorted(acc.positions):
+            pos = acc.positions[code]
+            price, day_ret = _close_info(cache, code, d)
+            row = {"account": name, "code": code, "name": pos.name, "qty": pos.qty,
+                   "cost": pos.cost, "price": price, "day_ret": day_ret, "pnl": None, "pnl_ret": None}
+            if price is not None:
+                row["pnl"] = (price - pos.cost) * pos.qty
+                row["pnl_ret"] = price / pos.cost - 1.0
+            rows.append(row)
+    return rows
+
+
 def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) -> str:
     return "\n".join([f"# 复盘日 {d.isoformat()}", "",
                       f"## 候选版经验规则（playbook v{pb.get('version', 1)}，你的 lesson 只作用于这一版）",
@@ -170,4 +209,6 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     if bad:
         files = "、".join(f"playbook/{k}.json" for k in bad)
         summary = f"{summary}\n注意：{files} 损坏，今日未发布、未更新 playbook，请手工修复（可从 git 历史恢复）。"
-    notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary))
+    # 回补的日子持仓已不是当天的：只在最近一天的日报里列收盘持仓收益
+    notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary,
+                                              _holding_rows(store, cache, d)))

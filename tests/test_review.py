@@ -12,9 +12,9 @@ from agents.llm import LLM, LLMError
 from agents.review import Lesson, ReviewOutput
 from config import Settings
 from engine.calendar import TradingCalendar
-from engine.ledger import Account
+from engine.ledger import Account, Position
 from engine.store import Store
-from engine.types import Fill, Pick
+from engine.types import Bar, Fill, Pick
 
 D = dt.date(2026, 10, 16)
 PREV = dt.date(2026, 10, 15)
@@ -35,13 +35,31 @@ def pick(code):
 class FakeCache:
     def __init__(self):
         self.requested = None
+        idx = pd.DatetimeIndex([pd.Timestamp(PREV), pd.Timestamp(D)])
+        self.raw = pd.DataFrame({"open": [10.0, 10.62], "high": [10.2, 10.8], "low": [9.9, 10.1],
+                                 "close": [10.0, 10.15], "volume": [1e6, 2e6], "amount": [1e7, 2e7],
+                                 "prev_close": [9.9, 10.0]}, index=idx)
+        self.divs: dict[str, list] = {}
 
     def load_panel(self, codes, start, end):
         self.requested = (sorted(codes), start, end)
-        idx = pd.DatetimeIndex([pd.Timestamp(PREV), pd.Timestamp(D)])
-        df = pd.DataFrame({"open": [10.0, 10.62], "high": [10.2, 10.8], "low": [9.9, 10.1], "close": [10.0, 10.15],
-                           "volume": [1e6, 2e6], "amount": [1e7, 2e7], "prev_close": [9.9, 10.0]}, index=idx)
-        return {c: df.copy() for c in codes}, {c: f"股{c}" for c in codes}
+        return {c: self.raw.copy() for c in codes}, {c: f"股{c}" for c in codes}
+
+    def raw_bars(self, codes, d, names=None):
+        ts = pd.Timestamp(d)
+        if ts not in self.raw.index:
+            return {}
+        r = self.raw.loc[ts]
+        return {c: Bar(code=c, date=d, open=float(r["open"]), high=float(r["high"]), low=float(r["low"]),
+                       close=float(r["close"]), prev_close=float(r["prev_close"]), volume=float(r["volume"]),
+                       amount=float(r["amount"]), name=f"股{c}") for c in codes}
+
+    def last_raw_close(self, code, d):
+        closes = self.raw.loc[:pd.Timestamp(d), "close"].dropna()
+        return (closes.index[-1].date(), float(closes.iloc[-1])) if len(closes) else None
+
+    def dividends(self, code):
+        return self.divs.get(code, [])
 
 
 class FakeLLM:
@@ -235,6 +253,28 @@ def test_commit_counts_only_effective_changes(env):
                                              Lesson(action="remove", rule_id="r99", text="", evidence="e")])
     run(env, FakeLLM(out))
     assert env["commits"][-1][1] == "playbook: 2026-10-16 复盘更新 1 条"
+
+
+def test_report_lists_close_holdings_pnl(env):
+    acc = env["store"].load_account("h:active")
+    acc.positions["600001"] = Position(code="600001", name="股600001", qty=1000, available=1000, cost=10.0,
+                                       entry_date=D, stop=9.6, target=11.2, exit_date=dt.date(2026, 10, 23))
+    env["store"].save_account(acc)
+    run(env, FakeLLM(OUTPUT))
+    report = env["notifier"].sent[0]
+    assert "收盘持仓收益" in report
+    assert "**h:active** 浮动盈亏 +150 元（+1.50%）" in report
+    assert "600001 股600001 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），当日 +1.50%" in report
+
+
+def test_backfilled_report_has_no_holdings(env):
+    acc = env["store"].load_account("h:active")
+    acc.positions["600001"] = Position(code="600001", name="股600001", qty=1000, available=1000, cost=10.0,
+                                       entry_date=D, stop=9.6, target=11.2, exit_date=dt.date(2026, 10, 23))
+    env["store"].save_account(acc)
+    review.run_review(PREV, settings(), env["store"], FakeLLM(OUTPUT), env["cache"], env["notifier"], CAL,
+                      backfill=True)
+    assert "收盘持仓收益" not in env["notifier"].sent[0]  # 回补的日子持仓已经不是当天的
 
 
 def test_backfilled_day_only_sends_the_report(env, monkeypatch):

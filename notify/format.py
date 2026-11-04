@@ -29,11 +29,32 @@ def format_recommendation(d: date, picks: list[Pick], llm_reviewed: bool, market
     return "\n".join(lines)
 
 
-def format_daily_report(d: date, rows: list[dict], review_summary: str) -> str:
+def format_daily_report(d: date, rows: list[dict], review_summary: str,
+                        holdings: list[dict] | None = None) -> str:
     # 企业微信群机器人的 markdown（v1）不渲染表格：每个账户一行
     lines = [f"## RSIQS 日报 {d.isoformat()}"]
     for r in rows:
         lines.append(f"**{r['account']}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}")
+    if holdings is not None:
+        lines.append("### 收盘持仓收益")
+        if not holdings:
+            lines.append("（空仓）")
+        for account in dict.fromkeys(h["account"] for h in holdings):
+            part = [h for h in holdings if h["account"] == account]
+            priced = [h for h in part if h["price"] is not None]
+            if priced:
+                pnl = sum(h["pnl"] for h in priced)
+                basis = sum(h["cost"] * h["qty"] for h in priced)
+                lines.append(f"**{account}** 浮动盈亏 {pnl:+,.0f} 元（{pnl / basis:+.2%}）")
+            else:
+                lines.append(f"**{account}**")
+            for h in part:
+                if h["price"] is None:
+                    lines.append(f"- {h['code']} {h['name']} {h['qty']} 股：成本 {h['cost']:.2f}，收盘价缺失")
+                    continue
+                day = f"，当日 {h['day_ret']:+.2%}" if h["day_ret"] is not None else ""
+                lines.append(f"- {h['code']} {h['name']} {h['qty']} 股：成本 {h['cost']:.2f} → "
+                             f"收盘 {h['price']:.2f}，浮动 {h['pnl']:+,.0f} 元（{h['pnl_ret']:+.2%}）{day}")
     lines.append("**复盘**：" + (_one_line(review_summary) or "（本日无 LLM 复盘）"))
     return "\n".join(lines)
 

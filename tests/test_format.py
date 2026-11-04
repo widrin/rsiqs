@@ -36,6 +36,25 @@ def test_daily_report():
     assert "复盘" in format_daily_report(date(2026, 10, 16), rows, "")
 
 
+def test_daily_report_lists_holdings_pnl():
+    rows = [{"account": "h:active", "equity": 512345.678, "day_ret": 0.0123, "total_ret": 0.0247}]
+    holdings = [{"account": "h:active", "code": "600000", "name": "浦发银行", "qty": 1000, "cost": 10.0,
+                 "price": 10.15, "day_ret": 0.015, "pnl": 150.0, "pnl_ret": 0.015}]
+    s = format_daily_report(date(2026, 10, 16), rows, "", holdings)
+    assert "收盘持仓收益" in s
+    assert "**h:active** 浮动盈亏 +150 元（+1.50%）" in s
+    assert "- 600000 浦发银行 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），当日 +1.50%" in s
+
+
+def test_daily_report_says_empty_when_no_holdings():
+    s = format_daily_report(date(2026, 10, 16), [], "", [])
+    assert "收盘持仓收益" in s and "（空仓）" in s
+
+
+def test_daily_report_without_holdings_argument_has_no_section():
+    assert "收盘持仓收益" not in format_daily_report(date(2026, 10, 16), [], "")
+
+
 def test_alert():
     s = format_alert("触发止损", "600000 浦发银行 现价 9.30")
     assert s.startswith("【RSIQS 告警】触发止损")
