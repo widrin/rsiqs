@@ -3,10 +3,13 @@
 
 列名映射是模块级字典，AKShare 升级改列名时只改一行；用 scripts/smoke_akshare.py 实网核实。
 """
+import json
 import logging
+import random
 import socket
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
 import akshare as ak
 import pandas as pd
@@ -39,7 +42,15 @@ CONNECT_TIMEOUT = 5.0
 # 东财日线熔断：连续失败这么多次后冷却一段时间不再请求东财（反复打限流中的接口会延长封禁），日线直走新浪
 EM_FAIL_LIMIT = 3
 EM_COOLDOWN = 1800.0
+EM_MIN_INTERVAL = 1.0  # 东财请求最小间隔（秒）：实测 >5 次/秒、1 分钟 >200 次会触发风控
+EM_JITTER = 0.3        # 间隔上的随机抖动上限（秒），避免多个任务/进程的请求节拍对齐
 RAW_PREV_BUFFER = 7  # 新浪不复权回退时向前多取的自然日数：保证增量窗口也有前一根收盘来推算参考昨收
+# 腾讯批量行情：东财限流时按批复用，一次最多 60 只（实测上限），GBK 编码，字段位置见 TENCENT_FIELDS
+TENCENT_URL = "https://qt.gtimg.cn/q="
+TENCENT_BATCH = 60
+TENCENT_FIELDS = {"name": 1, "code": 2, "last": 3, "prev_close": 4, "open": 5, "volume": 6,
+                  "pct": 32, "high": 33, "amount": 37}  # amount 单位为万元
+TENCENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
 def _install_requests_default_timeout() -> None:
@@ -122,11 +133,17 @@ class AkClient:
     构造时给不带 timeout 的 requests 请求补上默认超时，并设置进程级的 socket 默认超时（兜住走 urllib 的接口）：
     akshare 多数接口不设超时，连接卡住时重试和告警都不会触发，任务会一直挂住。"""
 
-    def __init__(self, attempts: int = 3, wait: float = 2.0):
+    def __init__(self, attempts: int = 3, wait: float = 2.0, min_interval: float = 0.0,
+                 jitter: float = EM_JITTER, ban_path: Path | str | None = None):
         self.attempts = attempts
         self.wait = wait
+        self.min_interval = min_interval
+        self.jitter = jitter
+        self.ban_path = Path(ban_path) if ban_path is not None else None
+        self._em_last = 0.0
         self._em_fail_streak = 0
         self._em_skip_until = 0.0
+        self._read_ban_state()
         _install_requests_default_timeout()
         if socket.getdefaulttimeout() is None:
             socket.setdefaulttimeout(SOCKET_TIMEOUT)
@@ -134,21 +151,66 @@ class AkClient:
     def _call(self, fn, *args, **kwargs):
         return with_retry(fn, *args, attempts=self.attempts, wait=self.wait, **kwargs)
 
+    def _em_get(self, fn, *args, **kwargs):
+        """东财请求统一入口：串行限流 + 抖动。akshare 内部没有节流，逐个股票串行打过去就会被风控。"""
+        self._em_throttle()
+        return self._call(fn, *args, **kwargs)
+
+    def _em_throttle(self) -> None:
+        """距上一次东财请求不足 min_interval（再加随机抖动）时先等待。min_interval=0 时不限流（测试）。"""
+        if self.min_interval <= 0:
+            return
+        target = self._em_last + self.min_interval
+        if self.jitter > 0:
+            target += random.uniform(0, self.jitter)
+        delay = target - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        self._em_last = time.time()
+
+    def _read_ban_state(self) -> None:
+        """从 ban_path 读取跨进程的熔断状态（文件是唯一事实来源）；未配置或文件损坏时保持内存状态。"""
+        if self.ban_path is None:
+            return
+        try:
+            data = json.loads(self.ban_path.read_text(encoding="utf-8"))
+            self._em_skip_until = float(data.get("until", 0.0))
+            self._em_fail_streak = int(data.get("fails", 0))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _write_ban_state(self) -> None:
+        if self.ban_path is None:
+            return
+        try:
+            self.ban_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ban_path.write_text(json.dumps({"until": self._em_skip_until,
+                                                 "fails": self._em_fail_streak}),
+                                     encoding="utf-8")
+        except OSError as e:
+            log.warning("东财熔断状态写入失败(%s): %s", self.ban_path, e)
+
     def _em_allow(self) -> bool:
-        """熔断冷却期已过才允许请求东财。"""
+        """熔断冷却期已过才允许请求东财；配置了 ban_path 时每次都同步其他进程写入的封禁状态。"""
+        if self.ban_path is not None:
+            self._read_ban_state()
         return time.time() >= self._em_skip_until
 
     def _em_note(self, ok: bool) -> None:
         """记录一次东财调用结果：成功清零计数；失败按底层请求计（with_retry 已重试 attempts 次），
         达到 EM_FAIL_LIMIT 后熔断 EM_COOLDOWN——反复打限流中的接口会把封禁越打越长。"""
         if ok:
-            self._em_fail_streak = 0
+            if self._em_fail_streak or self._em_skip_until:
+                self._em_fail_streak = 0
+                self._em_skip_until = 0.0
+                self._write_ban_state()
             return
         self._em_fail_streak += self.attempts
         if self._em_fail_streak >= EM_FAIL_LIMIT:
             self._em_skip_until = time.time() + EM_COOLDOWN
             log.warning("东财连续 %d 次请求失败，%.0f 分钟内日线直接走新浪（避免延长限流）",
                         self._em_fail_streak, EM_COOLDOWN / 60)
+        self._write_ban_state()
 
     def trade_calendar(self) -> list[date]:
         df = self._call(ak.tool_trade_date_hist_sina)
@@ -166,8 +228,8 @@ class AkClient:
         sina = True
         if self._em_allow():
             try:
-                df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                                start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
+                df = self._em_get(ak.stock_zh_a_hist, symbol=code, period="daily",
+                                  start_date=_fmt(start), end_date=_fmt(end), adjust="qfq")
                 sina = False
                 self._em_note(True)
             except Exception as e:  # noqa: BLE001 - 东财限流/接口异常时都走新浪回退
@@ -200,8 +262,8 @@ class AkClient:
         sina = True
         if self._em_allow():
             try:
-                df = self._call(ak.stock_zh_a_hist, symbol=code, period="daily",
-                                start_date=_fmt(start), end_date=_fmt(end), adjust="")
+                df = self._em_get(ak.stock_zh_a_hist, symbol=code, period="daily",
+                                  start_date=_fmt(start), end_date=_fmt(end), adjust="")
                 sina = False
                 self._em_note(True)
             except Exception as e:  # noqa: BLE001
@@ -230,7 +292,7 @@ class AkClient:
         except Exception as e:  # noqa: BLE001
             log.warning("新浪指数日线失败，切换东财: %s", e)
             try:
-                df = self._call(ak.stock_zh_index_daily_em, symbol=symbol)
+                df = self._em_get(ak.stock_zh_index_daily_em, symbol=symbol)
             except Exception as e2:  # noqa: BLE001
                 raise DataError(f"指数日线新浪/东财均失败: {e2}") from e2
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
@@ -292,8 +354,8 @@ class AkClient:
         给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
         和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空；一只都取不到时抛
         DataError。sink 不为 None 时每取到一只就追加一行（dict），调用方超时后可以用已取到的部分。
-        fallback=True 时对仍然缺报价的代码回退到全市场快照（东财失败会自动切新浪，一次将近一分钟）：
-        盘中监控容忍这个耗时，09:25 定稿有 09:28 的时限，宁可当缺失处理，所以默认不开。
+        fallback=True 时对仍然缺报价的代码先取腾讯批量行情（快、不限频），仍缺再回退新浪全市场快照
+        （一次将近一分钟）：盘中监控容忍这个耗时，09:25 定稿有 09:28 的时限，宁可当缺失处理，所以默认不开。
         不给 codes 时取全市场：东财失败切新浪。"""
         if codes is not None:
             try:
@@ -312,34 +374,82 @@ class AkClient:
                 raise DataError(f"个股报价全部获取失败（{len(codes)} 只，含全市场快照回退）")
             return out[SPOT_COLS]
         try:
-            out = _pick(self._call(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
+            out = _pick(self._em_get(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
+            out["code"] = out["code"].astype(str).str.zfill(6)
+            out["name"] = out["name"].astype(str)
+            return out[SPOT_COLS].reset_index(drop=True)
         except Exception as e:  # noqa: BLE001
             log.warning("东财快照失败，切换新浪: %s", e)
-            try:
-                out = _pick(self._call(ak.stock_zh_a_spot), SPOT_SINA_COLS, "stock_zh_a_spot")
-            except Exception as e2:  # noqa: BLE001
-                raise DataError(f"实时快照东财/新浪均失败: {e2}") from e2
-            out["code"] = out["code"].astype(str).str[-6:]
-            out["volume"] = out["volume"] / SINA_VOLUME_DIVISOR
-        out["code"] = out["code"].astype(str).str.zfill(6)
+        try:
+            return self._full_snapshot_sina()
+        except Exception as e2:  # noqa: BLE001
+            raise DataError(f"实时快照东财/新浪均失败: {e2}") from e2
+
+    def _full_snapshot_sina(self) -> pd.DataFrame:
+        """新浪全市场快照（一次将近一分钟），东财不可用时的兜底。成交量单位为股，除以 100 拉齐成手。"""
+        out = _pick(self._call(ak.stock_zh_a_spot), SPOT_SINA_COLS, "stock_zh_a_spot")
+        out["code"] = out["code"].astype(str).str[-6:].str.zfill(6)
         out["name"] = out["name"].astype(str)
+        out["volume"] = out["volume"] / SINA_VOLUME_DIVISOR
         return out[SPOT_COLS].reset_index(drop=True)
 
-    def _snapshot_rows(self, codes: list[str]) -> pd.DataFrame:
-        """从全市场快照挑出这些代码（东财失败会自动切新浪）。快照本身失败时返回空表，按缺报价处理。"""
-        try:
-            full = self.spot()
-        except Exception as e:  # noqa: BLE001 - 回退失败不应掩盖原来的缺报价
-            log.warning("个股报价回退全市场快照失败: %s", e)
+    def _tencent_rows(self, codes: list[str]) -> pd.DataFrame:
+        """腾讯批量行情（qt.gtimg.cn）：一次最多 TENCENT_BATCH 只，GBK 编码，报价为手、成交额为万元。
+
+        停牌/无报价的代码腾讯不返回（或字段为 "-"），按缺失处理，由调用方决定是否再走全市场快照。"""
+        rows = []
+        for i in range(0, len(codes), TENCENT_BATCH):
+            syms = ",".join(_sina_symbol(str(c).zfill(6)) for c in codes[i:i + TENCENT_BATCH])
+            resp = requests.get(TENCENT_URL + syms, timeout=(CONNECT_TIMEOUT, 10),
+                                headers=TENCENT_HEADERS)
+            resp.encoding = "gbk"
+            resp.raise_for_status()
+            for part in resp.text.split(";"):
+                if '="' not in part:
+                    continue
+                fields = part.split('="', 1)[1].rsplit('"', 1)[0].split("~")
+                if len(fields) <= max(TENCENT_FIELDS.values()):
+                    continue
+                if not fields[TENCENT_FIELDS["code"]].strip():
+                    continue
+                row = {"code": fields[TENCENT_FIELDS["code"]].strip(),
+                       "name": fields[TENCENT_FIELDS["name"]].strip()}
+                for k in ("open", "prev_close", "last", "pct", "high", "volume", "amount"):
+                    row[k] = fields[TENCENT_FIELDS[k]]
+                rows.append(row)
+        if not rows:
             return pd.DataFrame(columns=SPOT_COLS)
-        wanted = {str(c).zfill(6) for c in codes}
-        return full[full["code"].isin(wanted)]
+        out = pd.DataFrame(rows, columns=SPOT_COLS)
+        for c in SPOT_COLS[2:]:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
+        out["amount"] = out["amount"] * 10000  # 腾讯成交额单位为万元
+        out["code"] = out["code"].astype(str).str.zfill(6)
+        return out
+
+    def _snapshot_rows(self, codes: list[str]) -> pd.DataFrame:
+        """补齐缺报价：先腾讯批量行情，仍缺再回退新浪全市场快照。都失败时返回空表，按缺报价处理。"""
+        rows = pd.DataFrame(columns=SPOT_COLS)
+        try:
+            rows = self._tencent_rows(codes)
+        except Exception as e:  # noqa: BLE001 - 回退失败不应掩盖原来的缺报价
+            log.warning("腾讯批量行情失败: %s", e)
+        have = set(rows["code"]) if not rows.empty else set()
+        missing = [c for c in codes if str(c).zfill(6) not in have]
+        if not missing:
+            return rows[SPOT_COLS]
+        try:
+            full = self._full_snapshot_sina()
+        except Exception as e:  # noqa: BLE001
+            log.warning("个股报价回退全市场快照失败: %s", e)
+            return rows[SPOT_COLS]
+        wanted = {str(c).zfill(6) for c in missing}
+        return pd.concat([rows, full[full["code"].isin(wanted)]], ignore_index=True)[SPOT_COLS]
 
     def _spot_codes(self, codes: list[str], sink: list | None = None) -> pd.DataFrame:
         rows = [] if sink is None else sink
         for code in codes:
             try:
-                df = self._call(ak.stock_bid_ask_em, symbol=code)
+                df = self._em_get(ak.stock_bid_ask_em, symbol=code)
             except Exception as e:  # noqa: BLE001 - 单只失败不影响其他代码
                 log.warning("个股报价 %s 失败: %s", code, e)
                 continue

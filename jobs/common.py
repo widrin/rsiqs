@@ -20,6 +20,7 @@ from notify.wecom import NullNotifier, WeCom
 log = logging.getLogger("rsiqs.jobs")
 
 LOCK_DIR: Path | None = None  # context() 设为 <root>/logs/locks；为 None（测试）时不加锁
+EM_MIN_INTERVAL = 1.0  # 生产环境东财请求最小间隔（秒）：实测 >5 次/秒、1 分钟 >200 次会触发风控
 
 if os.name == "nt":
     import msvcrt
@@ -180,7 +181,8 @@ def context():
         db_path = settings.root / db_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = Store(db_path)
-    client = AkClient()
+    client = AkClient(min_interval=EM_MIN_INTERVAL,
+                      ban_path=db_path.parent / "em_cooldown.json")
     cache = BarCache(db_path, client)
     notifier = (WeCom(settings.wecom_webhook_url, log_dir=settings.root / "logs")
                 if settings.wecom_webhook_url else NullNotifier())

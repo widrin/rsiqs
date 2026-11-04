@@ -1,4 +1,5 @@
 # tests/test_akshare_client.py
+import json
 from datetime import date
 from types import SimpleNamespace
 
@@ -109,6 +110,45 @@ SINA_RAW = pd.DataFrame({
     "low": [10.0, 9.9], "close": [10.3, 10.2], "volume": [120000, 100000],
     "amount": [1.2e6, 1.0e6], "outstanding_share": [1.0, 1.0], "turnover": [0.01, 0.01],
 })
+
+
+def test_em_min_interval_waits_between_requests(monkeypatch, no_sleep):
+    raw = pd.DataFrame({
+        "日期": ["2026-01-06"], "股票代码": ["600000"], "开盘": [10.1], "收盘": [10.3],
+        "最高": [10.5], "最低": [10.0], "成交量": [1200], "成交额": [1.2e6], "振幅": [1.0]})
+    fake_ak(monkeypatch, stock_zh_a_hist=lambda **kw: raw)
+    c = AkClient(min_interval=1.0, jitter=0)
+    c.daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    c.daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert len(no_sleep) == 1 and 0.9 < no_sleep[0] <= 1.0
+
+
+def test_em_ban_is_persisted_and_shared_across_processes(monkeypatch, tmp_path, no_sleep):
+    calls = []
+
+    def em_fail(**kw):
+        calls.append(1)
+        raise ConnectionError("rate limited")
+
+    fake_ak(monkeypatch, stock_zh_a_hist=em_fail, stock_zh_a_daily=lambda **kw: SINA_RAW)
+    ban = tmp_path / "em_cooldown.json"
+    AkClient(wait=0, ban_path=ban).daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert len(calls) == 3
+    state = json.loads(ban.read_text(encoding="utf-8"))
+    assert state["fails"] >= akc.EM_FAIL_LIMIT and state["until"] > akc.time.time()
+
+    AkClient(wait=0, ban_path=ban).daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert len(calls) == 3  # 另一个进程从文件读到冷却期，也不再打东财
+
+
+def test_em_success_clears_persisted_failure_count(monkeypatch, tmp_path, no_sleep):
+    ban = tmp_path / "em_cooldown.json"
+    ban.write_text(json.dumps({"until": 0.0, "fails": 9}), encoding="utf-8")
+    fake_ak(monkeypatch, stock_zh_a_hist=lambda **kw: pd.DataFrame({
+        "日期": ["2026-01-06"], "股票代码": ["600000"], "开盘": [10.1], "收盘": [10.3],
+        "最高": [10.5], "最低": [10.0], "成交量": [1200], "成交额": [1.2e6], "振幅": [1.0]}))
+    AkClient(wait=0, ban_path=ban).daily_bars("600000", date(2026, 1, 5), date(2026, 1, 6))
+    assert json.loads(ban.read_text(encoding="utf-8")) == {"until": 0.0, "fails": 0}
 
 
 def test_daily_bars_breaker_skips_em_until_cooldown_ends(monkeypatch, no_sleep):
@@ -361,12 +401,17 @@ def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
     assert AkClient().spot([]).empty and list(AkClient().spot([]).columns) == SPOT_COLS
 
 
-def test_spot_for_codes_falls_back_to_full_market_snapshot(monkeypatch):
+def test_spot_for_codes_falls_back_to_sina_snapshot(monkeypatch):
     def down(symbol):
         raise ConnectionError("东财限流")
 
-    fake_ak(monkeypatch, stock_bid_ask_em=down, stock_zh_a_spot_em=lambda: EM_SPOT,
-            stock_zh_a_spot=lambda: pytest.fail("东财快照可用，不该切新浪"))
+    def tencent_down(*args, **kwargs):
+        raise ConnectionError("腾讯不可用")
+
+    monkeypatch.setattr(akc.requests, "get", tencent_down)
+    fake_ak(monkeypatch, stock_bid_ask_em=down,
+            stock_zh_a_spot_em=lambda: pytest.fail("回退不应再打东财"),
+            stock_zh_a_spot=lambda: SINA_SPOT)
     df = AkClient(wait=0).spot(["600000", "300750"], fallback=True)
     assert set(df["code"]) == {"600000", "300750"}
     r = df.set_index("code").loc["600000"]
@@ -379,8 +424,13 @@ def test_spot_for_codes_fallback_fills_only_missing(monkeypatch):
             return _bid_ask(BID_ASK)
         raise ConnectionError("down")
 
-    fake_ak(monkeypatch, stock_bid_ask_em=quote, stock_zh_a_spot_em=lambda: EM_SPOT,
-            stock_zh_a_spot=lambda: pytest.fail("东财快照可用，不该切新浪"))
+    def tencent_down(*args, **kwargs):
+        raise ConnectionError("腾讯不可用")
+
+    monkeypatch.setattr(akc.requests, "get", tencent_down)
+    fake_ak(monkeypatch, stock_bid_ask_em=quote,
+            stock_zh_a_spot_em=lambda: pytest.fail("回退不应再打东财"),
+            stock_zh_a_spot=lambda: SINA_SPOT)
     df = AkClient(wait=0).spot(["600000", "300750"], fallback=True).set_index("code")
     assert df.loc["600000", "last"] == 10.3 and df.loc["600000", "name"] == ""  # 个股报价没有名称
     assert df.loc["300750", "name"] == "宁德时代"                              # 缺的这只由快照补上
@@ -400,9 +450,66 @@ def test_spot_for_codes_raises_when_snapshot_also_fails(monkeypatch):
     def down(*args, **kwargs):
         raise ConnectionError("down")
 
+    monkeypatch.setattr(akc.requests, "get", down)
     fake_ak(monkeypatch, stock_bid_ask_em=down, stock_zh_a_spot_em=down, stock_zh_a_spot=down)
     with pytest.raises(DataError, match="含全市场快照回退"):
         AkClient(wait=0).spot(["600000"], fallback=True)
+
+
+class FakeResp:
+    def __init__(self, text):
+        self.text = text
+        self.encoding = "utf-8"
+
+    def raise_for_status(self):
+        pass
+
+
+def _tencent_line(code, name, last, prev, open_, high, pct, volume, amount_wan):
+    fields = [""] * 88
+    fields[0], fields[1], fields[2] = "1", name, code
+    fields[3], fields[4], fields[5], fields[6] = str(last), str(prev), str(open_), str(volume)
+    fields[32], fields[33], fields[37] = str(pct), str(high), str(amount_wan)
+    prefix = "sh" if code.startswith("6") else "sz"
+    return f'v_{prefix}{code}="' + "~".join(fields) + '";'
+
+
+def test_spot_for_codes_uses_tencent_before_full_market_snapshot(monkeypatch):
+    def down(symbol):
+        raise ConnectionError("东财限流")
+
+    text = (_tencent_line("600000", "浦发银行", 10.09, 10.09, 10.05, 10.23, 0.0, 824086, 83502)
+            + _tencent_line("300750", "宁德时代", 200.0, 202.0, 201.0, 203.0, -1.0, 2000, 40000))
+    seen = {}
+
+    def get(url, **kwargs):
+        seen["url"] = url
+        return FakeResp(text)
+
+    monkeypatch.setattr(akc.requests, "get", get)
+    fake_ak(monkeypatch, stock_bid_ask_em=down,
+            stock_zh_a_spot_em=lambda: pytest.fail("腾讯已有报价，不该再取东财快照"),
+            stock_zh_a_spot=lambda: pytest.fail("腾讯已有报价，不该再取新浪快照"))
+    df = AkClient(wait=0).spot(["600000", "300750"], fallback=True).set_index("code")
+    assert seen["url"].startswith(akc.TENCENT_URL) and "sh600000" in seen["url"]
+    r = df.loc["600000"]
+    assert (r["open"], r["prev_close"], r["last"], r["high"]) == (10.05, 10.09, 10.09, 10.23)
+    assert r["volume"] == 824086.0
+    assert r["amount"] == 83502 * 10000  # 腾讯成交额单位为万元
+    assert df.loc["300750", "name"] == "宁德时代" and df.loc["300750", "pct"] == -1.0
+
+
+def test_tencent_rows_batches_by_60_and_skips_empty(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return FakeResp('v_pv_none_match="1";')
+
+    monkeypatch.setattr(akc.requests, "get", get)
+    out = AkClient()._tencent_rows([f"{600000 + i:06d}" for i in range(61)])
+    assert len(calls) == 2
+    assert out.empty and list(out.columns) == SPOT_COLS
 
 
 def test_names_from_exchange_lists(monkeypatch):
