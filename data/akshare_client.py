@@ -291,6 +291,8 @@ class AkClient:
             df = self._call(ak.stock_zh_index_daily, symbol=symbol)
         except Exception as e:  # noqa: BLE001
             log.warning("新浪指数日线失败，切换东财: %s", e)
+            if not self._em_allow():
+                raise DataError(f"指数日线新浪失败且东财熔断冷却中: {e}") from e
             try:
                 df = self._em_get(ak.stock_zh_index_daily_em, symbol=symbol)
             except Exception as e2:  # noqa: BLE001
@@ -373,13 +375,16 @@ class AkClient:
             if codes and out.empty:
                 raise DataError(f"个股报价全部获取失败（{len(codes)} 只，含全市场快照回退）")
             return out[SPOT_COLS]
-        try:
-            out = _pick(self._em_get(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
-            out["code"] = out["code"].astype(str).str.zfill(6)
-            out["name"] = out["name"].astype(str)
-            return out[SPOT_COLS].reset_index(drop=True)
-        except Exception as e:  # noqa: BLE001
-            log.warning("东财快照失败，切换新浪: %s", e)
+        if not self._em_allow():
+            log.warning("东财熔断冷却中，快照直接切换新浪")
+        else:
+            try:
+                out = _pick(self._em_get(ak.stock_zh_a_spot_em), SPOT_EM_COLS, "stock_zh_a_spot_em")
+                out["code"] = out["code"].astype(str).str.zfill(6)
+                out["name"] = out["name"].astype(str)
+                return out[SPOT_COLS].reset_index(drop=True)
+            except Exception as e:  # noqa: BLE001
+                log.warning("东财快照失败，切换新浪: %s", e)
         try:
             return self._full_snapshot_sina()
         except Exception as e2:  # noqa: BLE001
@@ -446,6 +451,8 @@ class AkClient:
         return pd.concat([rows, full[full["code"].isin(wanted)]], ignore_index=True)[SPOT_COLS]
 
     def _spot_codes(self, codes: list[str], sink: list | None = None) -> pd.DataFrame:
+        if codes and not self._em_allow():
+            raise DataError(f"个股报价全部获取失败（{len(codes)} 只，东财熔断冷却中）")
         rows = [] if sink is None else sink
         for code in codes:
             try:

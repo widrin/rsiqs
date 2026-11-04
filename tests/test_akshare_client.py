@@ -512,6 +512,33 @@ def test_tencent_rows_batches_by_60_and_skips_empty(monkeypatch):
     assert out.empty and list(out.columns) == SPOT_COLS
 
 
+def test_spot_for_codes_skips_em_during_cooldown(monkeypatch):
+    calls = []
+
+    def quote(symbol):
+        calls.append(symbol)
+        return _bid_ask(BID_ASK)
+
+    text = _tencent_line("600000", "浦发银行", 10.09, 10.09, 10.05, 10.23, 0.0, 824086, 83502)
+    monkeypatch.setattr(akc.requests, "get", lambda url, **kw: FakeResp(text))
+    fake_ak(monkeypatch, stock_bid_ask_em=quote,
+            stock_zh_a_spot_em=lambda: pytest.fail("熔断冷却中不该再打东财快照"),
+            stock_zh_a_spot=lambda: pytest.fail("腾讯已补齐报价"))
+    c = AkClient(wait=0)
+    c._em_skip_until = akc.time.time() + 60  # 模拟连续失败后进入冷却期
+    df = c.spot(["600000"], fallback=True)
+    assert calls == [] and df.iloc[0]["last"] == 10.09
+
+
+def test_spot_full_market_skips_em_during_cooldown(monkeypatch):
+    fake_ak(monkeypatch, stock_zh_a_spot_em=lambda: pytest.fail("熔断冷却中不该再打东财"),
+            stock_zh_a_spot=lambda: SINA_SPOT)
+    c = AkClient(wait=0)
+    c._em_skip_until = akc.time.time() + 60
+    df = c.spot()
+    assert list(df["code"]) == ["600000", "300750"]
+
+
 def test_names_from_exchange_lists(monkeypatch):
     sh = {"主板A股": pd.DataFrame({"证券代码": ["600000"], "证券简称": ["浦发银行"]}),
           "科创板": pd.DataFrame({"证券代码": ["688001"], "证券简称": ["华兴源创"]})}

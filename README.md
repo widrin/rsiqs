@@ -127,6 +127,7 @@ docs/plans/  设计文档与实施计划
 | 路径 | 内容 |
 |---|---|
 | `data/rsiqs.sqlite` | 账户、持仓、成交、净值、推荐、任务状态、LLM 记录 |
+| `data/em_cooldown.json` | 东财熔断状态（跨任务共享的冷却期，可删；删除后下次失败会重新计时） |
 | `data/cache/` | 前复权/不复权日线、指数、分红、股票名称（可删，重跑 `bootstrap` 重建） |
 | `logs/jobs.log` | 所有任务、LLM、推送的日志 |
 | `logs/locks/` | 任务互斥锁文件 |
@@ -156,7 +157,7 @@ uv run python -c "from pathlib import Path; from engine.integrity import verify;
 - **群里没收到消息**：`WECOM_WEBHOOK_URL` 为空或填错；用上面的一行连通测试确认。
 - **任务没执行**：任务以 SYSTEM 身份运行、不依赖登录状态；用上面的查询命令确认任务存在且 `schtasks /run /tn RSIQS_settle` 手动触发一次，再看日志。
 - **`engine/` 完整性告警**：`engine/` 是锁定区，改动后 `research` 会空转（exit 0 但无产出）。确认改动无误后人工重写清单并提交。
-- **日志出现东财限流、切换新浪**：`push2` 反复请求会延长封禁，不要连续手动重跑盘前任务。
+- **日志出现东财限流、切换新浪**：所有东财请求已按 1 秒间隔串行并带抖动，连续 3 次失败会写入 `data/em_cooldown.json` 冷却 30 分钟（各任务共享）；冷却期内日线走新浪、个股报价走腾讯。不要连续手动重跑盘前任务。
 - **启动即报 `LLM_BASE_URL` 为空**：`.env` 未填或系统环境变量把它覆盖成了空值。
 
 ## 文档
