@@ -1,11 +1,12 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 
 import pandas as pd
 import pytest
 
 import engine.integrity as integrity
 import engine.promotion as promotion
-from engine.types import Pick
+from engine.ledger import Account, Position
+from engine.types import Fill, Pick
 from jobs import bootstrap, settle
 from notify.wecom import NullNotifier
 from tests.jobfakes import (CODES, NAMES, FakeCache, FakeClient, cal, install_context,
@@ -63,6 +64,20 @@ def test_catch_up_multiple_missed_days(env):
     assert bench.iloc[-1] == pytest.approx(expected)
     assert env["cache"].updates[-1] == dates[104]  # 补跑前一次性刷新到最后一天
     assert env["decided"] == dates[101:105]  # 每个结算日跑一次晋升判定
+
+
+def test_notify_fills_sell_reports_realized_pnl():
+    """卖出成交回执带已实现盈亏：1000 股、成本 10.0、卖出 11.0、费用 5 元 -> +995 元。"""
+    acc = Account(name="h:active", cash=0.0)
+    pos = Position(code="600001", name="测试", qty=1000, available=0, cost=10.0,
+                   entry_date=date(2026, 10, 12), stop=9.0, target=11.0, exit_date=date(2026, 10, 16))
+    f = Fill(date=date(2026, 10, 16), code="600001", side="SELL", qty=1000, price=11.0,
+             fee=5.0, reason="止盈")
+    n = NullNotifier()
+    settle._notify_fills(date(2026, 10, 16), [f], acc, {"600001": pos}, n)
+    assert len(n.sent) == 1
+    assert "卖出 600001 测试 止盈" in n.sent[0]
+    assert "已实现盈利 +995 元（+10.0%）" in n.sent[0]
 
 
 def test_rerun_is_idempotent(env):

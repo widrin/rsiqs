@@ -99,8 +99,11 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
             if f"{code}:{event}" in sent:
                 continue
             sent.add(f"{code}:{event}")
+            # 疑似除权时现价已按除权后、成本还没换算，两者不可比，不算浮盈
+            pnl = "" if event == "疑似除权" else (
+                f"，浮动盈亏 {(last - pos.cost) * pos.qty:+.0f} 元（{last / pos.cost - 1:+.1%}）")
             msg = format_alert(f"{event} {code} {pos.name}",
-                               f"{detail}；持仓 {pos.qty} 股，成本 {pos.cost:.2f}")
+                               f"{detail}；持仓 {pos.qty} 股，成本 {pos.cost:.2f}{pnl}")
             notifier.send_text(msg)
             out.append(msg)
     if out or dirty:

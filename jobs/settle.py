@@ -240,13 +240,14 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
                             warnings.append(f"{name} 持仓 {code} 于 {ex.isoformat()} 除权除息：股数 "
                                             f"{act['qty_before']} → {act['qty_after']}，税后分红 {act['cash']:.2f} 元"
                                             + late)
+        before = dict(acc.positions)  # 卖出的持仓成交后会被移除，先留快照算已实现盈亏
         fills = broker.execute_day(acc, d, bars, picks, calendar, per_pick)
         # 先存账户再记净值：中途中断时，重跑看到 last_trade_day == d，execute_day 不会重复成交，只补记净值
         store.save_account(acc)
         prices = {c: v for c in acc.positions if (v := _valuation(cache, c, d)) is not None}
         store.record_nav(name, d, acc.equity(prices))
         if notifier is not None and name == common.ACTIVE_ACCOUNT:
-            _notify_buys(d, fills, acc, notifier)
+            _notify_fills(d, fills, acc, before, notifier)
 
     for status in ("incumbent", "shadow"):
         for strat in store.strategies_with_status(status):
@@ -279,20 +280,30 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     return warnings
 
 
-def _notify_buys(d: date, fills, acc, notifier) -> None:
-    """推送实盘模拟账户当天的买入成交（含成交价、费用、成本与止损止盈）。
+def _notify_fills(d: date, fills, acc, before: dict, notifier) -> None:
+    """推送实盘模拟账户当天的成交：买入给成本与止损止盈，卖出给成交价与已实现盈亏。
 
     settle 重跑时 execute_day 不会重复成交、fills 为空，所以不会重复推送。"""
     for f in fills:
-        if f.side != "BUY":
-            continue
-        pos = acc.positions.get(f.code)
-        if pos is None:  # 当天买入当天卖出（到期）时持仓已移除，不再推买入
-            continue
-        notifier.send_text(format_alert(
-            f"买入 {f.code} {pos.name}",
-            f"{d.isoformat()} 开盘买入 {f.qty} 股，成交价 {f.price:.2f}，费用 {f.fee:.2f} 元\n"
-            f"成本 {pos.cost:.2f}，止损 {pos.stop:.2f}，止盈 {pos.target:.2f}，持有至 {pos.exit_date.isoformat()}"))
+        if f.side == "BUY":
+            pos = acc.positions.get(f.code)
+            if pos is None:  # 当天买入当天卖出（到期）时持仓已移除，卖出那条已经说明结果
+                continue
+            notifier.send_text(format_alert(
+                f"买入 {f.code} {pos.name}",
+                f"{d.isoformat()} 开盘买入 {f.qty} 股，成交价 {f.price:.2f}，费用 {f.fee:.2f} 元\n"
+                f"成本 {pos.cost:.2f}，止损 {pos.stop:.2f}，止盈 {pos.target:.2f}，"
+                f"持有至 {pos.exit_date.isoformat()}"))
+        else:
+            pos = before.get(f.code)
+            if pos is None:
+                continue
+            cost = pos.cost * f.qty
+            pnl = f.price * f.qty - f.fee - cost
+            notifier.send_text(format_alert(
+                f"卖出 {f.code} {pos.name} {f.reason}",
+                f"{d.isoformat()} 以 {f.price:.2f} 卖出 {f.qty} 股，费用 {f.fee:.2f} 元\n"
+                f"成本 {pos.cost:.2f}，已实现盈利 {pnl:+.0f} 元（{pnl / cost:+.1%}）"))
 
 
 def _send_warnings(d: date, warnings: list[str], store, notifier, today: date) -> None:
