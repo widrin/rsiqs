@@ -62,23 +62,29 @@ uv run pytest
 
 ## 日常运行：Windows 计划任务
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tasks.ps1
-```
-
-注册到任务计划程序文件夹 `\RSIQS\`，以当前用户身份、仅在登录时运行（重复执行安全，会覆盖旧定义）：
+本机已注册 8 个任务：位于根路径 `\`、名称前缀 `RSIQS_`、SYSTEM 身份，统一经 `scripts\run_job.ps1` 进入仓库目录后调用 `uv`：
 
 | 任务 | 触发 | 入口 | 作用 |
 |---|---|---|---|
-| PremarketScan | 工作日 08:30（可唤醒计算机） | `jobs.premarket_scan` | 量化扫描 + 两路 LLM 深度分析，为每只候选写出竞价区间、最高买入价、止损、目标 |
-| PremarketFinal | 工作日 09:25（可唤醒计算机） | `jobs.premarket_final` | 等竞价数据落定（09:25:15）后规则过滤 + 轻量确认，09:28 前推送；09:35 之后视为过时跳过 |
-| Monitor | 工作日 09:30 | `jobs.monitor` | 前台常驻，每 120 秒检查 `h:active` 持仓，触发止损/止盈/炸板即推送，15:00 退出 |
-| Settle | 工作日 15:35，每 20 分钟重试共 5 小时 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
-| Review | 工作日 16:05，同样重试 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
-| Research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘（错过即跳过） |
-| Catchup | 登录后 3 分钟 | `jobs.settle` → `jobs.review` | 开机补跑，依次执行 |
+| RSIQS_premarket_scan | 工作日 08:30 | `jobs.premarket_scan` | 量化扫描 + 两路 LLM 深度分析，为每只候选写出竞价区间、最高买入价、止损、目标 |
+| RSIQS_premarket_final | 工作日 09:25 | `jobs.premarket_final` | 等竞价数据落定（09:25:15）后规则过滤 + 轻量确认，09:28 前推送；09:35 之后视为过时跳过 |
+| RSIQS_monitor | 工作日 09:30 起，每 2 分钟重复 5 小时 30 分 | `jobs.monitor` | 常驻，检查 `h:active` 持仓，触发止损/止盈/炸板即推送，15:00 退出 |
+| RSIQS_settle | 工作日 15:35 起，每 20 分钟重试至 17:05 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
+| RSIQS_review | 工作日 16:05 起，每 20 分钟重试至 17:35 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
+| RSIQS_research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘（错过即跳过） |
+| RSIQS_doctor | 每天 07:30 | `jobs.doctor` | 体检 + 已知故障自动修复 + 未修复异常诊断 |
+| RSIQS_boot_catchup | 开机时 | `jobs.settle` → `jobs.review` | 开机补跑，依次执行 |
 
-卸载：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\uninstall_tasks.ps1`
+查看状态与下次运行时间：
+
+```powershell
+Get-ScheduledTask | Where-Object TaskName -Like 'RSIQS_*' | Format-Table TaskName, State
+schtasks /query /fo LIST | Select-String 'RSIQS_' -Context 1,3
+```
+
+注意：`scripts\install_tasks.ps1` / `uninstall_tasks.ps1` 仍是早期版本（注册到 `\RSIQS\` 文件夹、当前用户身份、7 个任务且无 doctor），
+与本机实际注册的任务不一致。**不要直接运行安装脚本**，否则会再注册一套同名不同路径的任务造成重复执行；卸载脚本也删不到现有任务。
+确需重建时先按上表核对；把脚本对齐后再执行更稳妥。
 
 非交易日由代码自行跳过；同一任务同一时刻只有一个进程在跑（`logs/locks/*.lock` 跨进程互斥），
 所以开机补跑与定时任务重叠不会互相干扰。
@@ -95,7 +101,7 @@ uv run python -m jobs.premarket_scan   # 盘前扫描 + 深度分析
 uv run python -m jobs.premarket_final  # 竞价定稿 + 推送
 uv run python -m jobs.monitor          # 盘中监控（前台常驻，Ctrl+C 结束）
 uv run python -m jobs.research         # 研究循环（耗时较长）
-uv run python -m jobs.doctor           # 系统体检（未注册计划任务，建议每日手动或自行加触发器）
+uv run python -m jobs.doctor           # 系统体检（每日 07:30 由 RSIQS_doctor 触发，也可手动跑）
 ```
 
 `jobs.doctor` 会检查近期失败任务、锚定日缺失 K 线（自动增量回填）、指数缺口、数据源限流日志、
