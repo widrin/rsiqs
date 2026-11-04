@@ -54,6 +54,7 @@ def test_stop_target_zhaban_alerts_deduped_per_day():
     assert "触发止损" in text and "600001" in text
     assert "触发止盈" in text and "600002" in text
     assert "炸板" in text and "600003" in text
+    assert all(msg.startswith("【RSIQS 交易】") for msg in first)  # 交易信号，不是错误告警
     # 告警带相对成本的浮动盈亏（成本 10.0、1000 股）：止损为负，止盈为正
     assert "浮动盈亏 -800 元（-8.0%）" in text
     assert "浮动盈亏 +1200 元（+12.0%）" in text

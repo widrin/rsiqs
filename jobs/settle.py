@@ -293,7 +293,7 @@ def _notify_fills(d: date, fills, acc, before: dict, notifier) -> None:
                 f"买入 {f.code} {pos.name}",
                 f"{d.isoformat()} 开盘买入 {f.qty} 股，成交价 {f.price:.2f}，费用 {f.fee:.2f} 元\n"
                 f"成本 {pos.cost:.2f}，止损 {pos.stop:.2f}，止盈 {pos.target:.2f}，"
-                f"持有至 {pos.exit_date.isoformat()}"))
+                f"持有至 {pos.exit_date.isoformat()}", kind="trade"))
         else:
             pos = before.get(f.code)
             if pos is None:
@@ -303,7 +303,7 @@ def _notify_fills(d: date, fills, acc, before: dict, notifier) -> None:
             notifier.send_text(format_alert(
                 f"卖出 {f.code} {pos.name} {f.reason}",
                 f"{d.isoformat()} 以 {f.price:.2f} 卖出 {f.qty} 股，费用 {f.fee:.2f} 元\n"
-                f"成本 {pos.cost:.2f}，已实现盈利 {pnl:+.0f} 元（{pnl / cost:+.1%}）"))
+                f"成本 {pos.cost:.2f}，已实现盈利 {pnl:+.0f} 元（{pnl / cost:+.1%}）", kind="trade"))
 
 
 def _send_warnings(d: date, warnings: list[str], store, notifier, today: date) -> None:
@@ -325,7 +325,7 @@ def settle_and_decide(d: date, settings, store, cache, calendar, notifier, div_f
         _send_warnings(d, warnings, store, notifier, run_date or common.today())
     for ev in promotion.decide(store, d, calendar):
         notifier.send_text(format_alert(f"策略{KIND_CN.get(ev.kind, ev.kind)}",
-                                        f"{ev.strategy}：{ev.detail}"))
+                                        f"{ev.strategy}：{ev.detail}", kind="strategy"))
 
 
 def main(now: datetime | None = None) -> list[date]:

@@ -59,5 +59,14 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
     return "\n".join(lines)
 
 
-def format_alert(title: str, body: str) -> str:
-    return f"【RSIQS 告警】{title}\n{body}"
+ALERT_PREFIXES = {
+    "alert": "【RSIQS 告警】",     # 需要人工关注的错误、异常、任务失败
+    "trade": "【RSIQS 交易】",     # 模拟盘成交、止损止盈等交易信号
+    "strategy": "【RSIQS 策略】",  # 策略晋升、降级、淘汰
+    "notice": "【RSIQS 通知】",    # 其他普通信息
+}
+
+
+def format_alert(title: str, body: str, kind: str = "alert") -> str:
+    """kind 决定前缀，便于在群里区分错误和普通消息；未知 kind 直接报错，避免配错静默成错误类别。"""
+    return f"{ALERT_PREFIXES[kind]}{title}\n{body}"

@@ -432,7 +432,7 @@ def _summary(today: date, out: dict, error: str) -> str:
     title = f"研究会话 {today.isoformat()}：{label}"
     if out["status"] in ("llm_error", "error"):
         return format_alert(title, "\n".join(lines))
-    return f"RSIQS {title}\n" + "\n".join(lines)
+    return format_alert(title, "\n".join(lines), kind="notice")
 
 
 def res_names(out: dict) -> str:

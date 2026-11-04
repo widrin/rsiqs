@@ -1,6 +1,8 @@
 # tests/test_format.py
 from datetime import date
 
+import pytest
+
 from engine.types import Pick
 from notify.format import format_alert, format_daily_report, format_recommendation
 
@@ -56,9 +58,17 @@ def test_daily_report_without_holdings_argument_has_no_section():
 
 
 def test_alert():
-    s = format_alert("触发止损", "600000 浦发银行 现价 9.30")
-    assert s.startswith("【RSIQS 告警】触发止损")
-    assert "600000 浦发银行 现价 9.30" in s
+    s = format_alert("任务失败 settle", "600000 数据不完整")
+    assert s.startswith("【RSIQS 告警】任务失败 settle")
+    assert "600000 数据不完整" in s
+
+
+def test_alert_kinds_are_distinguishable():
+    assert format_alert("触发止损", "现价 9.30", kind="trade").startswith("【RSIQS 交易】")
+    assert format_alert("策略降级", "", kind="strategy").startswith("【RSIQS 策略】")
+    assert format_alert("研究会话完成", "", kind="notice").startswith("【RSIQS 通知】")
+    with pytest.raises(KeyError):  # 类别写错不能静默推成告警
+        format_alert("x", "", kind="bad")
 
 
 def test_multiline_reason_and_view_stay_in_place():
