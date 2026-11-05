@@ -59,6 +59,7 @@ def _unexplained_ex(code: str, prev: float, cache, d: date, calendar, settled_pr
 
 def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> list[str]:
     """检查一次持仓，返回本次新发出的告警；(code, 事件) 去重键按日持久化在 kv。
+    09:30 起每次扫描都会给刚解锁的今日新建仓推一条确认（T+1 前不能卖，09:30 start_day 后解锁）。
     cache 提供分红送转记录：建仓后除权除息、结算还没调整的持仓按换算后的止损、止盈价判断。
     东财个股报价取不到时回退全市场快照（见 AkClient.spot 的 fallback）；某只持仓仍然连续
     MISSING_ALERT_AFTER 次没有报价，说明这只股票今天没有止损、止盈保护，按日推送一次提醒。"""
@@ -75,6 +76,31 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
     last_nav = store.last_nav_date(ACCOUNT)
     settled_prev = calendar is not None and last_nav is not None and last_nav >= calendar.prev_day(d)
     for code, pos in acc.positions.items():
+        # 建仓确认：买入次日（或更久后首次被 start_day 解锁）首次扫到就推一条
+        # acc.available 在 T+1 解锁前为 0（start_day 设的），解锁后等于 pos.qty
+        # calendar is None 时跳过（离线测试；生产环境 main() 总传入 calendar）
+        if calendar is not None and pos.available > 0 \
+                and pos.entry_date == calendar.prev_day(d) \
+                and f"{code}:T+1解锁" not in sent:
+            sent.add(f"{code}:T+1解锁")
+            dirty = True
+            pnl = ""
+            r = rows.get(code)
+            if r is not None:
+                last, prev = _num(r.get("last")), _num(r.get("prev_close"))
+                if last > 0:
+                    pnl = (f"，浮盈 {(last - pos.cost) * pos.qty:+.0f} 元（{last / pos.cost - 1:+.1%}）"
+                           f"，昨收 {prev:.2f}")
+            msg = format_alert(
+                f"T+1 解锁 {code} {pos.name}",
+                f"昨收买入 {pos.qty} 股，成本 {pos.cost:.2f}，止损 {pos.stop:.2f}，"
+                f"止盈 {pos.target:.2f}，持有至 {pos.exit_date.isoformat()}；"
+                f"今日起可卖{pnl}",
+                kind="trade")
+            notifier.send_text(msg)
+            out.append(msg)
+            # T+1 解锁是一次性确认：后面不再对这只持仓推止损/止盈/炸板之外的事件
+            # 继续往下走到下面的到期判断
         if pos.exit_date <= d:  # 到期的持仓开盘已按到期卖出，盘中不再提醒止损、止盈
             continue
         r = rows.get(code)
