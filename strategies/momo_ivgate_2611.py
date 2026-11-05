@@ -3,7 +3,6 @@ import math
 
 import pandas as pd
 
-from config import get_settings
 from engine.dataview import DataView
 from engine.rules import at_limit_up, is_st, limit_prices
 from engine.types import Pick
@@ -59,7 +58,7 @@ class MomoIvGate2611:
         return [
             Pick(code=r.code, name=r.name, score=float(r.score),
                  entry_max=round(r.close * 1.03, 2), stop=round(r.close * 0.96, 2),
-                 target=round(r.close * 1.12, 2), hold_days=get_settings().hold_days_for(self.name),
+                 target=round(r.close * 1.12, 2), hold_days=8,
                  reason=f"20日涨幅{r.r20:.1%}，5日涨幅{r.r5:.1%}，60日波动{r.vol60:.1%}未超前20%，止损−4%止盈+12%持有8天，收盘{r.close:.2f}")
             for r in df.itertuples(index=False)
         ]

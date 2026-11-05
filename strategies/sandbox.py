@@ -3,7 +3,6 @@
 import ast
 
 ALLOWED_IMPORTS = {"math", "statistics", "numpy", "pandas", "dataclasses", "typing",
-                   "config",
                    "engine.types", "engine.dataview", "engine.rules"}
 # strategies.base 不在白名单：它模块级导入了 pathlib.Path；策略按鸭子类型实现 Strategy 接口，不需要 import 它
 BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
