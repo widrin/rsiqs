@@ -79,12 +79,25 @@ uv run pytest
 查看状态与下次运行时间：
 
 ```powershell
-Get-ScheduledTask | Where-Object TaskName -Like 'RSIQS_*' | Format-Table TaskName, State
-schtasks /query /fo LIST | Select-String 'RSIQS_' -Context 1,3
+.\scripts\service.ps1 status
 ```
 
-注意：安装/卸载脚本按上表配置写成（`scripts\install_tasks.ps1` 注册、`scripts\uninstall_tasks.ps1` 卸载），
-注册 SYSTEM 任务需要**管理员 PowerShell**。重装或迁移机器时以脚本为准，注册后用上面的命令核对触发时间。
+## 部署 / 启动 / 暂停 / 移除
+
+统一入口 `scripts\service.ps1`（`install/start/stop/remove` 需要**管理员 PowerShell**，`status` 不需要）：
+
+```powershell
+.\scripts\service.ps1 install              # 检查 venv/.env 必填项，注册 8 个任务
+.\scripts\service.ps1 install -Bootstrap   # 同上，并首次拉取历史日线（约 1 小时，中断可重跑）
+.\scripts\service.ps1 start                # 启用全部任务
+.\scripts\service.ps1 stop                 # 停掉运行中实例，再禁用全部任务（数据保留）
+.\scripts\service.ps1 remove               # 删除全部任务（数据库、日志、engine/ 保留）
+.\scripts\service.ps1 status               # 任务状态、上次结果、下次运行时间
+```
+
+- `stop` 之后可随时 `start` 恢复；`remove` 后需 `install` 重新注册
+- 部署脚本按上表配置写入，重装或迁移机器时以它为准（底层仍是 `install_tasks.ps1` / `uninstall_tasks.ps1`）
+- 注意 `RSIQS_boot_catchup` 在开机时补跑结算与复盘，只删其它任务不删它会继续执行，用 `remove` 整组删除
 
 非交易日由代码自行跳过；同一任务同一时刻只有一个进程在跑（`logs/locks/*.lock` 跨进程互斥），
 所以开机补跑与定时任务重叠不会互相干扰。
@@ -117,7 +130,7 @@ strategies/  量化策略（现任 + 候选）
 jobs/        各时间点入口脚本（计划任务调用）
 notify/      企业微信推送与消息格式
 playbook/    盘前/复盘 system prompt 与 active/candidate 配置
-scripts/     冒烟脚本、计划任务安装/卸载
+scripts/     冒烟脚本、服务控制（service.ps1）与计划任务安装/卸载
 tests/       pytest 用例（全部离线）
 docs/plans/  设计文档与实施计划
 ```
