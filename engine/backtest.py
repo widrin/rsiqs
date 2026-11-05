@@ -90,7 +90,7 @@ def run_backtest(strategy, panel, names, calendar: TradingCalendar, start: date,
         # 持有期越过日历末尾的 pick 无法确定到期日，丢弃（t 之后还剩 horizon-1-i 个交易日）
         picks = [p for p in picks if p.hold_days <= horizon - 1 - i]
         bars = day_bars.get(t)
-        broker.execute_day(acct, t, bars, picks, calendar, capital / max_picks)
+        broker.execute_day(acct, t, bars, picks, calendar, capital / max_picks, total_capital=capital)
         # 收盘价缺失（NaN）时沿用上一个有效收盘价，净值不会变成 NaN
         last_close.update({c: b.close for c, b in bars.items() if math.isfinite(b.close)})
         navs.append(acct.equity(last_close))

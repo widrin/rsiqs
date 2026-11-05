@@ -45,7 +45,8 @@ class SimBroker:
         self.slip = slippage_bps / 10_000
 
     def execute_day(self, account: Account, d: date, bars: dict[str, Bar], picks: list[Pick],
-                    calendar: TradingCalendar, capital_per_pick: float) -> list[Fill]:
+                    calendar: TradingCalendar, capital_per_pick: float,
+                    total_capital: float | None = None) -> list[Fill]:
         """Simulate trading day ``d`` for ``account`` in three steps.
 
         Each day runs once per account: if ``d`` equals ``account.last_trade_day`` this returns
@@ -124,7 +125,15 @@ class SimBroker:
             if bar.open <= pick.stop:
                 continue  # opened at or below the stop: the plan is already broken
             price = _clip(bar.open * (1 + self.slip), band)
-            qty = round_lot(min(capital_per_pick, account.cash * 0.999) / price)
+            if pick.weight is not None:
+                # AI 建议仓位：budget = total_capital * weight，受剩余现金夹取。
+                # total_capital 未提供（backtest / 旧测试）时退回 capital_per_pick 的等分行为，
+                # 让 weight 仍起作用但不突破传统总仓位上限。
+                base = total_capital if total_capital is not None else capital_per_pick * 5
+                budget = base * pick.weight
+            else:
+                budget = capital_per_pick
+            qty = round_lot(min(budget, account.cash * 0.999) / price)
             # 0.1% buffer may not cover the 5-yuan minimum commission: shrink until affordable
             while qty >= 100 and price * qty + calc_fee("BUY", price * qty, d) > account.cash:
                 qty -= 100

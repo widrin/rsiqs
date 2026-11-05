@@ -25,6 +25,7 @@ from engine.dataview import DataView
 from engine.rules import limit_pct, limit_prices
 from engine.store import Store
 from engine.types import Pick
+from jobs import common as _common
 from notify.format import format_recommendation
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class PlannedPick(BaseModel):
     min_gap_pct: float
     max_gap_pct: float
     reason: str
+    weight: float | None = None  # 建议投入占总资金的比例 (0, 1]；veto 或无明确意见时填 0 或 null
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -71,6 +73,21 @@ class PlannedPick(BaseModel):
         if 2.0 <= v <= 100.0:
             v /= 100.0
         return min(max(v, 0.0), 1.0)
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def _weight_range(cls, v):
+        """模型没给 weight 时为 None（系统自己按 max_picks 等分）。给了就要在 (0, 1]；
+        0 或 veto 时把 None 让 broker 跳过。"""
+        if v is None or v == "":
+            return None
+        try:
+            vv = float(v)
+        except (TypeError, ValueError):
+            return None  # 格式错就忽略，不阻塞整个 plan
+        if not math.isfinite(vv) or vv <= 0 or vv > 1:
+            return None  # 越界忽略
+        return vv
 
 
 class PremarketPlan(BaseModel):
@@ -165,6 +182,30 @@ def _load_candidates(d: dt.date, store: Store) -> tuple[list[Pick], dict]:
     return loaded
 
 
+def _account_snapshot(store: Store, account_name: str, d: dt.date) -> str:
+    """盘前给 LLM 喂账户快照：现金、持仓、今日到期数。None 或异常时返回空字符串（不阻塞分析）。"""
+    try:
+        acc = store.load_account(account_name)
+    except Exception:  # noqa: BLE001
+        return ""
+    if acc is None:
+        return ""
+    parts = [f"账户 {account_name}：可用现金 ¥{acc.cash:,.0f}，持仓 {len(acc.positions)} 只"]
+    if acc.positions:
+        rows = []
+        expiring_today = []
+        for code, pos in acc.positions.items():
+            rows.append(
+                f"  {code} {pos.name} {pos.qty} 股，成本 {pos.cost:.2f}，"
+                f"止损 {pos.stop:.2f}，止盈 {pos.target:.2f}，到期 {pos.exit_date.isoformat()}")
+            if pos.exit_date <= d:
+                expiring_today.append(f"{code} {pos.name}")
+        parts += rows
+        if expiring_today:
+            parts.append(f"今日到期（预计卖出）：{'、'.join(expiring_today)}")
+    return "\n".join(parts) + "\n"
+
+
 def _plan_key(d: dt.date, kind: str) -> str:
     return f"plan:{d.isoformat()}:{kind}"
 
@@ -217,10 +258,11 @@ def _item(n: dict, width: int = 100) -> str:
     return f"[{n.get('time', '')}] {body}"
 
 
-def _analyze_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict) -> str:
+def _analyze_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict, account_snapshot: str = "") -> str:
     stats = ctx.get("stats", {})
     lines = [f"# 交易日 {d.isoformat()}（08:30 盘前，集合竞价尚未开始）", "",
              f"## 经验规则（playbook v{pb.get('version', 1)}）", playbook.render(pb), "",
+             f"## 当前账户快照", account_snapshot or "（账户数据暂缺）",
              f"## 候选股票（量化排序，共 {len(cands)} 只）"]
     for p in cands:
         s = stats.get(p.code, {})
@@ -237,7 +279,10 @@ def _analyze_prompt(d: dt.date, pb: dict, cands: list[Pick], ctx: dict) -> str:
     lines += ["", "## 候选个股新闻", *(stock_news or ["（无）"])]
     lines += ["", "## 隔夜要闻（财联社电报）", *(news or ["（无）"])]
     lines += ["", f"请对以上 {len(cands)} 只候选逐一给出 action、confidence、价位与竞价条件"
-                  "（min_gap_pct / max_gap_pct），code 与上表完全一致。"]
+                  "（min_gap_pct / max_gap_pct），code 与上表完全一致。"
+              "weight 字段给出每只 keep 建议投入占总资金的比例（0~1），"
+              "veto 或拿不准时填 0 或 null。各 keep 的 weight 建议之和 ≈ 1，"
+              "但如果持仓空间或现金不足可以不投满。"]
     return "\n".join(lines)
 
 
@@ -309,9 +354,10 @@ def analyze(d: dt.date, settings: Settings, store: Store, llm: LLM, playbook_kin
         if not cands:  # 策略当天一只都没选出来：不花深度分析的钱
             log.info("premarket analyze %s: no candidates", playbook_kind)
             return None
+        snapshot = _account_snapshot(store, _common.ACTIVE_ACCOUNT, d)
         raw = llm.parse(purpose=f"analyze:{playbook_kind}", system=playbook.load_prompt("premarket"),
-                        user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx), schema=PremarketPlan,
-                        timeout=timeout)
+                        user=_analyze_prompt(d, playbook.load(playbook_kind), cands, ctx, snapshot),
+                        schema=PremarketPlan, timeout=timeout)
         codes = {p.code for p in cands}
         picks: list[PlannedPick] = []
         for pp in raw.picks:
@@ -357,7 +403,7 @@ def _merge(q: Pick, pp: PlannedPick) -> Pick:
     if not (stop < entry < target and all(lo <= x <= hi for x in (stop, entry, target))):
         entry, stop, target = q.entry_max, q.stop, q.target
     return Pick(code=q.code, name=q.name, score=float(pp.confidence), entry_max=entry, stop=stop, target=target,
-                hold_days=q.hold_days, reason=pp.reason.strip() or q.reason)
+                hold_days=q.hold_days, reason=pp.reason.strip() or q.reason, weight=pp.weight)
 
 
 def auction_filter(plan: PremarketPlan, cands: list[Pick], spot: pd.DataFrame | None) -> list[Pick]:

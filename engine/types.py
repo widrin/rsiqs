@@ -29,6 +29,7 @@ class Pick:
     target: float
     hold_days: int
     reason: str = ""
+    weight: float | None = None  # 建议投入资金占总资金的比例，None 时 broker 用默认等分。范围 (0, 1]
 
     def __post_init__(self):
         """Coerce prices to float and hold_days to int; reject values the broker cannot trade.
@@ -53,6 +54,15 @@ class Pick:
             raise ValueError(f"Pick {self.code}: hold_days must be >= 1, got {self.hold_days}")
         if not self.stop < self.target:
             raise ValueError(f"Pick {self.code}: stop {self.stop} must be below target {self.target}")
+        w = self.weight
+        if w is not None:
+            try:
+                wv = float(w)
+            except (TypeError, ValueError):
+                raise ValueError(f"Pick {self.code}: weight must be a number, got {w!r}") from None
+            if not (math.isfinite(wv) and 0 < wv <= 1):
+                raise ValueError(f"Pick {self.code}: weight must be in (0, 1], got {wv}")
+            object.__setattr__(self, "weight", wv)
 
     def to_dict(self) -> dict:
         return asdict(self)

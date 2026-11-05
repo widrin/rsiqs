@@ -190,7 +190,6 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     tracked = set(codes)
     view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
     broker, per_pick = SimBroker(), settings.capital / settings.max_picks
-
     def raw_bars(codes) -> dict:
         need = sorted(set(codes))
         failed = cache.update_raw(need, d, d - timedelta(days=RAW_START_DAYS))
@@ -241,7 +240,8 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
                                             f"{act['qty_before']} → {act['qty_after']}，税后分红 {act['cash']:.2f} 元"
                                             + late)
         before = dict(acc.positions)  # 卖出的持仓成交后会被移除，先留快照算已实现盈亏
-        fills = broker.execute_day(acc, d, bars, picks, calendar, per_pick)
+        fills = broker.execute_day(acc, d, bars, picks, calendar, per_pick,
+                                   total_capital=settings.capital)
         # 先存账户再记净值：中途中断时，重跑看到 last_trade_day == d，execute_day 不会重复成交，只补记净值
         store.save_account(acc)
         prices = {c: v for c in acc.positions if (v := _valuation(cache, c, d)) is not None}
