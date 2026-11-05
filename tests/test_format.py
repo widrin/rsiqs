@@ -45,7 +45,7 @@ def test_daily_report_lists_holdings_pnl():
     s = format_daily_report(date(2026, 10, 16), rows, "", holdings)
     assert "收盘持仓收益" in s
     assert "**h:active** 浮动盈亏 +150 元（+1.50%）" in s
-    assert "- 600000 浦发银行 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），当日 +1.50%" in s
+    assert "- 600000 浦发银行 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），今日 +1.50%" in s
 
 
 def test_daily_report_says_empty_when_no_holdings():

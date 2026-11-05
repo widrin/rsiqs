@@ -140,10 +140,15 @@ def _holding_rows(store: Store, cache: BarCache, d: dt.date) -> list[dict]:
             pos = acc.positions[code]
             price, day_ret = _close_info(cache, code, d)
             row = {"account": name, "code": code, "name": pos.name, "qty": pos.qty,
-                   "cost": pos.cost, "price": price, "day_ret": day_ret, "pnl": None, "pnl_ret": None}
+                   "cost": pos.cost, "price": price, "day_ret": day_ret,
+                   "day_pnl": None, "day_pnl_ret": None,
+                   "pnl": None, "pnl_ret": None}
             if price is not None:
                 row["pnl"] = (price - pos.cost) * pos.qty
                 row["pnl_ret"] = price / pos.cost - 1.0
+                if day_ret is not None:  # 停牌时 day_ret 为 None，今日盈亏也不算
+                    row["day_pnl"] = price * day_ret * pos.qty
+                    row["day_pnl_ret"] = day_ret
             rows.append(row)
     return rows
 

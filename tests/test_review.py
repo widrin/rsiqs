@@ -264,7 +264,8 @@ def test_report_lists_close_holdings_pnl(env):
     report = env["notifier"].sent[0]
     assert "收盘持仓收益" in report
     assert "**h:active** 浮动盈亏 +150 元（+1.50%）" in report
-    assert "600001 股600001 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），当日 +1.50%" in report
+    assert "今日持仓盈亏 +152 元" in report
+    assert "600001 股600001 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），今日 +152 元（+1.50%）" in report
 
 
 def test_backfilled_report_has_no_holdings(env):

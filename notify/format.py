@@ -46,13 +46,20 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
                 pnl = sum(h["pnl"] for h in priced)
                 basis = sum(h["cost"] * h["qty"] for h in priced)
                 lines.append(f"**{account}** 浮动盈亏 {pnl:+,.0f} 元（{pnl / basis:+.2%}）")
+                day_pnls = [h.get("day_pnl") for h in priced if h.get("day_pnl") is not None]
+                if day_pnls:
+                    lines.append(f"今日持仓盈亏 {sum(day_pnls):+,.0f} 元")
             else:
                 lines.append(f"**{account}**")
             for h in part:
                 if h["price"] is None:
                     lines.append(f"- {h['code']} {h['name']} {h['qty']} 股：成本 {h['cost']:.2f}，收盘价缺失")
                     continue
-                day = f"，当日 {h['day_ret']:+.2%}" if h["day_ret"] is not None else ""
+                day = ""
+                if h.get("day_pnl") is not None:
+                    day = (f"，今日 {h['day_pnl']:+,.0f} 元（{h['day_pnl_ret']:+.2%}）")
+                elif h.get("day_ret") is not None:
+                    day = f"，今日 {h['day_ret']:+.2%}"
                 lines.append(f"- {h['code']} {h['name']} {h['qty']} 股：成本 {h['cost']:.2f} → "
                              f"收盘 {h['price']:.2f}，浮动 {h['pnl']:+,.0f} 元（{h['pnl_ret']:+.2%}）{day}")
     lines.append("**复盘**：" + (_one_line(review_summary) or "（本日无 LLM 复盘）"))
