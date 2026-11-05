@@ -415,7 +415,8 @@ def test_auction_filter_price_sanity_falls_back_to_quant():
 def test_finalize_without_plan_returns_quant(store):
     llm, ak = FakeLLM({}), FakeAk()
     picks, reviewed, view = premarket.finalize(D, settings(), store, llm, ak, "active")
-    assert (picks, reviewed, view) == ([qpick(c, i) for i, c in enumerate(CODES[:3])], False, "")
+    # 无 plan 时返回全部候选（不再截断到 max_picks）
+    assert [p.code for p in picks] == CODES[:6] and reviewed is False and view == ""
     assert llm.calls == [] and ak.spot_calls() == 0
 
 
@@ -425,7 +426,7 @@ def test_finalize_confirm_vetoes_but_never_adds(store):
     llm = FakeLLM({"auction:active": check({"600001": "keep", "600002": "veto", "600004": "keep",
                                            "600000": "keep", "999999": "keep"})})
     picks, reviewed, view = premarket.finalize(D, settings(), store, llm, FakeAk(), "active")
-    assert [p.code for p in picks] == ["600001", "600003"]
+    assert [p.code for p in picks] == ["600001", "600003", "600004"]  # 不再截断 max_picks；之前截到 3 只现在全保留
     assert reviewed is True and view == "偏强（竞价确认：竞价平稳）"
     call = llm.calls[0]
     assert call["system"] == premarket.AUCTION_SYSTEM and call["schema"] is AuctionCheck
@@ -433,7 +434,7 @@ def test_finalize_confirm_vetoes_but_never_adds(store):
     for s in ("600001", "600003", "竞价 10.20（+2.00%）", "500.00万", "占20日均额 2.50%", "涨停 11.00",
               "计划理由600002", "偏强", "有竞价 6 只：高开 6"):  # 竞价概况只统计候选（只取候选的报价）
         assert s in call["user"], s
-    assert "600004" not in call["user"] and "600000" not in call["user"]  # 只列出通过过滤且在 max_picks 内的
+    assert "600004" in call["user"] and "600000" not in call["user"]  # 不截断 max_picks 了；veto 的不在
 
 
 @pytest.mark.parametrize("exc", LLM_ERRORS)
@@ -513,7 +514,7 @@ def test_run_final_kind_without_plan_uses_quant(store):
     llm = FakeLLM({"auction:active": check({})})
     premarket.run_final(D, settings(), store, llm, FakeAk(), Recorder(), CAL)
     cand, meta = store.load_recommendation(D, "h:candidate")
-    assert cand == [qpick(c, i) for i, c in enumerate(CODES[:3])]
+    assert [p.code for p in cand] == CODES[:6]  # 无 plan 时用全量候选
     assert meta["llm_reviewed"] is False and meta["market_view"] == ""
     assert [c["purpose"] for c in llm.calls] == ["auction:active"]
 
@@ -538,8 +539,8 @@ def test_run_final_without_plans_pushes_quant_without_spot(store):
     premarket.run_final(D, settings(), store, FakeLLM({}), ak, notifier, CAL)
     assert ak.spot_calls() == 0
     act, meta = store.load_recommendation(D, "h:active")
-    assert [p.code for p in act] == CODES[:3] and meta["llm_reviewed"] is False
-    assert meta["ref_close"] == {c: 10.0 for c in CODES[:3]}  # 没有快照：记扫描时的昨收，结算再比较
+    assert [p.code for p in act] == CODES[:6] and meta["llm_reviewed"] is False
+    assert meta["ref_close"] == {c: 10.0 for c in CODES[:6]}  # 没有快照：记扫描时的昨收，结算再比较
     assert len(notifier.sent) == 1 and "未经 LLM 审核" in notifier.sent[0]
 
 

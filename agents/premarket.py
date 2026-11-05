@@ -183,14 +183,15 @@ def _load_candidates(d: dt.date, store: Store) -> tuple[list[Pick], dict]:
 
 
 def _account_snapshot(store: Store, account_name: str, d: dt.date) -> str:
-    """盘前给 LLM 喂账户快照：现金、持仓、今日到期数。None 或异常时返回空字符串（不阻塞分析）。"""
+    """盘前给 LLM 喂账户快照：持仓结构（数量、到期），**不喂具体现金金额**——
+    推荐是独立于模拟盘资金的，让 LLM 按信心排序，cash 约束只在 broker 撮合环节生效。"""
     try:
         acc = store.load_account(account_name)
     except Exception:  # noqa: BLE001
         return ""
     if acc is None:
         return ""
-    parts = [f"账户 {account_name}：可用现金 ¥{acc.cash:,.0f}，持仓 {len(acc.positions)} 只"]
+    parts = [f"账户 {account_name}：当前持仓 {len(acc.positions)} 只（现金金额未给出，不影响推荐排序）"]
     if acc.positions:
         rows = []
         expiring_today = []
@@ -470,10 +471,11 @@ def _ref_close(picks: list[Pick], ctx: dict, spot: pd.DataFrame | None) -> dict[
 
 def _rule_result(settings: Settings, plan: PremarketPlan | None, cands: list[Pick],
                  spot: pd.DataFrame | None) -> tuple[list[Pick], bool, str]:
-    """不调用 LLM 的确定性结果：无计划用量化；有计划用规则过滤。也是竞价确认失败或超时时的结果。"""
+    """不调用 LLM 的确定性结果：无计划用量化；有计划用规则过滤。也是竞价确认失败或超时时的结果。
+    注意：不再截断到 max_picks——推荐独立于模拟盘资金约束，broker 撮合时才受 cash/weight 限制。"""
     if plan is None:
-        return cands[: settings.max_picks], False, ""
-    prelim = auction_filter(plan, cands, spot)[: settings.max_picks]
+        return cands, False, ""
+    prelim = auction_filter(plan, cands, spot)
     if not prelim:
         vetoed_all = not any(pp.action == "keep" for pp in plan.picks)
         return [], True, plan.market_view + (NOTE_ALL_VETOED if vetoed_all else NOTE_NONE_PASSED)

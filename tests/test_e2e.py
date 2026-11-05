@@ -67,7 +67,7 @@ def test_two_trading_days_full_cycle(world):
         assert premarket_final.main(now=at(day, 9, 25), sleep=slept.append) is True
         assert slept == pytest.approx([15.0], abs=0.5)         # 等到 09:25:15 再定稿
         recs, meta = store.load_recommendation(day, "h:active")
-        assert recs and len(recs) <= world["settings"].max_picks and meta["llm_reviewed"] is True
+        assert recs and meta["llm_reviewed"] is True  # 不再截断 max_picks（推荐独立于模拟盘资金）
         pushed = notifier.sent[n0:]
         assert len(pushed) == 1 and all(p.code in pushed[0] for p in recs)  # 只推 h:active
         assert store.load_recommendation(day, "h:candidate") is not None
@@ -110,7 +110,7 @@ def test_relay_outage_degrades_to_quant_and_still_reports(world):
     recs, meta = store.load_recommendation(day, "h:active")
     cands, _ = store.load_candidates(day)
     assert meta["llm_reviewed"] is False
-    assert [p.code for p in recs] == [p.code for p in cands[: world["settings"].max_picks]]
+    assert [p.code for p in recs] == [p.code for p in cands]  # 不再截断 max_picks（推荐独立于模拟盘资金）
     assert any("未经 LLM 审核" in m for m in notifier.sent[n0:])    # 量化推荐照常推送
     assert not any(p.startswith("auction") for p in llm.purposes)  # 无计划不做竞价确认
 
