@@ -4,6 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from config import get_settings
 from engine.dataview import DataView
 from engine.rules import at_limit_up, is_st, limit_prices
 from engine.types import Pick
@@ -56,7 +57,7 @@ class LowIvMomo2610:
         return [
             Pick(code=r.code, name=r.name, score=float(r.score),
                  entry_max=round(r.close * 1.03, 2), stop=round(r.close * 0.93, 2),
-                 target=round(r.close * 1.10, 2), hold_days=5,
+                 target=round(r.close * 1.10, 2), hold_days=get_settings().hold_days_for(self.name),
                  reason=f"20日涨幅{r.r20:.1%}，5日涨幅{r.r5:.1%}，60日波动{r.vol60:.1%}偏低，中期动量+短期回调+低波动，收盘{r.close:.2f}")
             for r in df.itertuples(index=False)
         ]

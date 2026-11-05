@@ -8,6 +8,18 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 
+# 每个策略的默认持有天数（与各策略文件当前硬编码值保持一致）。
+# key = STRATEGY.name（策略类的 name 属性，不是文件名）
+_STRATEGY_HOLD_DAYS_DEFAULTS: dict[str, int] = {
+    "baseline_momo": 5,
+    "low_iv_momo_2610": 5,
+    "momo_gap_rev_2611": 5,
+    "momo_ivgate_2611": 8,
+    "momo_tight_2610": 8,
+    "momo_turn_dry_2611": 5,
+}
+_HOLD_DAYS_FALLBACK = 5  # 未知策略的兜底值
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -19,6 +31,7 @@ class Settings:
     capital: float = 500_000.0
     max_picks: int = 5
     root: Path = field(default=ROOT)
+    hold_days_map: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         # 比较式遇到 NaN 为 False，所以 NaN 同样会被拒绝
@@ -31,6 +44,17 @@ class Settings:
             raise ValueError("配置 LLM_BASE_URL 不能为空：填服务商 base_url"
                              "（火山方舟 https://ark.cn-beijing.volces.com/api/v3，其他家见 .env.example）")
 
+    def hold_days_for(self, strategy_name: str) -> int:
+        """返回策略 ``strategy_name`` 的持有天数。
+
+        查找顺序：hold_days_map（由 .env HOLD_DAYS_* 覆写）→ 内置默认值
+        _STRATEGY_HOLD_DAYS_DEFAULTS → 兜底 _HOLD_DAYS_FALLBACK=5。
+        """
+        return self.hold_days_map.get(
+            strategy_name,
+            _STRATEGY_HOLD_DAYS_DEFAULTS.get(strategy_name, _HOLD_DAYS_FALLBACK),
+        )
+
 
 def _num(env, name: str, default: str, cast):
     raw = env(name, default)
@@ -39,6 +63,30 @@ def _num(env, name: str, default: str, cast):
     except ValueError:
         kind = "整数" if cast is int else "数字"
         raise ValueError(f"配置 {name} 必须是{kind}，当前为 {raw!r}") from None
+
+
+def _read_strategy_hold_days(env) -> dict[str, int]:
+    """遍历所有策略名，从 .env / 环境变量读取 HOLD_DAYS_<STRATEGY_UPPER>，
+    未设置或非法时跳过（用默认值）。环境变量键名：策略名全大写，下划线保留。"""
+    result: dict[str, int] = {}
+    for strat, default in _STRATEGY_HOLD_DAYS_DEFAULTS.items():
+        key = f"HOLD_DAYS_{strat.upper()}"
+        try:
+            raw = env(key, "")
+            if raw.strip():  # 空字符串视为未设置
+                val = int(raw)
+                if val >= 1:
+                    result[strat] = val
+                else:
+                    # 非法值（0 或负数）警告并跳过，让调用方拿默认
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "配置 %s=%d 非法（必须 >= 1），跳过，使用默认值 %d", key, val, default)
+        except ValueError:
+            import logging
+            logging.getLogger(__name__).warning(
+                "配置 %s=%r 不是整数，跳过，使用默认值 %d", key, raw, default)
+    return result
 
 
 def get_settings(env_file: Path | None = None) -> Settings:
@@ -62,4 +110,5 @@ def get_settings(env_file: Path | None = None) -> Settings:
         capital=_num(env, "CAPITAL", "500000", float),
         max_picks=_num(env, "MAX_PICKS", "5", int),
         root=ROOT,
+        hold_days_map=_read_strategy_hold_days(env),
     )
