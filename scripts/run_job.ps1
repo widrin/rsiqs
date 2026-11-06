@@ -11,6 +11,13 @@ if (-not $Jobs) {
     exit 2
 }
 Set-Location $PSScriptRoot\..
+# 计划任务以 SYSTEM 身份运行，若系统级代理（如 127.0.0.1:19828 的残留配置）已失效，
+# requests 会读注册表代理并全部请求失败。这里强制直连，避免任务被无关的系统代理拖垮。
+$env:NO_PROXY = '*'
+$env:no_proxy = '*'
+'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy' | ForEach-Object {
+    Remove-Item "Env:$_" -ErrorAction SilentlyContinue
+}
 $python = ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
     Write-Error "python venv not found: $python"
