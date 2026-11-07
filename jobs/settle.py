@@ -72,7 +72,11 @@ def recommended_codes(store, days) -> set[str]:
 
 def refresh_data(codes: list[str], end: date, client, cache) -> None:
     cache.update(codes, end=end)
-    cache.save_index(common.INDEX_SYMBOL, client.index_daily(common.INDEX_SYMBOL))
+    index = client.index_daily(common.INDEX_SYMBOL)
+    cache.save_index(common.INDEX_SYMBOL, index)
+    # 数据源在收盘后偶尔仍只返回到前一交易日：不校验的话 settle_data 会记 ok，紧接着 settle 因缺当日指数失败
+    if pd.Timestamp(end) not in pd.to_datetime(index.index).normalize():
+        raise DataError(f"指数日线未更新到 {end.isoformat()}（数据源延迟），暂停结算，下次重试")
     try:  # 每天刷新简称：新纳入的成分股、新戴帽的股票（基线策略按名称排除 ST）
         cache.set_names(client.names())
     except Exception:  # noqa: BLE001 - 名称取不到不影响结算，沿用旧名称
