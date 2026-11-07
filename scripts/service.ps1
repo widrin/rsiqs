@@ -120,7 +120,7 @@ function Invoke-Start {
     }
     foreach ($t in $tasks) {
         Enable-ScheduledTask -TaskName $t.TaskName | Out-Null
-        Write-Host "enabled \$($t.TaskName)"
+        Write-Host "enabled $($t.TaskName)"
     }
 }
 
@@ -134,7 +134,7 @@ function Invoke-Stop {
     foreach ($t in $tasks) {
         Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
         Disable-ScheduledTask -TaskName $t.TaskName | Out-Null
-        Write-Host "disabled \$($t.TaskName)"
+        Write-Host "disabled $($t.TaskName)"
     }
 }
 
