@@ -146,6 +146,28 @@ def test_split_utf8_does_not_split_emoji_sequences():
     assert all(len(c.encode("utf-8")) <= 4000 for c in chunks)
 
 
+def test_replay_failed_resends_without_prefix_and_clears_log(tmp_path):
+    w, s = make(tmp_path, [Resp(500), Resp(500), ConnectionError("bad")])
+    assert w.send_text("旧告警") is False
+    log = tmp_path / "logs" / "notify_failed.jsonl"
+    assert log.exists()
+
+    assert w.replay_failed() == 1
+    assert s.posts[-1]["text"]["content"] == "旧告警"  # 补发不加"上条推送失败"前缀
+    assert not log.exists()  # 送达后清空
+    assert w.replay_failed() == 0
+
+
+def test_replay_failed_skips_read_timeout(tmp_path):
+    import requests
+    w, s = make(tmp_path, [requests.ReadTimeout("read timed out")])
+    assert w.send_text("止损告警") is False
+
+    assert w.replay_failed() == 0
+    assert len(s.posts) == 1  # 可能已送达，不重发
+    assert not (tmp_path / "logs" / "notify_failed.jsonl").exists()
+
+
 def test_failure_during_concurrent_send_is_not_erased(tmp_path):
     w_ok, s_ok = make(tmp_path)
     w_bad, _ = make(tmp_path, [Resp(500), Resp(500), Resp(500)])

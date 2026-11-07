@@ -50,6 +50,9 @@ class FakeNotifier:
         self.sent.append(text)
         return True
 
+    def replay_failed(self):
+        return 0
+
 
 @pytest.fixture
 def env(tmp_path):

@@ -197,7 +197,11 @@ def main(now: datetime | None = None) -> bool:
     settings, store, client, cache, calendar, notifier = common.context()
 
     def job() -> None:
-        send_report(settings, store, notifier, health_check(settings, store, client, cache, calendar, now))
+        report = health_check(settings, store, client, cache, calendar, now)
+        n = notifier.replay_failed()  # 补齐代理故障期间落盘的历史告警
+        if n:
+            report["repaired"].append(f"补发历史失败告警 {n} 条")
+        send_report(settings, store, notifier, report)
 
     return common.run_job("doctor", now.date(), job, store, notifier)
 

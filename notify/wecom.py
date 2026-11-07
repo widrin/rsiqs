@@ -80,9 +80,9 @@ class WeCom:
         except FileNotFoundError:
             return None
 
-    def _send(self, msgtype: str, content: str, limit: int) -> bool:
+    def _send(self, msgtype: str, content: str, limit: int, annotate: bool = True) -> bool:
         mark = self._pending_mark()  # 只清除发送前就存在的标记：发送期间别的进程失败写下的新标记要保留
-        body = (FAIL_PREFIX + content) if mark is not None else content
+        body = (FAIL_PREFIX + content) if annotate and mark is not None else content
         for chunk in split_utf8(body, limit):
             err = self._post({"msgtype": msgtype, msgtype: {"content": chunk}})
             if err is not None:
@@ -132,6 +132,35 @@ class WeCom:
         with open(self.log_dir / "notify_failed.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    def replay_failed(self) -> int:
+        """补发 notify_failed.jsonl 里历史推送失败的告警，返回补发成功条数。
+
+        读超时的记录跳过：服务端可能已经转发，重发会在群里出现两条。成功的记录从文件里删掉，失败的由
+        _send 重新落盘（带新时间戳）；补发时不加"上条推送失败"前缀，避免历史告警被误读成新故障。
+        文件末尾并发追加的新失败保留不动。"""
+        path = self.log_dir / "notify_failed.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return 0
+        sent = 0
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if "可能已送达" in str(rec.get("error", "")):
+                continue
+            msgtype = rec.get("msgtype") if rec.get("msgtype") in ("text", "markdown") else "text"
+            limit = MARKDOWN_LIMIT if msgtype == "markdown" else TEXT_LIMIT
+            sent += self._send(msgtype, str(rec.get("content", "")), limit, annotate=False)
+        remaining = path.read_text(encoding="utf-8").splitlines()[len(lines):]
+        if remaining:
+            path.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+        return sent
+
 
 class NullNotifier:
     """测试与 dry-run 用：不发网络请求，只记录消息。"""
@@ -146,3 +175,6 @@ class NullNotifier:
     def send_markdown(self, content: str) -> bool:
         self.sent.append(content)
         return True
+
+    def replay_failed(self) -> int:
+        return 0
