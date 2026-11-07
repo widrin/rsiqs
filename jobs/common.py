@@ -7,6 +7,7 @@ import time as _time
 import traceback
 from contextlib import contextmanager
 from datetime import date, datetime, time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from config import get_settings
@@ -75,11 +76,14 @@ def setup_logging(root: Path) -> None:
     target = os.path.abspath(log_dir / "jobs.log")
     base = logging.getLogger()
     if not any(getattr(h, "baseFilename", None) == target for h in base.handlers):
-        h = logging.FileHandler(target, encoding="utf-8")
+        h = RotatingFileHandler(target, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
         base.addHandler(h)
     base.setLevel(logging.INFO)
 
+
+LOG_MAX_BYTES = 10 * 1024 * 1024  # 单个 jobs.log 上限；doctor 的 source_health 只读尾部 512KB
+LOG_BACKUPS = 5
 
 INDEX_SYMBOL = "sh000300"
 BENCH_ACCOUNT = "bench:csi300"
