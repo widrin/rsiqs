@@ -70,8 +70,8 @@ uv run pytest
 | RSIQS_premarket_scan | 工作日 08:30 | `jobs.premarket_scan` | 量化扫描 + 两路 LLM 深度分析，为每只候选写出竞价区间、最高买入价、止损、目标 |
 | RSIQS_premarket_final | 工作日 09:25 | `jobs.premarket_final` | 等竞价数据落定（09:25:15）后规则过滤 + 轻量确认，09:28 前推送；09:35 之后视为过时跳过 |
 | RSIQS_monitor | 工作日 09:30 起，每 2 分钟重复 5 小时 30 分 | `jobs.monitor` | 常驻，检查 `h:active` 持仓，触发止损/止盈/炸板即推送，15:00 退出 |
-| RSIQS_settle | 工作日 15:35 起，每 20 分钟重试至 17:05 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
-| RSIQS_review | 工作日 16:05 起，每 20 分钟重试至 17:35 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
+| RSIQS_settle | 工作日 15:35 起，每 20 分钟重试至 18:30 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
+| RSIQS_review | 工作日 16:05 起，每 20 分钟重试至 18:40 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
 | RSIQS_research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘（错过即跳过） |
 | RSIQS_doctor | 每天 07:30 | `jobs.doctor` | 体检 + 已知故障自动修复 + 未修复异常诊断 |
 | RSIQS_boot_catchup | 开机时 | `jobs.settle` → `jobs.review` | 开机补跑，依次执行 |

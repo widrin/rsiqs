@@ -5,8 +5,8 @@
 # Re-running is safe: -Force overwrites existing definitions.
 # Triggers (non-trading days are skipped by the jobs themselves):
 #   PremarketScan  weekdays 08:30 (wake from sleep)      PremarketFinal weekdays 09:25 (wake)
-#   Monitor        daily 09:30 + every 2 min for 5h30m   Settle daily 15:35 + every 20 min for 1h30m
-#   Review         daily 16:05 + every 20 min for 1h30m  Doctor daily 07:30
+#   Monitor        daily 09:30 + every 2 min for 5h30m   Settle daily 15:35 + every 20 min for 2h55m
+#   Review         daily 16:05 + every 20 min for 2h35m  Doctor daily 07:30
 #   Research       Saturday 10:00 (missed run is skipped by the job)
 #   BootCatchup    at system start: settle then review (actions run sequentially)
 # Overlapping runs are serialized by the per-job file lock in jobs.common.
@@ -46,8 +46,8 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $fa
 Register-Rsiqs "premarket_scan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
 Register-Rsiqs "premarket_final" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
 Register-Rsiqs "monitor"         (New-RetryTrigger "09:30" 2 330)  (New-JobAction "monitor")
-Register-Rsiqs "settle"          (New-RetryTrigger "15:35" 20 90)  (New-JobAction "settle")
-Register-Rsiqs "review"          (New-RetryTrigger "16:05" 20 90)  (New-JobAction "review")
+Register-Rsiqs "settle"          (New-RetryTrigger "15:35" 20 175) (New-JobAction "settle")
+Register-Rsiqs "review"          (New-RetryTrigger "16:05" 20 155) (New-JobAction "review")
 Register-Rsiqs "doctor"          (New-ScheduledTaskTrigger -Daily -At "07:30") (New-JobAction "doctor")
 Register-Rsiqs "research"        (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "10:00") `
                                  (New-JobAction "research")

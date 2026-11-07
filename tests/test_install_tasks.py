@@ -28,8 +28,8 @@ def test_schedule_times_and_triggers():
 def test_monitor_settle_review_retry_and_start_when_available():
     ps1 = read("install_tasks.ps1")
     assert '(New-RetryTrigger "09:30" 2 330)  (New-JobAction "monitor")' in ps1
-    assert '(New-RetryTrigger "15:35" 20 90)  (New-JobAction "settle")' in ps1
-    assert '(New-RetryTrigger "16:05" 20 90)  (New-JobAction "review")' in ps1
+    assert '(New-RetryTrigger "15:35" 20 175) (New-JobAction "settle")' in ps1
+    assert '(New-RetryTrigger "16:05" 20 155) (New-JobAction "review")' in ps1
     assert "-RepetitionInterval (New-TimeSpan -Minutes $EveryMin)" in ps1
     assert "$r.StopAtDurationEnd = $false" in ps1  # 重复窗口结束时不终止还在跑的实例
     for job in ("premarket_scan", "premarket_final"):  # 从睡眠中唤醒
