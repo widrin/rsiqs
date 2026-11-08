@@ -153,7 +153,8 @@ def test_replay_failed_resends_without_prefix_and_clears_log(tmp_path):
     assert log.exists()
 
     assert w.replay_failed() == 1
-    assert s.posts[-1]["text"]["content"] == "旧告警"  # 补发不加"上条推送失败"前缀
+    body = s.posts[-1]["text"]["content"]
+    assert body.startswith("【历史补发 ") and body.endswith("旧告警")  # 标明是旧告警，且不加"上条推送失败"前缀
     assert not log.exists()  # 送达后清空
     assert w.replay_failed() == 0
 

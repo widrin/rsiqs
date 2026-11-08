@@ -153,7 +153,10 @@ class WeCom:
                 continue
             msgtype = rec.get("msgtype") if rec.get("msgtype") in ("text", "markdown") else "text"
             limit = MARKDOWN_LIMIT if msgtype == "markdown" else TEXT_LIMIT
-            sent += self._send(msgtype, str(rec.get("content", "")), limit, annotate=False)
+            stamp = str(rec.get("time", ""))[:16]
+            content = str(rec.get("content", ""))
+            body = f"【历史补发 {stamp}】\n{content}" if stamp else content
+            sent += self._send(msgtype, body, limit, annotate=False)
         remaining = path.read_text(encoding="utf-8").splitlines()[len(lines):]
         if remaining:
             path.write_text("\n".join(remaining) + "\n", encoding="utf-8")
