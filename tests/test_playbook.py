@@ -241,6 +241,17 @@ def test_git_commit_in_tmp_repo(tmp_path, monkeypatch):
     assert playbook.git_commit(["playbook/candidate.json"], "nothing changed") is None  # 没有变化不是失败
 
 
+def test_git_commit_works_without_user_identity(tmp_path, monkeypatch):
+    """计划任务以 SYSTEM 运行，该账号没有 user.email（11-07 实际报 fatal: unable to auto-detect email）。"""
+    monkeypatch.setattr(playbook, "ROOT", tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-config"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "playbook").mkdir()
+    (tmp_path / "playbook" / "candidate.json").write_text("{}", encoding="utf-8")
+    assert playbook.git_commit(["playbook/candidate.json"], "playbook: 复盘更新") is True
+
+
 def test_git_commit_timeout_kills_process_tree_and_skips_hooks(monkeypatch):
     started, killed = [], []
 

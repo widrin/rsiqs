@@ -190,6 +190,9 @@ def maybe_release(store: Store, today: dt.date, calendar: TradingCalendar) -> st
 
 GIT_TIMEOUT = 60  # 秒：计划任务里没有人能输入口令，钩子或签名卡住时不能挡住日报
 NO_HOOKS = ROOT / ".git-no-hooks"  # 不存在的目录：core.hooksPath 指向它，所有钩子都不跑
+GIT_IDENTITY = ("user.name=RSIQS runner", "user.email=rsiqs@localhost")
+# 计划任务以 SYSTEM 身份运行，该账号没有 user.email，git commit 会 fatal: unable to auto-detect email
+# address（11-07 16:05 review 的 playbook 提交就是这样失败的）。显式带上身份，提交不依赖运行账号。
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -203,7 +206,10 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 def _git(*args) -> tuple[int, str]:
     """运行一次 git：不签名、不跑任何钩子；输出写临时文件而不是管道（残留的子进程不会挡住等待），
     超时就结束整个进程树并抛 TimeoutExpired。"""
-    cmd = ["git", "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={NO_HOOKS}", *args]
+    cmd = ["git", "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={NO_HOOKS}"]
+    for idc in GIT_IDENTITY:
+        cmd += ["-c", idc]
+    cmd += list(args)
     with tempfile.TemporaryFile() as out:
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=out, stdin=subprocess.DEVNULL)
         try:
