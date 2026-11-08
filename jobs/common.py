@@ -117,6 +117,10 @@ def make_llm(settings, store: Store):
     return LLM(settings, store)
 
 
+class JobFailed(Exception):
+    """任务失败，但具体原因已由任务内部推送过告警：只记 error，不再重复告警。"""
+
+
 def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, lock: bool = True) -> bool:
     """幂等执行：已成功则跳过（返回 True）；成功标记 ok；异常标记 error 并告警（返回 False）。
 
@@ -135,6 +139,13 @@ def run_job(job: str, d: date, fn, store: Store, notifier, force: bool = False, 
             return True
         try:
             fn()
+        except JobFailed as e:
+            log.error("job %s %s failed: %s", job, d, e)  # 内部已告警过，这里只补状态
+            try:
+                store.mark_job(job, d, "error")
+            except Exception as ne:  # noqa: BLE001
+                log.error("recording failure of %s %s failed: %s", job, d, ne)
+            return False
         except Exception as e:  # noqa: BLE001 — 任务边界统一兜底
             log.error("job %s %s failed: %s\n%s", job, d, e, traceback.format_exc())
             try:

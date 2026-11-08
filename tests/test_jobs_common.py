@@ -50,6 +50,19 @@ def test_run_job_error_marks_error_and_alerts():
     assert store.job_done("premarket_scan", D)
 
 
+def test_run_job_failed_exception_marks_error_without_duplicate_alert():
+    store, notifier = Store(":memory:"), NullNotifier()
+
+    def boom():
+        raise common.JobFailed("研究会话状态 integrity_failed（原因已单独告警）")
+
+    assert run_job("research", D, boom, store, notifier) is False
+    row = store.conn.execute(
+        "SELECT status FROM jobs WHERE job='research' AND d=?", (D.isoformat(),)).fetchone()
+    assert row[0] == "error"  # 不能记 ok
+    assert notifier.sent == []  # agents.research 已经推过具体告警
+
+
 def test_run_job_skips_while_another_process_holds_the_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(common, "LOCK_DIR", tmp_path / "locks")
     store, notifier, ran = Store(":memory:"), NullNotifier(), []
