@@ -575,6 +575,36 @@ def test_index_daily_falls_back_to_eastmoney(monkeypatch):
     assert seen == {"symbol": "sh000300"} and s.tolist() == [4000.0, 4010.5] and s.name == "sh000300"
 
 
+def test_index_daily_picks_most_recent_source(monkeypatch):
+    """新浪不报错但只到 11-06，东财已到 11-09：选东财（这是 2026-11-09 settle_data 失败的根因）。"""
+    def sina(symbol):  # 新浪静默缺最后一天，旧代码的 try/except 不会进 fallback
+        return pd.DataFrame({"date": ["2026-11-05", "2026-11-06"], "open": [1, 1], "close": [3980.0, 4000.0],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    def em(symbol, start_date="19900101", end_date="20500101"):
+        return pd.DataFrame({"date": ["2026-11-06", "2026-11-09"], "open": [1, 1], "close": [4000.0, 4025.5],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    fake_ak(monkeypatch, stock_zh_index_daily=sina, stock_zh_index_daily_em=em)
+    s = AkClient(wait=0).index_daily("sh000300")
+    # 选东财的那份，日期覆盖到 11-09
+    assert list(s.index) == [pd.Timestamp("2026-11-06"), pd.Timestamp("2026-11-09")]
+    assert s.tolist() == [4000.0, 4025.5]
+
+    # 反过来：新浪数据更新，东财滞后时选新浪
+    def sina_fresh(symbol):
+        return pd.DataFrame({"date": ["2026-11-06", "2026-11-09"], "open": [1, 1], "close": [4000.0, 4025.5],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    def em_stale(symbol, start_date="19900101", end_date="20500101"):
+        return pd.DataFrame({"date": ["2026-11-05", "2026-11-06"], "open": [1, 1], "close": [3980.0, 4000.0],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    fake_ak(monkeypatch, stock_zh_index_daily=sina_fresh, stock_zh_index_daily_em=em_stale)
+    s = AkClient(wait=0).index_daily("sh000300")
+    assert list(s.index) == [pd.Timestamp("2026-11-06"), pd.Timestamp("2026-11-09")]
+
+
 def test_client_sets_a_default_socket_timeout():
     import socket
     old = socket.getdefaulttimeout()

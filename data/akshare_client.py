@@ -286,17 +286,38 @@ class AkClient:
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
-        """新浪指数日线，失败时切东财（stock_zh_index_daily_em，symbol 同样带 sh/sz 前缀）。"""
+        """指数日线：两边都查，取最新日期的那个。
+
+        东财（stock_zh_index_daily_em）是分钟聚合，收盘后几分钟就齐；新浪（stock_zh_index_daily）是独立每日
+        服务，常在次日凌晨才更新前一天。简单的"新浪优先、失败切东财"会漏掉东财已有的当日数据（新浪不报错、
+        只是静默缺最后一天）。这里两边都取，用 max(date) 选更新更全的那份。
+        """
+        sina_df = None
+        sina_max = None
         try:
-            df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+            sina_df = self._call(ak.stock_zh_index_daily, symbol=symbol)
+            sina_max = pd.to_datetime(sina_df["date"]).max()
         except Exception as e:  # noqa: BLE001
-            log.warning("新浪指数日线失败，切换东财: %s", e)
-            if not self._em_allow():
-                raise DataError(f"指数日线新浪失败且东财熔断冷却中: {e}") from e
+            log.warning("新浪指数日线失败: %s", e)
+
+        em_df = None
+        em_max = None
+        if self._em_allow():
             try:
-                df = self._em_get(ak.stock_zh_index_daily_em, symbol=symbol)
-            except Exception as e2:  # noqa: BLE001
-                raise DataError(f"指数日线新浪/东财均失败: {e2}") from e2
+                em_df = self._em_get(ak.stock_zh_index_daily_em, symbol=symbol)
+                self._em_note(True)
+                em_max = pd.to_datetime(em_df["date"]).max()
+            except Exception as e:  # noqa: BLE001
+                self._em_note(False)
+                log.warning("东财指数日线失败: %s", e)
+
+        if sina_df is None and em_df is None:
+            raise DataError("指数日线新浪/东财均失败")
+        if em_df is not None and (sina_df is None or em_max >= sina_max):
+            df = em_df
+        else:
+            df = sina_df
+
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
         s = pd.Series(pd.to_numeric(df["close"]).astype(float).to_numpy(), index=idx, name=symbol)
         return s.sort_index()
