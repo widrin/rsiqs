@@ -302,16 +302,26 @@ class AkClient:
         return s.sort_index()
 
     def industry_boards(self) -> pd.DataFrame:
-        """东财行业板块当日行情：board（板块名）、pct（涨跌幅，百分数）。收盘后即当日最终值。"""
-        if not self._em_allow():
-            raise DataError("东财熔断冷却中，行业板块行情不可用")
+        """行业板块当日行情：board（板块名）、pct（涨跌幅，百分数）。收盘后即当日最终值。
+        东财为主（496 个细分板块），失败或熔断冷却时切同花顺（90 个行业，口径更粗）；
+        两家都失败才抛 DataError。同花顺这里不叠加熔断：它风控松、单日只用一次，避免为偶发备用源
+        引入一套独立的冷却/抖动/文件状态机。"""
+        if self._em_allow():
+            try:
+                df = self._em_get(ak.stock_board_industry_name_em)
+                self._em_note(True)
+                return _pick(df, {"板块名称": "board", "涨跌幅": "pct"}, "stock_board_industry_name_em")
+            except Exception as e:  # noqa: BLE001
+                self._em_note(False)
+                log.warning("东财行业板块失败，切换同花顺: %s", e)
         try:
-            df = self._em_get(ak.stock_board_industry_name_em)
-            self._em_note(True)
-        except Exception as e:  # noqa: BLE001
-            self._em_note(False)
-            raise DataError(f"行业板块行情获取失败: {e}") from e
-        return _pick(df, {"板块名称": "board", "涨跌幅": "pct"}, "stock_board_industry_name_em")
+            df = self._call(ak.stock_board_industry_summary_ths)
+            out = _pick(df, {"板块": "board", "涨跌幅": "pct"}, "stock_board_industry_summary_ths")
+            if out.empty or out["pct"].isna().all():
+                raise DataError("同花顺行业板块返回空/全 NaN")
+            return out
+        except Exception as e2:  # noqa: BLE001
+            raise DataError(f"行业板块行情东财/同花顺均失败: {e2}") from e2
 
     def dividends(self, code: str) -> pd.DataFrame:
         """已实施的分红送转：ex_date（除权除息日）、cash（每股税前派息，元）、ratio（每股送转股数）。
