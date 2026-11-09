@@ -40,7 +40,7 @@ def env(tmp_path, monkeypatch):
     def fake_final(d, settings, store, llm, client, notifier, calendar):
         calls.append(("final", d, llm))
 
-    def fake_review(d, settings, store, llm, cache, notifier, calendar, backfill=False):
+    def fake_review(d, settings, store, llm, cache, notifier, calendar, backfill=False, client=None):
         if d in review_fail:
             review_fail.discard(d)
             raise RuntimeError("复盘失败")

@@ -301,6 +301,18 @@ class AkClient:
         s = pd.Series(pd.to_numeric(df["close"]).astype(float).to_numpy(), index=idx, name=symbol)
         return s.sort_index()
 
+    def industry_boards(self) -> pd.DataFrame:
+        """东财行业板块当日行情：board（板块名）、pct（涨跌幅，百分数）。收盘后即当日最终值。"""
+        if not self._em_allow():
+            raise DataError("东财熔断冷却中，行业板块行情不可用")
+        try:
+            df = self._em_get(ak.stock_board_industry_name_em)
+            self._em_note(True)
+        except Exception as e:  # noqa: BLE001
+            self._em_note(False)
+            raise DataError(f"行业板块行情获取失败: {e}") from e
+        return _pick(df, {"板块名称": "board", "涨跌幅": "pct"}, "stock_board_industry_name_em")
+
     def dividends(self, code: str) -> pd.DataFrame:
         """已实施的分红送转：ex_date（除权除息日）、cash（每股税前派息，元）、ratio（每股送转股数）。
 

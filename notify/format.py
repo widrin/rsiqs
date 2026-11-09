@@ -2,6 +2,7 @@
 """推送消息模板。"""
 from datetime import date
 
+from agents.market import bench_pct, summary_lines
 from engine.types import Pick
 
 DISCLAIMER = "> 模拟盘信号，仅供研究，不构成投资建议。"
@@ -30,11 +31,20 @@ def format_recommendation(d: date, picks: list[Pick], llm_reviewed: bool, market
 
 
 def format_daily_report(d: date, rows: list[dict], review_summary: str,
-                        holdings: list[dict] | None = None) -> str:
+                        holdings: list[dict] | None = None,
+                        market: dict | None = None) -> str:
     # 企业微信群机器人的 markdown（v1）不渲染表格：每个账户一行
     lines = [f"## RSIQS 日报 {d.isoformat()}"]
+    bench = bench_pct(market)
     for r in rows:
-        lines.append(f"**{r['account']}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}")
+        extra = ""
+        if bench is not None and r.get("today") and not r["account"].startswith("bench:"):
+            extra = f"，超额 {r['day_ret'] - bench:+.2%}"
+        lines.append(f"**{r['account']}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}{extra}")
+    market_lines = summary_lines(market)
+    if market_lines:
+        lines.append("### 大盘")
+        lines += market_lines
     if holdings is not None:
         lines.append("### 收盘持仓收益")
         if not holdings:

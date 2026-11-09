@@ -58,7 +58,8 @@ def main(now: datetime | None = None, sleep=_time.sleep) -> bool:
         if d == last and not ok:
             return False  # 较早的日子要先重置发布窗口：它们没补完，最近一天先不判断发布，下次重试按顺序接着补
         ok = common.run_job("review", d, lambda d=d: review_agent.run_review(
-            d, settings, store, llm, cache, notifier, calendar, backfill=(d != last)), store, notifier) and ok
+            d, settings, store, llm, cache, notifier, calendar, backfill=(d != last), client=client),
+            store, notifier) and ok
     return ok
 
 

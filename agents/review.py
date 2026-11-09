@@ -9,6 +9,7 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel
 
+from agents import market as market_agent
 from agents import playbook
 from agents.llm import LLM
 from config import Settings
@@ -107,7 +108,7 @@ def _report_rows(store: Store, d: dt.date) -> list[dict]:
         day_ret = equity / float(nav.iloc[-2]) - 1.0 if len(nav) >= 2 and today else 0.0
         label = name if today else f"{name}（今日未结算）"  # 选股失败当天跳过结算：不把前一天的涨跌当成今天的
         rows.append({"account": label, "equity": equity, "day_ret": day_ret,
-                     "total_ret": equity / float(nav.iloc[0]) - 1.0})
+                     "total_ret": equity / float(nav.iloc[0]) - 1.0, "today": bool(today)})
     return rows
 
 
@@ -157,21 +158,26 @@ def _build_prompt(d: dt.date, pb: dict, sections: list[str], bars: list[str]) ->
     return "\n".join([f"# 复盘日 {d.isoformat()}", "",
                       f"## 候选版经验规则（playbook v{pb.get('version', 1)}，你的 lesson 只作用于这一版）",
                       playbook.render(pb), "", *sections, "", *bars, "",
-                      f"请写当日复盘 summary，并给出不超过 {MAX_LESSONS} 条带证据的 lesson（可以为空）。"])
+                      f"请写当日复盘 summary（含大盘表现与个股执行），并给出不超过 {MAX_LESSONS} 条带证据的 lesson（可以为空）。"])
 
 
 BACKFILL_SUMMARY = "回补的日报：这一天的结算延迟到之后才完成。LLM 复盘、playbook 更新与发布只针对最近一个交易日，这一天不做。"
 
 
 def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: BarCache, notifier,
-               calendar: TradingCalendar, backfill: bool = False) -> None:
+               calendar: TradingCalendar, backfill: bool = False, client=None) -> None:
     """backfill=True：回补较早的日子，只补发日报（各账户当天的净值），不调用 LLM、不写 lesson、不判断发布。
-    回补期间写的规则没有前向模拟过，发布判断和 lesson 都只在最近一个交易日做，顺序与平时相同。"""
+    回补期间写的规则没有前向模拟过，发布判断和 lesson 都只在最近一个交易日做，顺序与平时相同。
+    client 用于取当日大盘快照；为 None（测试）或回补旧日期时不取，避免用今天的行情冒充历史。"""
     if backfill:
         playbook.reset_window_if_degraded(store, d)  # 这一天盘前按空规则运行时，发布窗口从这一天重新开始
         notifier.send_markdown(format_daily_report(d, _report_rows(store, d), BACKFILL_SUMMARY))
         return
+    market = None if client is None else market_agent.collect(store, cache, client, d)
     sections: list[str] = []
+    market_lines = market_agent.summary_lines(market)
+    if market_lines:
+        sections += ["## 大盘", *market_lines]
     codes: set[str] = set()
     has_rec = False
     for name in LLM_ACCOUNTS:
@@ -216,4 +222,4 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
         summary = f"{summary}\n注意：{files} 损坏，今日未发布、未更新 playbook，请手工修复（可从 git 历史恢复）。"
     # 回补的日子持仓已不是当天的：只在最近一天的日报里列收盘持仓收益
     notifier.send_markdown(format_daily_report(d, _report_rows(store, d), summary,
-                                              _holding_rows(store, cache, d)))
+                                              _holding_rows(store, cache, d), market))

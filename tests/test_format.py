@@ -48,6 +48,29 @@ def test_daily_report_lists_holdings_pnl():
     assert "- 600000 浦发银行 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），今日 +1.50%" in s
 
 
+def test_daily_report_with_market_section_and_excess():
+    rows = [{"account": "h:active", "equity": 512345.678, "day_ret": 0.0234, "total_ret": 0.0247,
+             "today": True},
+            {"account": "bench:csi300", "equity": 498000.0, "day_ret": -0.0144,
+             "total_ret": -0.0144, "today": True}]
+    mk = {"indexes": [{"name": "沪深300", "symbol": "sh000300", "close": 4054.28, "pct": -0.0144},
+                      {"name": "上证指数", "symbol": "sh000001", "close": 3200.0, "pct": -0.01}],
+          "breadth": {"up": 1203, "down": 3412, "flat": 78, "amount": 8642.0},
+          "sectors": {"top": [{"board": "煤炭", "pct": 3.2}], "bottom": [{"board": "计算机", "pct": -2.8}]},
+          "complete": True}
+    s = format_daily_report(date(2026, 11, 6), rows, "", market=mk)
+    assert "### 大盘" in s
+    assert "沪深300 4,054.28（-1.44%）；上证指数 3,200.00（-1.00%）" in s
+    assert "涨跌家数：上涨 1203 / 下跌 3412 / 平盘 78，成交额 8,642 亿" in s
+    assert "板块领涨：煤炭 +3.20%" in s and "板块领跌：计算机 -2.80%" in s
+    assert "h:active" in s and "超额 +3.78%" in s  # 2.34% - (-1.44%)
+    bench_line = next(ln for ln in s.splitlines() if ln.startswith("**bench:csi300**"))
+    assert "净值 498,000.00" in bench_line and "超额" not in bench_line
+    # 未结算的账户不算超额（会把前一天的涨跌当成今天的）
+    rows[0]["today"] = False
+    assert "超额" not in format_daily_report(date(2026, 11, 6), rows[:1], "", market=mk)
+
+
 def test_daily_report_says_empty_when_no_holdings():
     s = format_daily_report(date(2026, 10, 16), [], "", [])
     assert "收盘持仓收益" in s and "（空仓）" in s
