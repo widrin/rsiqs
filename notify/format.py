@@ -76,8 +76,8 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
     return "\n".join(lines)
 
 
-def format_midday_report(d: date, account: str, positions: list[dict], watch: list[dict],
-                         market: dict | None, comment: str) -> str:
+def format_midday_report(d: date, account: str, positions: list[dict], status: list[dict],
+                         watch: list[dict], market: dict | None, comment: str) -> str:
     """午盘简报：持仓汇总 + 早盘候选观察。明确标注观察项不会成交，避免与早盘推荐混淆。"""
     lines = [f"## RSIQS 午盘简报 {d.isoformat()}"]
     market_lines = summary_lines(market)
@@ -103,6 +103,12 @@ def format_midday_report(d: date, account: str, positions: list[dict], watch: li
                          f"现价 {p['price']:.2f}，浮动 {p['pnl']:+,.0f} 元（{p['pnl_ret']:+.2%}）{day}；"
                          f"距止损 {p['to_stop']:+.2%}，距止盈 {p['to_target']:+.2%}，"
                          f"{p['exit_date'].isoformat()} 到期")
+    if status:
+        lines.append("### 早盘推荐执行（未在持仓的）")
+        for s in status:
+            price = f"，现价 {s['price']:.2f}" if s["price"] else ""
+            lines.append(f"- {s['code']} {s['name']}（买入上限 ≤{s['entry_max']:.2f}）："
+                         f"{s['why']}{price}")
     lines.append("### 早盘候选观察（不改变早盘推荐，不会自动成交）")
     if not watch:
         lines.append("（无）")

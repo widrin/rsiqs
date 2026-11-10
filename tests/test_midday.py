@@ -3,7 +3,7 @@ from datetime import date, datetime, time
 import pandas as pd
 import pytest
 
-from agents.midday import positions, run_midday, watch
+from agents.midday import positions, recommendation_status, run_midday, watch
 from agents.premarket import PlannedPick, PremarketPlan
 from engine.ledger import Account, Position
 from engine.store import Store
@@ -55,11 +55,16 @@ def make_store(d: date = D) -> Store:
 
 def spot_df() -> pd.DataFrame:
     return pd.DataFrame([
-        {"code": "600001", "name": "测试01", "last": 10.20, "prev_close": 10.0, "pct": 2.0, "amount": 1e8},
-        {"code": "600002", "name": "测试02", "last": 10.00, "prev_close": 9.8, "pct": 2.04, "amount": 1e8},
-        {"code": "600003", "name": "测试03", "last": 8.50, "prev_close": 8.4, "pct": 1.19, "amount": 1e8},
-        {"code": "600004", "name": "测试04", "last": 21.00, "prev_close": 20.5, "pct": 2.44, "amount": 1e8},
-        {"code": "600009", "name": "其他", "last": 5.0, "prev_close": 5.1, "pct": -1.96, "amount": 1e8},
+        {"code": "600001", "name": "测试01", "open": 10.05, "last": 10.20, "prev_close": 10.0,
+         "pct": 2.0, "amount": 1e8},
+        {"code": "600002", "name": "测试02", "open": 10.00, "last": 10.00, "prev_close": 9.8,
+         "pct": 2.04, "amount": 1e8},
+        {"code": "600003", "name": "测试03", "open": 8.50, "last": 8.50, "prev_close": 8.4,
+         "pct": 1.19, "amount": 1e8},
+        {"code": "600004", "name": "测试04", "open": 20.95, "last": 21.00, "prev_close": 20.5,
+         "pct": 2.44, "amount": 1e8},
+        {"code": "600009", "name": "其他", "open": 5.05, "last": 5.0, "prev_close": 5.1,
+         "pct": -1.96, "amount": 1e8},
     ])
 
 
@@ -93,6 +98,19 @@ def test_watch_respects_morning_veto():
     assert watch(D, store, rows, {"600001"}, {"600003"}) == []
 
 
+def test_recommendation_status_matches_broker_rules():
+    """开盘价高于上限 / 破止损 / 区间内待成交，三种判断要与 broker step 2 一致。"""
+    store = make_store()
+    base = {"code": "600003", "name": "测试03", "prev_close": 8.4, "last": 8.5}
+    (above,) = recommendation_status(D, store, {"600003": dict(base, open=9.10)}, set())
+    assert "高于买入上限" in above["why"] and not above["pending"]
+    (broken,) = recommendation_status(D, store, {"600003": dict(base, open=8.30)}, set())
+    assert "破止损" in broken["why"] and not broken["pending"]
+    (pending,) = recommendation_status(D, store, {"600003": dict(base, open=8.45)}, set())
+    assert pending["pending"] and "尚未成交" in pending["why"]
+    assert recommendation_status(D, store, {"600003": dict(base, open=8.45)}, {"600003"}) == []
+
+
 def test_midday_report_lists_positions_and_watch_only():
     store, notifier = make_store(), NullNotifier()
     run_midday(D, store, Client(spot_df()), FakeLLM(), notifier)
@@ -101,8 +119,11 @@ def test_midday_report_lists_positions_and_watch_only():
     assert "午盘简报" in text and "持仓 h:active" in text
     assert "600001" in text and "浮动 +200 元（+2.00%）" in text
     assert "600002" in text                      # 回踩到买入区间的早盘候选
-    assert "600003" not in text                  # 早盘已推荐，不重复出现
-    assert "600004" not in text                  # 现价仍在买入区间之上
+    assert "### 早盘推荐执行" in text              # 早盘推荐未在持仓的给出开盘判断
+    assert "结算时才会按开盘价成交" in text and "尚未成交" in text
+    watch_part = text.split("### 早盘候选观察")[1]
+    assert "600003" not in watch_part             # 已推荐的不再进观察项
+    assert "600004" not in text                   # 现价仍在买入区间之上
     assert "不会自动成交" in text
     assert "午盘：持仓接近止盈" in text            # LLM 点评
 
@@ -147,6 +168,14 @@ def test_midday_job_runs_once(env):
     assert len(env["notifier"].sent) == 1
     assert midday_job.main(now=at(d, 11, 40)) is True  # 已完成，幂等跳过
     assert len(env["notifier"].sent) == 1
+
+
+def test_dry_run_previews_without_marking_job(env, capsys):
+    d = env["d"]
+    assert midday_job.main(now=at(d, 14, 0), dry_run=True) is True  # 过时窗口也允许预演
+    assert "午盘简报" in capsys.readouterr().out
+    assert env["notifier"].sent == []                               # 不走真实推送
+    assert not env["store"].job_done("midday", d)                   # 不挡当天真正的 11:35 推送
 
 
 def test_midday_job_skips_stale_and_non_trading_days(env):

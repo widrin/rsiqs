@@ -28,6 +28,7 @@ SYSTEM_PROMPT = """你是 A 股模拟盘的午盘观察助手。根据给定的�
 
 硬性要求：
 - 只描述现状与风险（离止损/止盈的距离、板块强弱、观察项是否接近买点），不推翻早盘推荐，不给新的买入指令
+- 持仓列表里没有的早盘推荐都是尚未成交，不要写成已成交或已建仓
 - 不重复表格里已经有的具体数字，不复述价位
 - 语气克制，不用感叹号，不给收益承诺"""
 
@@ -111,7 +112,41 @@ def watch(d: date, store: Store, rows: dict, held: set[str], recommended: set[st
     return out[:MAX_WATCH]
 
 
-def _prompt(d: date, pos: list[dict], watch_items: list[dict], market_lines: list[str]) -> str:
+def recommendation_status(d: date, store: Store, rows: dict, held: set[str]) -> list[dict]:
+    """早盘推荐在开盘价上的执行判断（与 broker step 2 同口径），未成交的给出原因。
+
+    午盘时点还没结算，持仓里没有的推荐码只能靠开盘价推断：开盘价在买入区间且未涨停的，
+    收盘结算时会按开盘价成交；其余今天不会成交。已成交的推荐码已在持仓里，这里跳过。"""
+    loaded = store.load_recommendation(d, ACCOUNT)
+    if loaded is None:
+        return []
+    out = []
+    for p in loaded[0]:
+        if p.code in held:
+            continue
+        row = rows.get(p.code) or {}
+        open_price, prev = _f(row.get("open")), _f(row.get("prev_close"))
+        last = _f(row.get("last"))
+        item = {"code": p.code, "name": p.name, "entry_max": p.entry_max, "stop": p.stop,
+                "open": open_price or None, "price": last or None, "pending": False, "why": ""}
+        if open_price <= 0:
+            item["why"] = "开盘价缺失"
+        elif prev > 0 and at_limit_up(open_price, limit_prices(
+                p.code, str(row.get("name") or p.name), prev, d)[0]):
+            item["why"] = "开盘涨停，未成交"
+        elif open_price > p.entry_max:
+            item["why"] = "开盘高于买入上限，今日不会成交"
+        elif open_price <= p.stop:
+            item["why"] = "开盘即破止损，计划放弃"
+        else:
+            item["pending"] = True
+            item["why"] = "开盘价在买入区间，15:35 结算时才会按开盘价成交（尚未成交）"
+        out.append(item)
+    return out
+
+
+def _prompt(d: date, pos: list[dict], status: list[dict], watch_items: list[dict],
+            market_lines: list[str]) -> str:
     lines = [f"# 午盘 {d.isoformat()}", ""]
     if market_lines:
         lines += ["## 大盘", *market_lines, ""]
@@ -127,6 +162,11 @@ def _prompt(d: date, pos: list[dict], watch_items: list[dict], market_lines: lis
                      f"，{p['exit_date'].isoformat()} 到期")
     if not pos:
         lines.append("（空仓）")
+    if status:
+        lines += ["", f"## 早盘推荐（{len(status)} 只未在持仓，其中 "
+                      f"{sum(1 for s in status if s['pending'])} 只待结算成交）"]
+        for s in status:
+            lines.append(f"- {s['code']} {s['name']}：{s['why']}")
     lines += ["", f"## 早盘候选观察项（{len(watch_items)} 只，未推荐、现价已回到买入区间）"]
     for w in watch_items:
         lines.append(f"- {w['code']} {w['name']}：现价 {w['price']:.2f}（今日 {w['day_ret']:+.2%}）")
@@ -136,11 +176,12 @@ def _prompt(d: date, pos: list[dict], watch_items: list[dict], market_lines: lis
     return "\n".join(lines)
 
 
-def comment(llm, d: date, pos: list[dict], watch_items: list[dict], market_lines: list[str]) -> str:
+def comment(llm, d: date, pos: list[dict], status: list[dict], watch_items: list[dict],
+            market_lines: list[str]) -> str:
     """LLM 点评；失败只记日志并返回空串，简报照发（规则部分不受影响）。"""
     try:
         out = llm.parse(purpose="midday", system=SYSTEM_PROMPT,
-                        user=_prompt(d, pos, watch_items, market_lines),
+                        user=_prompt(d, pos, status, watch_items, market_lines),
                         schema=MiddayComment, timeout=COMMENT_TIMEOUT)
         return out.comment.strip()
     except Exception as e:  # noqa: BLE001 - 超时/未配置/校验失败：只影响点评段
@@ -170,9 +211,11 @@ def run_midday(d: date, store: Store, client, llm, notifier) -> None:
             log.warning("个股报价获取失败: %r", e)
     rows = _spot_rows(spot)
     pos = positions(acc, rows, d)
+    status = recommendation_status(d, store, rows, held)
     watch_items = watch(d, store, rows, held, recommended)
     market = market_agent.intraday(client, spot if spot is not None and not spot.empty else None)
     market_lines = market_agent.summary_lines(market)
-    text = comment(llm, d, pos, watch_items, market_lines)
-    notifier.send_markdown(format_midday_report(d, ACCOUNT, pos, watch_items, market, text))
-    log.info("midday %s: %d positions, %d watch", d, len(pos), len(watch_items))
+    text = comment(llm, d, pos, status, watch_items, market_lines)
+    notifier.send_markdown(format_midday_report(d, ACCOUNT, pos, status, watch_items, market, text))
+    log.info("midday %s: %d positions, %d pending picks, %d watch",
+             d, len(pos), sum(1 for s in status if s["pending"]), len(watch_items))
