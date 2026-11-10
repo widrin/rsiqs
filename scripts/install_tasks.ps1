@@ -1,11 +1,12 @@
-# Register the 8 RSIQS scheduled tasks exactly as documented in README (see the scheduled-tasks table):
+# Register the 9 RSIQS scheduled tasks exactly as documented in README (see the scheduled-tasks table):
 # root path "\", RSIQS_ prefix, SYSTEM identity, every action goes through scripts\run_job.ps1
 # (repo venv python, no uv needed on PATH). Requires an ELEVATED PowerShell (SYSTEM registration).
 # Usage (repo root): powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tasks.ps1
 # Re-running is safe: -Force overwrites existing definitions.
 # Triggers (non-trading days are skipped by the jobs themselves):
 #   PremarketScan  weekdays 08:30 (wake from sleep)      PremarketFinal weekdays 09:25 (wake)
-#   Monitor        daily 09:30 + every 2 min for 5h30m   Settle daily 15:35 + every 20 min for 2h55m
+#   Monitor        daily 09:30 + every 2 min for 5h30m   Midday  weekdays 11:35
+#   Settle daily 15:35 + every 20 min for 2h55m
 #   Review         daily 16:05 + every 20 min for 2h35m  Doctor daily 07:30
 #   Research       Saturday 10:00 (missed run is skipped by the job)
 #   BootCatchup    at system start: settle then review (actions run sequentially)
@@ -46,6 +47,7 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $fa
 Register-Rsiqs "premarket_scan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
 Register-Rsiqs "premarket_final" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
 Register-Rsiqs "monitor"         (New-RetryTrigger "09:30" 2 330)  (New-JobAction "monitor")
+Register-Rsiqs "midday"          (New-WeekdayTrigger "11:35")      (New-JobAction "midday")
 Register-Rsiqs "settle"          (New-RetryTrigger "15:35" 20 175) (New-JobAction "settle")
 Register-Rsiqs "review"          (New-RetryTrigger "16:05" 20 155) (New-JobAction "review")
 Register-Rsiqs "doctor"          (New-ScheduledTaskTrigger -Daily -At "07:30") (New-JobAction "doctor")

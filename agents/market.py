@@ -46,7 +46,10 @@ def _indexes(cache, client, d: dt.date) -> list[dict]:
 
 
 def _breadth(client) -> dict | None:
-    spot = client.spot()
+    return _breadth_df(client.spot())
+
+
+def _breadth_df(spot: pd.DataFrame | None) -> dict | None:
     if spot is None or spot.empty or "pct" not in spot.columns:
         return None
     pct = pd.to_numeric(spot["pct"], errors="coerce").dropna()
@@ -98,6 +101,18 @@ def _safe(fn, client, what: str):
     except Exception as e:  # noqa: BLE001 - 任一块失败都只影响该段，不能让日报失败
         log.warning("%s获取失败: %s", what, e)
         return None
+
+
+def intraday(client, spot: pd.DataFrame | None = None) -> dict | None:
+    """盘中大盘快照：只取涨跌家数与行业板块。
+
+    不读不写 kv、不碰指数日线——盘中 index_daily 只有未完成的分时聚合值，写进缓存会污染
+    当晚结算与复盘用的收盘数据。spot 已由调用方拉取时直接复用，避免重复请求全市场行情。"""
+    breadth = _breadth_df(spot) if spot is not None else _safe(_breadth, client, "涨跌家数")
+    sectors = _safe(_sectors, client, "行业板块")
+    if not breadth and not sectors:
+        return None
+    return {"indexes": [], "breadth": breadth, "sectors": sectors, "complete": False}
 
 
 def bench_pct(market: dict | None) -> float | None:

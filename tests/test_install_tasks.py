@@ -10,7 +10,7 @@ def read(name):
 
 def test_every_task_points_to_existing_job_module():
     jobs = set(re.findall(r'New-JobAction "([\w,]+)"', read("install_tasks.ps1")))
-    assert jobs == {"premarket_scan", "premarket_final", "monitor", "settle", "review",
+    assert jobs == {"premarket_scan", "premarket_final", "monitor", "midday", "settle", "review",
                     "doctor", "research", "settle,review"}
     for job in jobs:
         for name in job.split(","):

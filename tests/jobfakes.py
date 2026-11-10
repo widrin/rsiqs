@@ -221,6 +221,7 @@ class FakeLLM:
         return loaded[0] if loaded else []
 
     def parse(self, purpose, system, user, schema, timeout=120.0):
+        from agents.midday import MiddayComment
         from agents.premarket import AuctionCheck, AuctionDecision, PlannedPick, PremarketPlan
         from agents.research import ResearchRound
         from agents.review import Lesson, ReviewOutput
@@ -246,6 +247,8 @@ class FakeLLM:
                 evidence=f"{purpose} 测试证据 600001 高开回落")])
         if schema is ResearchRound:
             return ResearchRound(analysis="测试：本轮不提交新策略", drafts=[], done=True)
+        if schema is MiddayComment:
+            return MiddayComment(comment="午盘：持仓接近止盈，观察项回踩买点附近")
         raise AssertionError(f"unexpected schema {schema}")
 
 

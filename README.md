@@ -62,7 +62,7 @@ uv run pytest
 
 ## 日常运行：Windows 计划任务
 
-本机已注册 8 个任务：位于根路径 `\`、名称前缀 `RSIQS_`、SYSTEM 身份，统一经 `scripts\run_job.ps1`
+本机已注册 9 个任务：位于根路径 `\`、名称前缀 `RSIQS_`、SYSTEM 身份，统一经 `scripts\run_job.ps1`
 进入仓库目录后调用仓库 `.venv` 的 python（不依赖 `uv` 在 PATH 中）：
 
 | 任务 | 触发 | 入口 | 作用 |
@@ -70,6 +70,7 @@ uv run pytest
 | RSIQS_premarket_scan | 工作日 08:30 | `jobs.premarket_scan` | 量化扫描 + 两路 LLM 深度分析，为每只候选写出竞价区间、最高买入价、止损、目标 |
 | RSIQS_premarket_final | 工作日 09:25 | `jobs.premarket_final` | 等竞价数据落定（09:25:15）后规则过滤 + 轻量确认，09:28 前推送；09:35 之后视为过时跳过 |
 | RSIQS_monitor | 工作日 09:30 起，每 2 分钟重复 5 小时 30 分 | `jobs.monitor` | 常驻，检查 `h:active` 持仓，触发止损/止盈/炸板即推送，15:00 退出 |
+| RSIQS_midday | 工作日 11:35 | `jobs.midday` | 午盘简报：h:active 持仓盘中状态 + 早盘候选回到买入区间的观察项；不改早盘推荐、不成交 |
 | RSIQS_settle | 工作日 15:35 起，每 20 分钟重试至 18:30 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
 | RSIQS_review | 工作日 16:05 起，每 20 分钟重试至 18:40 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
 | RSIQS_research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘（错过即跳过） |

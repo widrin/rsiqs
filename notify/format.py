@@ -76,6 +76,49 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
     return "\n".join(lines)
 
 
+def format_midday_report(d: date, account: str, positions: list[dict], watch: list[dict],
+                         market: dict | None, comment: str) -> str:
+    """午盘简报：持仓汇总 + 早盘候选观察。明确标注观察项不会成交，避免与早盘推荐混淆。"""
+    lines = [f"## RSIQS 午盘简报 {d.isoformat()}"]
+    market_lines = summary_lines(market)
+    if market_lines:
+        lines.append("### 大盘")
+        lines += market_lines
+    lines.append(f"### 持仓 {account}")
+    priced = [p for p in positions if p["price"] is not None]
+    if not positions:
+        lines.append("（空仓）")
+    else:
+        if priced:
+            pnl = sum(p["pnl"] for p in priced)
+            basis = sum(p["cost"] * p["qty"] for p in priced)
+            day = sum(p["price"] * p["day_ret"] * p["qty"] for p in priced if p["day_ret"] is not None)
+            lines.append(f"**浮动盈亏 {pnl:+,.0f} 元（{pnl / basis:+.2%}），今日 {day:+,.0f} 元**")
+        for p in positions:
+            if p["price"] is None:
+                lines.append(f"- {p['code']} {p['name']} {p['qty']} 股：成本 {p['cost']:.2f}，现价缺失")
+                continue
+            day = f"，今日 {p['day_ret']:+.2%}" if p["day_ret"] is not None else ""
+            lines.append(f"- {p['code']} {p['name']} {p['qty']} 股：成本 {p['cost']:.2f} → "
+                         f"现价 {p['price']:.2f}，浮动 {p['pnl']:+,.0f} 元（{p['pnl_ret']:+.2%}）{day}；"
+                         f"距止损 {p['to_stop']:+.2%}，距止盈 {p['to_target']:+.2%}，"
+                         f"{p['exit_date'].isoformat()} 到期")
+    lines.append("### 早盘候选观察（不改变早盘推荐，不会自动成交）")
+    if not watch:
+        lines.append("（无）")
+    for w in watch:
+        lines.append(f"- {w['code']} {w['name']}：现价 {w['price']:.2f}（今日 {w['day_ret']:+.2%}），"
+                     f"买入上限 ≤{w['entry_max']:.2f}，止损 {w['stop']:.2f}，止盈 {w['target']:.2f}，"
+                     f"持有 {w['hold_days']} 日")
+        if w.get("reason"):
+            lines.append(f"> {_one_line(w['reason'])}")
+    if watch:
+        lines.append("> 撮合引擎只按开盘价成交，以上仅为盘中观察；今日未成交即视为放弃。")
+    lines.append("**点评**：" + (_one_line(comment) or "（午盘点评不可用）"))
+    lines.append(DISCLAIMER)
+    return "\n".join(lines)
+
+
 ALERT_PREFIXES = {
     "alert": "【RSIQS 告警】",     # 需要人工关注的错误、异常、任务失败
     "trade": "【RSIQS 交易】",     # 模拟盘成交、止损止盈等交易信号
