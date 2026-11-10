@@ -99,16 +99,19 @@ def test_watch_respects_morning_veto():
 
 
 def test_recommendation_status_matches_broker_rules():
-    """开盘价高于上限 / 破止损 / 区间内待成交，三种判断要与 broker step 2 一致。"""
+    """开盘价高于上限 / 破止损 / 区间内待成交 / 现金不足，四种判断要与 broker step 2 一致。"""
     store = make_store()
     base = {"code": "600003", "name": "测试03", "prev_close": 8.4, "last": 8.5}
-    (above,) = recommendation_status(D, store, {"600003": dict(base, open=9.10)}, set())
+    (above,) = recommendation_status(D, store, {"600003": dict(base, open=9.10)}, set(), cash=1_000_000)
     assert "高于买入上限" in above["why"] and not above["pending"]
-    (broken,) = recommendation_status(D, store, {"600003": dict(base, open=8.30)}, set())
+    (broken,) = recommendation_status(D, store, {"600003": dict(base, open=8.30)}, set(), cash=1_000_000)
     assert "破止损" in broken["why"] and not broken["pending"]
-    (pending,) = recommendation_status(D, store, {"600003": dict(base, open=8.45)}, set())
+    (pending,) = recommendation_status(D, store, {"600003": dict(base, open=8.45)}, set(), cash=1_000_000)
     assert pending["pending"] and "尚未成交" in pending["why"]
     assert recommendation_status(D, store, {"600003": dict(base, open=8.45)}, {"600003"}) == []
+    # 现金不足：即使开盘价在区间内也不会 pending
+    (poor,) = recommendation_status(D, store, {"600003": dict(base, open=8.45)}, set(), cash=10.0)
+    assert not poor["pending"] and "现金" in poor["why"]
 
 
 def test_midday_report_lists_positions_and_watch_only():

@@ -18,7 +18,8 @@ MAX_FAILS = 3  # 连续失败达到此次数告警一次
 MISSING_ALERT_AFTER = 3  # 某只持仓连续这么多次取不到报价才推送提醒（单次偶发失败只记日志）
 
 
-def _check_recommendation_buys(d: date, store, rows: dict, sent: set, notifier) -> list[str]:
+def _check_recommendation_buys(d: date, store, rows: dict, sent: set, notifier,
+                               cash: float = 0.0, total_capital: float | None = None) -> list[str]:
     """检查今日推荐的买入触发，返回本次新推的消息。
 
     两种粒度（撮合引擎只按开盘价成交，盘中触发是额外信号，不代表撮合会执行）：
@@ -26,7 +27,11 @@ def _check_recommendation_buys(d: date, store, rows: dict, sent: set, notifier) 
       集合竞价价，任何时刻查都一样，每天只推一次。
     - 盘中触发：spot.last（现价）回踩入 (stop, entry_max] 区间，每天只推一次（去重 key 天然幂等）。
 
-    已持仓的推荐代码跳过（撮合已买）。"""
+    已持仓的推荐代码跳过（撮合已买）。额外检查现金约束：broker step 2 对每只算 qty=round_lot(
+    min(budget, cash*0.999)/price)，qty<100 就跳过；这里同步检查，避免误导推送"可买"但实际
+    cash 不够连 1 手都买不起。"""
+    from engine.rules import round_lot
+
     out = []
     rec = store.load_recommendation(d, ACCOUNT)
     if rec is None:
@@ -49,16 +54,31 @@ def _check_recommendation_buys(d: date, store, rows: dict, sent: set, notifier) 
             continue  # 停牌或无有效昨收，无法算涨停价
         name = str(row.get("name") or pick.name)
         up, _ = limit_prices(pick.code, name, prev, d)
+        # 现金约束：broker 同款 budget 计算
+        if pick.weight is not None and total_capital is not None:
+            budget = total_capital * pick.weight
+        elif pick.weight is not None:
+            budget = pick.weight * 500_000  # 生产默认 total_capital
+        else:
+            budget = 100_000  # 生产默认 capital_per_pick
+        can_buy = cash * 0.999 >= 100 * open_price or cash * 0.999 >= 100 * last_price
         # --- 开盘触发（撮合口径） ---
         key_open = f"{pick.code}:开盘可买"
         if (key_open not in sent and open_price > 0
                 and pick.stop < open_price <= pick.entry_max and not at_limit_up(open_price, up)):
             sent.add(key_open)
-            msg = format_alert(
-                f"开盘可买 {pick.code} {name}",
-                f"竞价价 {open_price:.2f}，在买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
-                f"止盈 {pick.target:.2f}，持有 {pick.hold_days} 日；撮合引擎将按开盘价成交",
-                kind="trade")
+            if not can_buy:
+                msg = format_alert(
+                    f"开盘达买区 {pick.code} {name}",
+                    f"竞价价 {open_price:.2f}，在买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
+                    f"但账户现金 {cash:.0f} 元，连 1 手都买不起，撮合引擎不会成交",
+                    kind="trade")
+            else:
+                msg = format_alert(
+                    f"开盘可买 {pick.code} {name}",
+                    f"竞价价 {open_price:.2f}，在买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
+                    f"止盈 {pick.target:.2f}，持有 {pick.hold_days} 日；撮合引擎将按开盘价成交",
+                    kind="trade")
             notifier.send_text(msg)
             out.append(msg)
         # --- 盘中触发（现价回踩） ---
@@ -66,11 +86,18 @@ def _check_recommendation_buys(d: date, store, rows: dict, sent: set, notifier) 
         if (key_intra not in sent and last_price > 0
                 and pick.stop < last_price <= pick.entry_max):
             sent.add(key_intra)
-            msg = format_alert(
-                f"盘中可买 {pick.code} {name}",
-                f"现价 {last_price:.2f} 回踩入买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
-                f"止盈 {pick.target:.2f}；此为盘中信号，撮合引擎仅按开盘价成交（今日若未撮合则视为放弃）",
-                kind="trade")
+            if not can_buy:
+                msg = format_alert(
+                    f"盘中达买区 {pick.code} {name}",
+                    f"现价 {last_price:.2f} 回踩入买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
+                    f"但账户现金 {cash:.0f} 元不足 1 手，撮合不会成交",
+                    kind="trade")
+            else:
+                msg = format_alert(
+                    f"盘中可买 {pick.code} {name}",
+                    f"现价 {last_price:.2f} 回踩入买入区间（≤ {pick.entry_max:.2f}，止损 {pick.stop:.2f}），"
+                    f"止盈 {pick.target:.2f}；此为盘中信号，撮合引擎仅按开盘价成交（今日若未撮合则视为放弃）",
+                    kind="trade")
             notifier.send_text(msg)
             out.append(msg)
     return out
@@ -141,7 +168,8 @@ def check_once(d: date, store, client, notifier, cache=None, calendar=None) -> l
     out, dirty, miss_dirty = [], False, False
     # --- 推荐买入触发 ---
     if rec is not None and rec[0]:
-        buys = _check_recommendation_buys(d, store, rows, sent, notifier)
+        buys = _check_recommendation_buys(d, store, rows, sent, notifier,
+                                          cash=acc.cash if acc else 0.0)
         if buys:
             out.extend(buys)
             dirty = True

@@ -112,11 +112,12 @@ def watch(d: date, store: Store, rows: dict, held: set[str], recommended: set[st
     return out[:MAX_WATCH]
 
 
-def recommendation_status(d: date, store: Store, rows: dict, held: set[str]) -> list[dict]:
-    """早盘推荐在开盘价上的执行判断（与 broker step 2 同口径），未成交的给出原因。
+def recommendation_status(d: date, store: Store, rows: dict, held: set[str],
+                          cash: float = 0.0, total_capital: float | None = None) -> list[dict]:
+    """早盘推荐在开盘价上的执行判断（与 broker step 2 同口径，含现金约束），未成交的给出原因。
 
-    午盘时点还没结算，持仓里没有的推荐码只能靠开盘价推断：开盘价在买入区间且未涨停的，
-    收盘结算时会按开盘价成交；其余今天不会成交。已成交的推荐码已在持仓里，这里跳过。"""
+    午盘时点还没结算，持仓里没有的推荐码只能靠开盘价推断；除了常见的涨停/超买入上限/破止损，
+    还有一关现金约束：broker 会算 qty=round_lot(min(budget, cash*0.999)/price)，qty<100 直接跳过。"""
     loaded = store.load_recommendation(d, ACCOUNT)
     if loaded is None:
         return []
@@ -139,8 +140,19 @@ def recommendation_status(d: date, store: Store, rows: dict, held: set[str]) -> 
         elif open_price <= p.stop:
             item["why"] = "开盘即破止损，计划放弃"
         else:
-            item["pending"] = True
-            item["why"] = "开盘价在买入区间，15:35 结算时才会按开盘价成交（尚未成交）"
+            # 现金约束：broker 同款 qty 计算
+            if p.weight is not None and total_capital is not None:
+                budget = total_capital * p.weight
+            elif p.weight is not None:
+                budget = p.weight * 500_000
+            else:
+                budget = 100_000
+            qty = int(min(budget, cash * 0.999) / (open_price * 1.001) // 100 * 100)
+            if qty < 100:
+                item["why"] = f"开盘价在买入区间，但账户现金 {cash:.0f} 元，连 1 手都买不起，撮合不会成交"
+            else:
+                item["pending"] = True
+                item["why"] = f"开盘价在买入区间，15:35 结算时才会按开盘价成交（尚未成交）"
         out.append(item)
     return out
 
@@ -211,7 +223,7 @@ def run_midday(d: date, store: Store, client, llm, notifier) -> None:
             log.warning("个股报价获取失败: %r", e)
     rows = _spot_rows(spot)
     pos = positions(acc, rows, d)
-    status = recommendation_status(d, store, rows, held)
+    status = recommendation_status(d, store, rows, held, cash=acc.cash if acc else 0.0)
     watch_items = watch(d, store, rows, held, recommended)
     market = market_agent.intraday(client, spot if spot is not None and not spot.empty else None)
     market_lines = market_agent.summary_lines(market)
