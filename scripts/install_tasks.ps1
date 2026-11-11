@@ -47,7 +47,7 @@ function Register-Rsiqs([string]$Name, $Trigger, $Action, [bool]$Available = $fa
 Register-Rsiqs "premarket_scan"  (New-WeekdayTrigger "08:30") (New-JobAction "premarket_scan") $true $true
 Register-Rsiqs "premarket_final" (New-WeekdayTrigger "09:25") (New-JobAction "premarket_final") $true $true
 Register-Rsiqs "monitor"         (New-RetryTrigger "09:30" 2 330)  (New-JobAction "monitor")
-Register-Rsiqs "midday"          (New-WeekdayTrigger "11:35")      (New-JobAction "midday")
+Register-Rsiqs "midday"          (New-WeekdayTrigger "11:35")      (New-JobAction "midday") $true $false
 Register-Rsiqs "settle"          (New-RetryTrigger "15:35" 20 175) (New-JobAction "settle")
 Register-Rsiqs "review"          (New-RetryTrigger "16:05" 20 155) (New-JobAction "review")
 Register-Rsiqs "doctor"          (New-ScheduledTaskTrigger -Daily -At "07:30") (New-JobAction "doctor")

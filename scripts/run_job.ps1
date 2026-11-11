@@ -1,4 +1,4 @@
-﻿# RSIQS Windows 计划任务入口。用法（schtasks /TR 里调用）：
+# RSIQS Windows 计划任务入口。用法（schtasks /TR 里调用）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File <root>\scripts\run_job.ps1 <job>[,<job>...]
 # 例：run_job.ps1 settle,review —— 依次跑，前一个失败即停（保留退出码）。
 # 先切到仓库根目录（schtasks 没有工作目录概念，配置/数据库都按相对路径解析）。
