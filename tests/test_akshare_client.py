@@ -391,14 +391,22 @@ def test_spot_for_codes_uses_per_stock_quotes(monkeypatch):
             raise ConnectionError("down")
         return _bid_ask({**BID_ASK, "今开": "-"} if symbol == "000003" else BID_ASK)
 
+    def tencent_skip(*args, **kwargs):
+        raise ConnectionError("腾讯不可用")
+
+    monkeypatch.setattr(akc.requests, "get", tencent_skip)
     fake_ak(monkeypatch, stock_bid_ask_em=quote, stock_zh_a_spot_em=lambda: pytest.fail("no full-market spot"))
-    df = AkClient(wait=0).spot(["600000", "000002", "000003"])
+    df = AkClient(wait=0).spot(["600000", "000003"])  # 无失败代码：全部取到
     assert list(df.columns) == SPOT_COLS
-    assert df["code"].tolist() == ["600000", "000003"]  # 取不到的代码不出现（按竞价数据缺失处理）
+    assert df["code"].tolist() == ["600000", "000003"]
     r = df.set_index("code").loc["600000"]
     assert (r["open"], r["prev_close"], r["last"], r["high"], r["volume"], r["pct"]) == (10.2, 10.0, 10.3, 10.4, 1200.0, 3.0)
     assert pd.isna(df.set_index("code").loc["000003", "open"])  # 停牌时报价为 "-"
     assert AkClient().spot([]).empty and list(AkClient().spot([]).columns) == SPOT_COLS
+
+    # 另：一只失败会触发东财熔断（3 次重试 = EM_FAIL_LIMIT），后续代码被跳过，腾讯也挂时只剩成功的那只
+    df2 = AkClient(wait=0).spot(["600000", "000002", "000003"])
+    assert df2["code"].tolist() == ["600000"]  # 000002 失败后熔断，000003 被跳，腾讯挂无兜底
 
 
 def test_spot_for_codes_falls_back_to_sina_snapshot(monkeypatch):
@@ -440,6 +448,10 @@ def test_spot_for_codes_without_fallback_still_raises(monkeypatch):
     def down(symbol):
         raise ConnectionError("down")
 
+    def tencent_down(*args, **kwargs):
+        raise ConnectionError("腾讯不可用")
+
+    monkeypatch.setattr(akc.requests, "get", tencent_down)
     fake_ak(monkeypatch, stock_bid_ask_em=down,
             stock_zh_a_spot_em=lambda: pytest.fail("未开启 fallback 时不应取全市场快照"))
     with pytest.raises(DataError, match="个股报价全部获取失败"):
@@ -452,7 +464,7 @@ def test_spot_for_codes_raises_when_snapshot_also_fails(monkeypatch):
 
     monkeypatch.setattr(akc.requests, "get", down)
     fake_ak(monkeypatch, stock_bid_ask_em=down, stock_zh_a_spot_em=down, stock_zh_a_spot=down)
-    with pytest.raises(DataError, match="含全市场快照回退"):
+    with pytest.raises(DataError, match="东财/腾讯/新浪"):
         AkClient(wait=0).spot(["600000"], fallback=True)
 
 
@@ -620,6 +632,10 @@ def test_spot_for_codes_all_failing_raises(monkeypatch):
     def down(symbol):
         raise ConnectionError("push2 down")
 
+    def tencent_down(*args, **kwargs):
+        raise ConnectionError("tencent down")
+
+    monkeypatch.setattr(akc.requests, "get", tencent_down)
     fake_ak(monkeypatch, stock_bid_ask_em=down)
     with pytest.raises(DataError):  # 一只都取不到：让盘中监控计入失败并告警，而不是当成全部停牌
         AkClient(wait=0).spot(["600000", "000001"])

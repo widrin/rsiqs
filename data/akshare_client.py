@@ -399,25 +399,43 @@ class AkClient:
         给出 codes 时逐只取东财个股报价：akshare 的全市场快照分页翻取、每页之间 sleep，要将近一分钟，09:25 定稿
         和盘中监控都等不起。取不到的代码不出现在结果里（按竞价数据缺失处理），名称为空；一只都取不到时抛
         DataError。sink 不为 None 时每取到一只就追加一行（dict），调用方超时后可以用已取到的部分。
-        fallback=True 时对仍然缺报价的代码先取腾讯批量行情（快、不限频），仍缺再回退新浪全市场快照
-        （一次将近一分钟）：盘中监控容忍这个耗时，09:25 定稿有 09:28 的时限，宁可当缺失处理，所以默认不开。
+
+        个股报价失败后会自动切腾讯批量行情（快、不限频，不走东财熔断判断）。仍缺的代码：
+        - fallback=True 时再回退新浪全市场快照（一次将近一分钟）：盘中监控容忍这个耗时
+        - fallback=False 时不再回退全市场快照（09:25 定稿有 09:28 的时限，宁可让缺失代码按竞价过滤缺失处理）
+
         不给 codes 时取全市场：东财失败切新浪。"""
         if codes is not None:
+            out = pd.DataFrame(columns=SPOT_COLS)
             try:
                 out = self._spot_codes(codes, sink)
-            except DataError:
-                if not fallback:
-                    raise
-                out = pd.DataFrame(sink or [], columns=SPOT_COLS)
-            if not fallback:
-                return out
-            have = {str(c).zfill(6) for c in out["code"]}
+            except DataError as e:
+                if not str(e).startswith("个股报价全部获取失败"):
+                    raise  # 字段改名等程序错误不能被吞掉
+                # _spot_codes 全部失败 → 走腾讯批量行情兜底
+            # 东财个股报价覆盖不全时，先试腾讯批量行情（快、不打东财）
+            have = set(out["code"]) if not out.empty else set()
             missing = [c for c in codes if str(c).zfill(6) not in have]
             if missing:
-                out = pd.concat([out, self._snapshot_rows(missing)], ignore_index=True)
+                try:
+                    tencent = self._tencent_rows(missing)
+                    if not tencent.empty:
+                        out = pd.concat([out, tencent], ignore_index=True)
+                        have.update(tencent["code"])
+                        missing = [c for c in codes if str(c).zfill(6) not in have]
+                except Exception as e:  # noqa: BLE001 - 腾讯失败不应掩盖东财部分成功
+                    log.warning("个股报价东财失败后腾讯批量行情也失败: %s", e)
+            # 腾讯仍缺的才走全市场快照（受 fallback 控制）
+            if missing and fallback:
+                try:
+                    full = self._full_snapshot_sina()
+                    wanted = {str(c).zfill(6) for c in missing}
+                    out = pd.concat([out, full[full["code"].isin(wanted)]], ignore_index=True)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("个股报价回退全市场快照失败: %s", e)
             if codes and out.empty:
-                raise DataError(f"个股报价全部获取失败（{len(codes)} 只，含全市场快照回退）")
-            return out[SPOT_COLS]
+                raise DataError(f"个股报价全部获取失败（{len(codes)} 只，东财/腾讯{'/新浪' if fallback else ''}均失败）")
+            return out[SPOT_COLS].reset_index(drop=True)
         if not self._em_allow():
             log.warning("东财熔断冷却中，快照直接切换新浪")
         else:
@@ -494,15 +512,19 @@ class AkClient:
         return pd.concat([rows, full[full["code"].isin(wanted)]], ignore_index=True)[SPOT_COLS]
 
     def _spot_codes(self, codes: list[str], sink: list | None = None) -> pd.DataFrame:
-        if codes and not self._em_allow():
-            raise DataError(f"个股报价全部获取失败（{len(codes)} 只，东财熔断冷却中）")
         rows = [] if sink is None else sink
         for code in codes:
+            # 循环内检查熔断：首只失败触发 cooldown 后，后续 code 不应再浪费 3 次重试 × 2.2s
+            if not self._em_allow():
+                log.warning("个股报价熔断冷却中，提前跳过剩余 %d 只", len(codes) - codes.index(code))
+                break
             try:
                 df = self._em_get(ak.stock_bid_ask_em, symbol=code)
             except Exception as e:  # noqa: BLE001 - 单只失败不影响其他代码
+                self._em_note(False)
                 log.warning("个股报价 %s 失败: %s", code, e)
                 continue
+            self._em_note(True)  # 成功则清零失败计数（跨接口残留的 cooldown 也会被清掉）
             kv = dict(zip(df["item"], df["value"]))
             missing = [k for k in BID_ASK_COLS if k not in kv]
             if missing:  # 字段改名不能静默变成 NaN：竞价过滤和盘中监控会悄悄失效

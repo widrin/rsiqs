@@ -98,7 +98,7 @@ def test_repair_index_only_when_gap(env):
 
 
 def test_research_idle_variants(env):
-    assert "没有成功运行记录" in research_idle(env.store, today=NOW.date())
+    assert "从未成功运行" in research_idle(env.store, today=NOW.date())
     env.store.mark_job("research", ANCHOR, "ok")
     assert "空转" in research_idle(env.store, today=NOW.date())  # ok 但没有 LLM 记录
     add_llm_usage(env.store)

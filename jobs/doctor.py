@@ -24,7 +24,7 @@ from jobs import common
 from notify.format import format_alert
 
 LOOKBACK_DAYS = 3       # jobs 表失败回看天数
-RESEARCH_STALE_DAYS = 3  # research 连续这么多天没有成功记录或产出才提示
+RESEARCH_STALE_DAYS = 14  # research 每周六跑一次；超过 2 周没成功运行才提示
 REPAIR_START_DAYS = 60   # 修复回填的 start_default：只对完全没数据的代码生效，老股票走增量
 LOG_TAIL_BYTES = 512 * 1024
 MISSING_WARN_FRACTION = 0.02  # 锚定日缺 K 线占比低于此值只提示（退市/CDR 等个别无数据），超过算异常
@@ -107,18 +107,24 @@ def source_health(log_path: Path, today: date | None = None) -> str | None:
 
 
 def research_idle(store, days: int = RESEARCH_STALE_DAYS, today: date | None = None) -> str | None:
-    """research 的 exit 0 不代表有产出：记 ok 但窗口内没有任何 research LLM 记录即为空转。"""
+    """research 每周六跑一次：距离最近一次 ok 超过 days 天才提示"未运行"；
+    运行过但没有任何 research LLM 记录（exit 0 但空转）也提示。"""
     today = today or common.today()
-    since = (today - timedelta(days=days - 1)).isoformat()
-    ran = store.conn.execute(
-        "SELECT MAX(d) FROM jobs WHERE job='research' AND status='ok' AND d>=?", (since,)).fetchone()[0]
-    if ran is None:
-        return f"research 最近 {days} 天没有成功运行记录"
+    last_ok = store.conn.execute(
+        "SELECT MAX(d) FROM jobs WHERE job='research' AND status='ok'").fetchone()[0]
+    if last_ok is None:
+        return f"research 从未成功运行过"
+    try:
+        delta = (today - date.fromisoformat(last_ok)).days
+    except (TypeError, ValueError):
+        return f"research 最近运行日期无效：{last_ok!r}"
+    if delta > days:
+        return f"research 距上次成功运行已 {delta} 天（阈值 {days} 天，每周六运行）"
     n = store.conn.execute(
-        "SELECT COUNT(*) FROM llm_usage WHERE purpose LIKE 'research%' AND substr(ts,1,10)>=?",
-        (since,)).fetchone()[0]
+        "SELECT COUNT(*) FROM llm_usage WHERE purpose LIKE 'research%' AND ts>=?",
+        (f"{last_ok} 00:00:00",)).fetchone()[0]
     if n == 0:
-        return f"research {ran} 记 ok 但近期没有任何 research LLM 记录（空转，检查 engine/ 完整性与日志）"
+        return f"research {last_ok} 记 ok 但没有任何 research LLM 记录（空转，检查 engine/ 完整性与日志）"
     return None
 
 
