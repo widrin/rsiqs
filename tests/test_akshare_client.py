@@ -617,6 +617,41 @@ def test_index_daily_picks_most_recent_source(monkeypatch):
     assert list(s.index) == [pd.Timestamp("2026-11-06"), pd.Timestamp("2026-11-09")]
 
 
+def test_index_daily_falls_back_to_tencent(monkeypatch):
+    """新浪缺当日 + 东财熔断中：选腾讯（2026-11-12 东财限流叠加新浪延迟、settle_data 重试 5 次全失败的兜底）。"""
+    def sina(symbol):
+        return pd.DataFrame({"date": ["2026-11-10", "2026-11-11"], "open": [1, 1], "close": [4000.0, 4010.5],
+                             "high": [1, 1], "low": [1, 1], "volume": [1, 1], "amount": [1, 1]})
+
+    def tx(symbol):
+        return pd.DataFrame({"date": ["2026-11-11", "2026-11-12"], "open": [1, 1], "close": [4010.5, 4043.93],
+                             "high": [1, 1], "low": [1, 1], "amount": [1, 1]})
+
+    def em(symbol, start_date="19900101", end_date="20500101"):
+        raise AssertionError("熔断冷却中不应请求东财")
+
+    fake_ak(monkeypatch, stock_zh_index_daily=sina, stock_zh_index_daily_tx=tx, stock_zh_index_daily_em=em)
+    client = AkClient(wait=0)
+    client._em_skip_until = 10**12  # 熔断冷却中
+    s = client.index_daily("sh000300")
+    assert list(s.index) == [pd.Timestamp("2026-11-11"), pd.Timestamp("2026-11-12")]
+    assert s.tolist() == [4010.5, 4043.93] and s.name == "sh000300"
+
+
+def test_index_daily_tencent_failure_still_raises(monkeypatch):
+    """三源都失败时仍抛 DataError：新浪延迟 + 东财熔断 + 腾讯挂了不静默返回旧数据。"""
+    def down(symbol):
+        raise ConnectionError("down")
+
+    def em(symbol, start_date="19900101", end_date="20500101"):
+        raise ConnectionError("rate limited")
+
+    fake_ak(monkeypatch, stock_zh_index_daily=down, stock_zh_index_daily_tx=down,
+            stock_zh_index_daily_em=em)
+    with pytest.raises(DataError, match="均失败"):
+        AkClient(wait=0).index_daily("sh000300")
+
+
 def test_client_sets_a_default_socket_timeout():
     import socket
     old = socket.getdefaulttimeout()

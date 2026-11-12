@@ -286,37 +286,39 @@ class AkClient:
         return out[cols].sort_values("date").reset_index(drop=True)
 
     def index_daily(self, symbol: str = "sh000300") -> pd.Series:
-        """指数日线：两边都查，取最新日期的那个。
+        """指数日线：新浪、东财、腾讯都查，取最新日期的那个。
 
-        东财（stock_zh_index_daily_em）是分钟聚合，收盘后几分钟就齐；新浪（stock_zh_index_daily）是独立每日
-        服务，常在次日凌晨才更新前一天。简单的"新浪优先、失败切东财"会漏掉东财已有的当日数据（新浪不报错、
-        只是静默缺最后一天）。这里两边都取，用 max(date) 选更新更全的那份。
+        东财（stock_zh_index_daily_em）是分钟聚合，收盘后几分钟就齐，但 push2 与个股报价共享 IP 限流，
+        熔断期间随个股一起跳过；新浪（stock_zh_index_daily）是独立每日服务，常在次日凌晨才更新前一天；
+        腾讯（stock_zh_index_daily_tx）收盘后即有当日数据，兜住前两家同时缺当日的情形（2026-11-12
+        东财限流 + 新浪未更新，settle_data 重试 5 次全失败的根因）。三边都取，用 max(date) 选更新更全的那份。
         """
-        sina_df = None
-        sina_max = None
+        candidates: list[tuple[pd.Timestamp, pd.DataFrame]] = []
         try:
             sina_df = self._call(ak.stock_zh_index_daily, symbol=symbol)
-            sina_max = pd.to_datetime(sina_df["date"]).max()
+            candidates.append((pd.to_datetime(sina_df["date"]).max(), sina_df))
         except Exception as e:  # noqa: BLE001
             log.warning("新浪指数日线失败: %s", e)
 
         em_df = None
-        em_max = None
         if self._em_allow():
             try:
                 em_df = self._em_get(ak.stock_zh_index_daily_em, symbol=symbol)
                 self._em_note(True)
-                em_max = pd.to_datetime(em_df["date"]).max()
+                candidates.append((pd.to_datetime(em_df["date"]).max(), em_df))
             except Exception as e:  # noqa: BLE001
                 self._em_note(False)
                 log.warning("东财指数日线失败: %s", e)
 
-        if sina_df is None and em_df is None:
-            raise DataError("指数日线新浪/东财均失败")
-        if em_df is not None and (sina_df is None or em_max >= sina_max):
-            df = em_df
-        else:
-            df = sina_df
+        try:
+            tx_df = self._call(ak.stock_zh_index_daily_tx, symbol=symbol)
+            candidates.append((pd.to_datetime(tx_df["date"]).max(), tx_df))
+        except Exception as e:  # noqa: BLE001
+            log.warning("腾讯指数日线失败: %s", e)
+
+        if not candidates:
+            raise DataError("指数日线新浪/东财/腾讯均失败")
+        df = max(candidates, key=lambda x: x[0])[1]
 
         idx = pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize()
         s = pd.Series(pd.to_numeric(df["close"]).astype(float).to_numpy(), index=idx, name=symbol)
