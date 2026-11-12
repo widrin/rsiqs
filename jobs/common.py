@@ -87,7 +87,7 @@ LOG_BACKUPS = 5
 
 INDEX_SYMBOL = "sh000300"
 BENCH_ACCOUNT = "bench:csi300"
-LLM_ACCOUNTS = ("h:active", "h:candidate")
+LLM_ACCOUNTS = ("h:active", "h:candidate", "h:news")  # h:news 是消息面影子账户：只结算、不推送
 ACTIVE_ACCOUNT = LLM_ACCOUNTS[0]  # 实盘模拟账户：买入成交、盘中止损止盈等提醒只推它
 DEFAULT_INCUMBENT = "baseline_momo"
 CLOSE_READY = time(15, 10)  # 当日日线视为可用的最早时刻

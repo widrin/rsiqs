@@ -27,7 +27,7 @@ def test_bootstrap_creates_everything(tmp_path, monkeypatch):
     dates, settings, store, cache, notifier, manifests = setup(tmp_path, monkeypatch)
     summary = bootstrap.main(now=datetime.combine(dates[100], time(20, 0)))
 
-    expected = {"q:baseline_momo", "h:active", "h:candidate", "bench:csi300"}
+    expected = {"q:baseline_momo", "h:active", "h:candidate", "h:news", "bench:csi300"}
     assert expected <= set(store.list_accounts())
     for name in expected:
         assert store.load_account(name).cash == settings.capital

@@ -10,7 +10,7 @@ def read(name):
 
 def test_every_task_points_to_existing_job_module():
     jobs = set(re.findall(r'New-JobAction "([\w,]+)"', read("install_tasks.ps1")))
-    assert jobs == {"premarket_scan", "premarket_final", "monitor", "midday", "settle", "review",
+    assert jobs == {"premarket_scan", "news_scan", "premarket_final", "monitor", "midday", "settle", "review",
                     "doctor", "research", "settle,review"}
     for job in jobs:
         for name in job.split(","):
@@ -19,7 +19,7 @@ def test_every_task_points_to_existing_job_module():
 
 def test_schedule_times_and_triggers():
     ps1 = read("install_tasks.ps1")
-    for t in ("08:30", "09:25", "09:30", "15:35", "16:05", "07:30", "10:00"):
+    for t in ("08:30", "08:35", "09:25", "09:30", "15:35", "16:05", "07:30", "10:00"):
         assert f'"{t}"' in ps1, t
     assert '(New-WeekdayTrigger "09:25") (New-JobAction "premarket_final")' in ps1
     assert "-AtStartup" in ps1 and "Saturday" in ps1 and "StartWhenAvailable:$Available" in ps1
