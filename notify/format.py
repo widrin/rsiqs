@@ -7,6 +7,21 @@ from engine.types import Pick
 
 DISCLAIMER = "> 模拟盘信号，仅供研究，不构成投资建议。"
 
+# 账户显示名：推送里中文名在前、数据库键名括号在后，一眼能看出是哪个通道。
+# 未登记的账户（例如新量化策略的 q:* 账户）显示原键名，策略名本身有语义。
+ACCOUNT_LABELS = {
+    "q:baseline_momo": "量化基线动量",
+    "h:active": "LLM现任",
+    "h:candidate": "LLM候选",
+    "h:news": "消息面影子",
+    "bench:csi300": "沪深300基准",
+}
+
+
+def account_label(account: str) -> str:
+    label = ACCOUNT_LABELS.get(account)
+    return f"{label}（{account}）" if label else account
+
 
 def _one_line(text: str) -> str:
     """LLM 写的理由和市场观点可能含换行：合并成一行，免得后面的行跳出引用、被渲染成标题或列表。"""
@@ -40,7 +55,7 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
         extra = ""
         if bench is not None and r.get("today") and not r["account"].startswith("bench:"):
             extra = f"，超额 {r['day_ret'] - bench:+.2%}"
-        lines.append(f"**{r['account']}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}{extra}")
+        lines.append(f"**{account_label(r['account'])}** 净值 {r['equity']:,.2f}，当日 {r['day_ret']:+.2%}，累计 {r['total_ret']:+.2%}{extra}")
     market_lines = summary_lines(market)
     if market_lines:
         lines.append("### 大盘")
@@ -55,12 +70,12 @@ def format_daily_report(d: date, rows: list[dict], review_summary: str,
             if priced:
                 pnl = sum(h["pnl"] for h in priced)
                 basis = sum(h["cost"] * h["qty"] for h in priced)
-                lines.append(f"**{account}** 浮动盈亏 {pnl:+,.0f} 元（{pnl / basis:+.2%}）")
+                lines.append(f"**{account_label(account)}** 浮动盈亏 {pnl:+,.0f} 元（{pnl / basis:+.2%}）")
                 day_pnls = [h.get("day_pnl") for h in priced if h.get("day_pnl") is not None]
                 if day_pnls:
                     lines.append(f"今日持仓盈亏 {sum(day_pnls):+,.0f} 元")
             else:
-                lines.append(f"**{account}**")
+                lines.append(f"**{account_label(account)}**")
             for h in part:
                 if h["price"] is None:
                     lines.append(f"- {h['code']} {h['name']} {h['qty']} 股：成本 {h['cost']:.2f}，收盘价缺失")
@@ -84,7 +99,7 @@ def format_midday_report(d: date, account: str, positions: list[dict], status: l
     if market_lines:
         lines.append("### 大盘")
         lines += market_lines
-    lines.append(f"### 持仓 {account}")
+    lines.append(f"### 持仓 {account_label(account)}")
     priced = [p for p in positions if p["price"] is not None]
     if not positions:
         lines.append("（空仓）")

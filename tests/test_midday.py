@@ -119,7 +119,7 @@ def test_midday_report_lists_positions_and_watch_only():
     run_midday(D, store, Client(spot_df()), FakeLLM(), notifier)
     assert len(notifier.sent) == 1
     text = notifier.sent[0]
-    assert "午盘简报" in text and "持仓 h:active" in text
+    assert "午盘简报" in text and "持仓 LLM现任（h:active）" in text
     assert "600001" in text and "浮动 +200 元（+2.00%）" in text
     assert "600002" in text                      # 回踩到买入区间的早盘候选
     assert "### 早盘推荐执行" in text              # 早盘推荐未在持仓的给出开盘判断

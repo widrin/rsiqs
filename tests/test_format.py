@@ -44,7 +44,7 @@ def test_daily_report_lists_holdings_pnl():
                  "price": 10.15, "day_ret": 0.015, "pnl": 150.0, "pnl_ret": 0.015}]
     s = format_daily_report(date(2026, 10, 16), rows, "", holdings)
     assert "收盘持仓收益" in s
-    assert "**h:active** 浮动盈亏 +150 元（+1.50%）" in s
+    assert "**LLM现任（h:active）** 浮动盈亏 +150 元（+1.50%）" in s
     assert "- 600000 浦发银行 1000 股：成本 10.00 → 收盘 10.15，浮动 +150 元（+1.50%），今日 +1.50%" in s
 
 
@@ -63,8 +63,8 @@ def test_daily_report_with_market_section_and_excess():
     assert "沪深300 4,054.28（-1.44%）；上证指数 3,200.00（-1.00%）" in s
     assert "涨跌家数：上涨 1203 / 下跌 3412 / 平盘 78，成交额 8,642 亿" in s
     assert "板块领涨：煤炭 +3.20%" in s and "板块领跌：计算机 -2.80%" in s
-    assert "h:active" in s and "超额 +3.78%" in s  # 2.34% - (-1.44%)
-    bench_line = next(ln for ln in s.splitlines() if ln.startswith("**bench:csi300**"))
+    assert "LLM现任（h:active）" in s and "超额 +3.78%" in s  # 2.34% - (-1.44%)
+    bench_line = next(ln for ln in s.splitlines() if ln.startswith("**沪深300基准（bench:csi300）**"))
     assert "净值 498,000.00" in bench_line and "超额" not in bench_line
     # 未结算的账户不算超额（会把前一天的涨跌当成今天的）
     rows[0]["today"] = False
