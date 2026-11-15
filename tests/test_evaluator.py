@@ -111,17 +111,26 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
     assert str(sentinel) not in repr(rep)
 
 
-GOOD_TRAIN = {"sharpe": 0.5}
+GOOD_TRAIN = {"sharpe": 0.5, "max_dd": -0.45}
 GOOD_VAL = {"sharpe": 0.5, "excess_ann": 0.05, "max_dd": -0.25}
 
 
 def test_gate_boundaries_inclusive_and_each_condition_counts():
     assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.61, dsr_incumbent=0.60) is True  # 边界含等号
     assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.60 - 1e-9, dsr_incumbent=0.60) is False
-    assert ev._passes_gate({"sharpe": 0.5 - 1e-9}, GOOD_VAL, 0.95) is False
+    assert ev._passes_gate({"sharpe": 0.5 - 1e-9, "max_dd": -0.45}, GOOD_VAL, 0.95) is False
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.95) is True
+    assert ev._passes_gate({**GOOD_TRAIN, "max_dd": -0.45 - 1e-9}, GOOD_VAL, 0.95) is False
     for key in GOOD_VAL:
         assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, key: GOOD_VAL[key] - 1e-9}, 0.95) is False, key
     assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, "sharpe": float("nan")}, 0.95) is False
+
+
+def test_gate_rejects_deep_train_drawdown():
+    """train 九年最大回撤 -66%/-74% 的策略不许靠 val 牛市过关（2026-11-14 两个候选的实测值）。"""
+    for dd in (-0.6617, -0.7404):
+        assert ev._passes_gate({**GOOD_TRAIN, "max_dd": dd}, GOOD_VAL, 0.95) is False, dd
+    assert ev.GATE["train_max_dd"] == -0.45
 
 
 def test_gate_excess_is_dividend_adjusted():

@@ -19,7 +19,10 @@ SPLITS = {"train": (date(2016, 1, 1), date(2024, 12, 31)),
 # train+val 拼接的约 2,600 个日收益，检验力足够。
 # val_excess_ann 的口径是相对沪深300价格指数，而策略净值来自前复权价（分红已隐含在价格里）、基准不含
 # 分红。沪深300 股息率约 2%/年，门槛因此从 3% 抬到 5%，抵消这部分结构性偏差。
-GATE = {"train_sharpe": 0.5, "val_sharpe": 0.5, "val_excess_ann": 0.05, "val_max_dd": -0.25}
+# train_max_dd 是九年的回撤上限：A 股长多动量必然经历熊市，放宽到 -45%，但挡住 -66%、-74% 这种
+# "九年亏掉三分之二"的策略——它们能靠 val 段（2025-01~2026-06 是单边牛市）蒙过其余门槛。
+GATE = {"train_sharpe": 0.5, "train_max_dd": -0.45, "val_sharpe": 0.5,
+        "val_excess_ann": 0.05, "val_max_dd": -0.25}
 # DSR 不再写死一个绝对门槛：策略够不够好，是相对现任判断的（目标是把钱赚得比现在这一套多）。
 # 挑战者的 DSR 至少要达到现任的水平——同一条公式、同一个 n_trials，比较是公平的，而且试验次数
 # 增加对双方的影响相同，不会像固定的 0.9 那样越研究越不可能达标。DSR_FLOOR 只是防噪声的底线：
@@ -52,7 +55,8 @@ def _dsr_bar(dsr_incumbent: float | None) -> float:
 
 
 def _passes_gate(train: dict, val: dict, dsr: float, dsr_incumbent: float | None = None) -> bool:
-    return (train["sharpe"] >= GATE["train_sharpe"] and val["sharpe"] >= GATE["val_sharpe"]
+    return (train["sharpe"] >= GATE["train_sharpe"] and train["max_dd"] >= GATE["train_max_dd"]
+            and val["sharpe"] >= GATE["val_sharpe"]
             and val["excess_ann"] >= GATE["val_excess_ann"] and val["max_dd"] >= GATE["val_max_dd"]
             and dsr >= _dsr_bar(dsr_incumbent))
 

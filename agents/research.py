@@ -147,7 +147,7 @@ def build_context(settings: Settings, store: Store) -> str:
         "",
         "## 数据切分与门槛",
         f"- 切分 SPLITS：{json.dumps(splits, ensure_ascii=False)}",
-        f"- 回测门槛 GATE（全部为 >= 比较；val_max_dd 为负数）：{json.dumps(GATE)}",
+        f"- 回测门槛 GATE（全部为 >= 比较；train_max_dd、val_max_dd 为负数）：{json.dumps(GATE)}",
         f"- DSR 门槛不是固定值：要求不低于现任策略的 DSR（每条报告的 dsr_bar 就是本次的分数线），"
         f"另设 {DSR_FLOOR} 的噪声底线。超过现任即可，不要为了更高的绝对 DSR 反复微调。",
         f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
