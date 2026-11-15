@@ -11,6 +11,7 @@ DISCLAIMER = "> 模拟盘信号，仅供研究，不构成投资建议。"
 # 未登记的账户（例如新量化策略的 q:* 账户）显示原键名，策略名本身有语义。
 ACCOUNT_LABELS = {
     "q:baseline_momo": "量化基线动量",
+    "q:vol_exit_fixedhold_2611": "波动率出场（现任）",
     "h:active": "LLM现任",
     "h:candidate": "LLM候选",
     "h:news": "消息面影子",
