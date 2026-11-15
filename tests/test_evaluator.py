@@ -112,7 +112,7 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
 
 
 GOOD_TRAIN = {"sharpe": 0.5}
-GOOD_VAL = {"sharpe": 0.8, "excess_ann": 0.03, "max_dd": -0.25}
+GOOD_VAL = {"sharpe": 0.5, "excess_ann": 0.05, "max_dd": -0.25}
 
 
 def test_gate_boundaries_inclusive_and_each_condition_counts():
@@ -122,6 +122,17 @@ def test_gate_boundaries_inclusive_and_each_condition_counts():
     for key in GOOD_VAL:
         assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, key: GOOD_VAL[key] - 1e-9}, 0.95) is False, key
     assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, "sharpe": float("nan")}, 0.95) is False
+
+
+def test_gate_excess_is_dividend_adjusted():
+    """基准是价格指数不含分红、策略净值含分红：3% 的原始超额不足以说明跑赢指数。"""
+    assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, "excess_ann": 0.03}, 0.95) is False
+    assert ev.GATE["val_excess_ann"] == 0.05
+
+
+def test_gate_val_sharpe_is_only_a_sanity_floor():
+    """val 段只有 18 个月，夏普标准误约 0.8：不设 0.8 硬门槛，显著性交给 DSR。"""
+    assert ev.GATE["val_sharpe"] == ev.GATE["train_sharpe"] == 0.5
 
 
 def test_splits_are_contiguous_and_holdout_starts_2026_07():

@@ -14,7 +14,12 @@ from engine.store import Store
 SPLITS = {"train": (date(2016, 1, 1), date(2024, 12, 31)),
           "val": (date(2025, 1, 1), date(2026, 6, 30)),
           "holdout": (date(2026, 7, 1), None)}  # None = calendar.last()
-GATE = {"train_sharpe": 0.5, "val_sharpe": 0.8, "val_excess_ann": 0.03, "val_max_dd": -0.25, "dsr": 0.90}
+# val 段只有 18 个月（约 378 个日收益），夏普的年化标准误约 0.8：真实夏普 1.0 的策略也有四成概率被
+# 测到 0.8 以下。所以 val_sharpe 只作为"样本外没有崩掉"的兜底，与 train 同档；显著性交给 DSR——它用
+# train+val 拼接的约 2,600 个日收益，检验力足够。
+# val_excess_ann 的口径是相对沪深300价格指数，而策略净值来自前复权价（分红已隐含在价格里）、基准不含
+# 分红。沪深300 股息率约 2%/年，门槛因此从 3% 抬到 5%，抵消这部分结构性偏差。
+GATE = {"train_sharpe": 0.5, "val_sharpe": 0.5, "val_excess_ann": 0.05, "val_max_dd": -0.25, "dsr": 0.90}
 HOLDOUT_GATE = {"excess_ann": 0.0, "sharpe": 0.5}
 
 
