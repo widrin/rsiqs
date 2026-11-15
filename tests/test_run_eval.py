@@ -43,9 +43,10 @@ def captured(tmp_path, monkeypatch):
     monkeypatch.setattr(run_eval, "load_strategy", lambda name: sentinel)
     seen = {}
 
-    def fake_evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
+    def fake_evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
+                      dsr_incumbent=None):
         seen.update(strategy=strategy, name=name, panel=panel, names=names, calendar=calendar,
-                    bench=benchmark_nav, store=store)
+                    bench=benchmark_nav, store=store, dsr_incumbent=dsr_incumbent)
         return FakeReport()
 
     monkeypatch.setattr(run_eval, "evaluate", fake_evaluate)
@@ -68,6 +69,7 @@ def test_main_prints_single_json_line(captured):
     assert captured["calendar"].last() == date(2026, 1, 7)
     assert captured["bench"].tolist() == pytest.approx([1.0, 1.1, 0.99])
     assert isinstance(captured["store"], Store)
+    assert captured["dsr_incumbent"] is None  # 库里没有现任：门槛退回 DSR_FLOOR
 
 
 def test_main_reports_error_as_json(captured, monkeypatch):
@@ -117,7 +119,8 @@ def _tamperings(monkeypatch):
 def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
     tamper_now = _tamperings(monkeypatch)[what]
 
-    def tamper(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
+    def tamper(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
+               dsr_incumbent=None):
         store.add_trial(name, {}, 1.0, 1.0, True, True)
         tamper_now()  # 模拟策略代码在评估中改了评估规则
         return FakeReport()
@@ -146,7 +149,8 @@ def test_rules_mutated_while_loading_strategy_void_the_trial(captured, monkeypat
         monkeypatch.setitem(ev.GATE, "dsr", -1.0)
         return captured["sentinel"]
 
-    def evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None):
+    def evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
+                 dsr_incumbent=None):
         store.add_trial(name, {}, 1.0, 1.0, True, True)
         return FakeReport()
 
@@ -155,6 +159,35 @@ def test_rules_mutated_while_loading_strategy_void_the_trial(captured, monkeypat
     out = io.StringIO()
     assert run_eval.main(["baseline_momo"], out=out) == 1
     assert captured["store_ref"].last_trial("baseline_momo")["gate_pass"] is False
+
+
+def test_incumbent_dsr_is_cached_per_incumbent(monkeypatch):
+    """现任的 DSR 是门槛的基准：同一只现任只回测一次，换现任后重算；评估现任自身时没有基准。"""
+    store = Store(":memory:")
+    store.set_status("inc_old", "incumbent", date(2026, 1, 5))
+    calls = []
+
+    class Res:
+        nav = pd.Series([1.0, 1.01, 1.005, 1.03, 1.02, 1.05], index=pd.bdate_range("2026-01-05", periods=6))
+
+    def bt(strategy, panel, names, calendar, start, end, bench, **kw):
+        calls.append(start)
+        return Res()
+
+    monkeypatch.setattr(run_eval, "load_strategy", lambda name: f"obj:{name}")
+    monkeypatch.setattr(run_eval.evaluator, "run_backtest", bt)
+    args = (store, {}, {}, None, pd.Series([1.0]), 3)
+
+    first = run_eval._incumbent_dsr(*args, skip="challenger")
+    assert first is not None and len(calls) == 2  # train + val 各一次
+    assert run_eval._incumbent_dsr(*args, skip="challenger") == pytest.approx(first)
+    assert len(calls) == 2  # 命中 kv 缓存
+    assert run_eval._incumbent_dsr(*args, skip="inc_old") is None  # 评估现任自身：无基准
+    assert len(calls) == 2
+
+    store.set_status("inc_new", "incumbent", date(2026, 2, 1))
+    run_eval._incumbent_dsr(*args, skip="challenger")
+    assert len(calls) == 4  # 换现任后重算
 
 
 def test_main_usage_error():

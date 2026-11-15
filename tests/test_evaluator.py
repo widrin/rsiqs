@@ -105,7 +105,7 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
     monkeypatch.setattr(ev, "run_backtest", tagged)
     rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
     d = rep.to_agent_dict()
-    assert set(d) == {"strategy", "train", "val", "dsr", "gate_pass", "holdout_pass", "n_trials"}
+    assert set(d) == {"strategy", "train", "val", "dsr", "dsr_bar", "gate_pass", "holdout_pass", "n_trials"}
     assert isinstance(d["holdout_pass"], bool)
     assert str(sentinel) not in json.dumps(d)
     assert str(sentinel) not in repr(rep)
@@ -116,8 +116,8 @@ GOOD_VAL = {"sharpe": 0.5, "excess_ann": 0.05, "max_dd": -0.25}
 
 
 def test_gate_boundaries_inclusive_and_each_condition_counts():
-    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.90) is True
-    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.90 - 1e-9) is False
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.61, dsr_incumbent=0.60) is True  # 边界含等号
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.60 - 1e-9, dsr_incumbent=0.60) is False
     assert ev._passes_gate({"sharpe": 0.5 - 1e-9}, GOOD_VAL, 0.95) is False
     for key in GOOD_VAL:
         assert ev._passes_gate(GOOD_TRAIN, {**GOOD_VAL, key: GOOD_VAL[key] - 1e-9}, 0.95) is False, key
@@ -133,6 +133,23 @@ def test_gate_excess_is_dividend_adjusted():
 def test_gate_val_sharpe_is_only_a_sanity_floor():
     """val 段只有 18 个月，夏普标准误约 0.8：不设 0.8 硬门槛，显著性交给 DSR。"""
     assert ev.GATE["val_sharpe"] == ev.GATE["train_sharpe"] == 0.5
+
+
+def test_dsr_bar_is_relative_to_incumbent():
+    """DSR 门槛跟着现任走：比现任高就过，比现任低就不过；现任很差时仍受噪声底线约束。"""
+    assert ev._dsr_bar(None) == ev.DSR_FLOOR
+    assert ev._dsr_bar(0.81) == 0.81
+    assert ev._dsr_bar(0.10) == ev.DSR_FLOOR  # 现任本身很差：不许门槛一路降到随机水平
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.82, dsr_incumbent=0.81) is True
+    assert ev._passes_gate(GOOD_TRAIN, GOOD_VAL, 0.80, dsr_incumbent=0.81) is False
+
+
+def test_report_exposes_the_dsr_bar(monkeypatch):
+    """模型要能看到本次分数线：否则只看到 dsr=0.72，不知道离现任差多少。"""
+    store = Store(":memory:")
+    rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL,
+                      dsr_incumbent=0.81)
+    assert rep.dsr_bar == 0.81 and rep.to_agent_dict()["dsr_bar"] == 0.81
 
 
 def test_splits_are_contiguous_and_holdout_starts_2026_07():

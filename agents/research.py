@@ -23,7 +23,7 @@ from agents.llm import LLM
 from agents.playbook import git_commit
 from agents.premarket import HISTORY_DAYS
 from config import Settings
-from engine.evaluator import GATE, HOLDOUT_GATE, SPLITS
+from engine.evaluator import DSR_FLOOR, GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
 from engine.run_eval import SETUP_EXIT
 from engine.store import Store
@@ -148,6 +148,8 @@ def build_context(settings: Settings, store: Store) -> str:
         "## 数据切分与门槛",
         f"- 切分 SPLITS：{json.dumps(splits, ensure_ascii=False)}",
         f"- 回测门槛 GATE（全部为 >= 比较；val_max_dd 为负数）：{json.dumps(GATE)}",
+        f"- DSR 门槛不是固定值：要求不低于现任策略的 DSR（每条报告的 dsr_bar 就是本次的分数线），"
+        f"另设 {DSR_FLOOR} 的噪声底线。超过现任即可，不要为了更高的绝对 DSR 反复微调。",
         f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
         f"- 会话开始时的历史试验总数 n_trials：{store.trial_count()}（本会话每评估一次加 1，当前数字见本轮任务）",
         "",
@@ -304,7 +306,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 精确日期和各项门槛数值见用户消息。
 
 # 过拟合与多重检验
-- 每次评估都记为一次试验；n_trials 是所有策略、所有会话累计的总数。门槛里的 DSR（Deflated Sharpe Ratio）按 n_trials 折减：试验越多，同样的夏普越可能只是运气，DSR 越低，越难达标。
+- 每次评估都记为一次试验；n_trials 是所有策略、所有会话累计的总数。DSR（Deflated Sharpe Ratio）按 n_trials 折减：试验越多，同样的夏普越可能只是运气。门槛与现任用同一个 n_trials 计算，折减对双方相同——目标是超过现任，而不是去追一个固定的绝对分数。
 - 所以要少而精：1 到 2 个论证充分、彼此差异明显的变体，胜过一堆参数微调。不做参数网格搜索，不为贴合 train/val 去微调阈值；参数取常见的整数（如 5、10、20、60 日），规则越简单越好。
 - 只在 val 好看、train 很差，或者只靠少数几笔交易撑起来的结果，大概率是噪声，属于过拟合的信号。
 
@@ -332,7 +334,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 - 系统依次处理你的草稿：检查名字和代码规范，保存为 strategies/<name>.py（状态 candidate），然后运行回测评估。没通过检查的草稿不会评估，也不占评估次数，原因会在下一轮告诉你。
 - gate_pass 且 holdout_pass 的策略自动进入影子盘（shadow），之后由至少 20 个交易日的前向模拟盘表现决定能否成为现任。
 - 一次会话有轮数、每轮草稿数和评估次数的上限（具体数字见用户消息）。草稿数不要超过剩余评估次数，超出的部分不会处理。
-- 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、gate_pass、holdout_pass（门槛未达标时为 null，表示没有运行）和 n_trials。
+- 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、dsr_bar（本次的 DSR 分数线）、gate_pass、holdout_pass（门槛未达标时为 null，表示没有运行）和 n_trials。
 - 每个草稿都要用新名字，包括修正上一轮出错的草稿。
 
 # 输出

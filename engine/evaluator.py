@@ -19,7 +19,12 @@ SPLITS = {"train": (date(2016, 1, 1), date(2024, 12, 31)),
 # train+val 拼接的约 2,600 个日收益，检验力足够。
 # val_excess_ann 的口径是相对沪深300价格指数，而策略净值来自前复权价（分红已隐含在价格里）、基准不含
 # 分红。沪深300 股息率约 2%/年，门槛因此从 3% 抬到 5%，抵消这部分结构性偏差。
-GATE = {"train_sharpe": 0.5, "val_sharpe": 0.5, "val_excess_ann": 0.05, "val_max_dd": -0.25, "dsr": 0.90}
+GATE = {"train_sharpe": 0.5, "val_sharpe": 0.5, "val_excess_ann": 0.05, "val_max_dd": -0.25}
+# DSR 不再写死一个绝对门槛：策略够不够好，是相对现任判断的（目标是把钱赚得比现在这一套多）。
+# 挑战者的 DSR 至少要达到现任的水平——同一条公式、同一个 n_trials，比较是公平的，而且试验次数
+# 增加对双方的影响相同，不会像固定的 0.9 那样越研究越不可能达标。DSR_FLOOR 只是防噪声的底线：
+# 现任本身很差时，不能让门槛一路降到随机水平。
+DSR_FLOOR = 0.5
 HOLDOUT_GATE = {"excess_ann": 0.0, "sharpe": 0.5}
 
 
@@ -29,6 +34,7 @@ class EvalReport:
     train: dict
     val: dict
     dsr: float
+    dsr_bar: float
     gate_pass: bool
     holdout_pass: bool | None
     n_trials: int
@@ -36,14 +42,19 @@ class EvalReport:
     def to_agent_dict(self) -> dict:
         # 只含训练/验证指标与留出期的通过与否；本类本身也不保存任何留出期数值
         return {"strategy": self.strategy, "train": dict(self.train), "val": dict(self.val),
-                "dsr": self.dsr, "gate_pass": self.gate_pass, "holdout_pass": self.holdout_pass,
-                "n_trials": self.n_trials}
+                "dsr": self.dsr, "dsr_bar": self.dsr_bar, "gate_pass": self.gate_pass,
+                "holdout_pass": self.holdout_pass, "n_trials": self.n_trials}
 
 
-def _passes_gate(train: dict, val: dict, dsr: float) -> bool:
+def _dsr_bar(dsr_incumbent: float | None) -> float:
+    """DSR 门槛：不低于现任，且不低于噪声底线。没有现任基准（首次评估、库为空）时只留底线。"""
+    return DSR_FLOOR if dsr_incumbent is None else max(DSR_FLOOR, float(dsr_incumbent))
+
+
+def _passes_gate(train: dict, val: dict, dsr: float, dsr_incumbent: float | None = None) -> bool:
     return (train["sharpe"] >= GATE["train_sharpe"] and val["sharpe"] >= GATE["val_sharpe"]
             and val["excess_ann"] >= GATE["val_excess_ann"] and val["max_dd"] >= GATE["val_max_dd"]
-            and dsr >= GATE["dsr"])
+            and dsr >= _dsr_bar(dsr_incumbent))
 
 
 def _data_end(panel, calendar: TradingCalendar) -> date:
@@ -53,7 +64,8 @@ def _data_end(panel, calendar: TradingCalendar) -> date:
 
 
 def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
-             store: Store, params: dict | None = None, splits: dict | None = None) -> EvalReport:
+             store: Store, params: dict | None = None, splits: dict | None = None,
+             dsr_incumbent: float | None = None) -> EvalReport:
     splits = splits or SPLITS
 
     def bt(key: str):
@@ -70,7 +82,7 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
     r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
     dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r), float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
-    gate_pass = _passes_gate(tr.metrics, va.metrics, dsr)
+    gate_pass = _passes_gate(tr.metrics, va.metrics, dsr, dsr_incumbent)
     # 先入库再回放留出期：留出期中途失败或进程被杀，这次试验也已计数
     trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
@@ -85,5 +97,6 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
         store.set_trial_holdout(trial_id, holdout_pass)
         if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
             raise KeyboardInterrupt from None
-    return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr, gate_pass=gate_pass,
+    return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr,
+                      dsr_bar=_dsr_bar(dsr_incumbent), gate_pass=gate_pass,
                       holdout_pass=holdout_pass, n_trials=store.trial_count())
