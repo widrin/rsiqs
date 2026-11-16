@@ -25,6 +25,7 @@ from agents.premarket import HISTORY_DAYS
 from config import Settings
 from engine.evaluator import DSR_FLOOR, GATE, HOLDOUT_GATE, SPLITS
 from engine.integrity import verify
+from engine import regime
 from engine.run_eval import SETUP_EXIT
 from engine.store import Store
 from notify.format import format_alert
@@ -152,6 +153,10 @@ def build_context(settings: Settings, store: Store) -> str:
         f"另设 {DSR_FLOOR} 的噪声底线。超过现任即可，不要为了更高的绝对 DSR 反复微调。",
         f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
         f"- 会话开始时的历史试验总数 n_trials：{store.trial_count()}（本会话每评估一次加 1，当前数字见本轮任务）",
+        "",
+        *([f"## 当前行情状态\n- {regime.summary_line(regime.latest(store))}（"
+           f"市场状态由沪深300相对120日均线+20日动量自动识别，每日结算时更新）"]
+          if regime.latest(store) else []),
         "",
         "## 策略代码可以 import 的模块（含其子模块）",
         "- " + ", ".join(sorted(ALLOWED_IMPORTS)),

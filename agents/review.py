@@ -16,6 +16,7 @@ from config import Settings
 from data.cache import BarCache
 from engine.calendar import TradingCalendar
 from engine.ledger import ex_rights_price
+from engine import regime
 from engine.store import Store
 from notify.format import format_daily_report
 
@@ -176,6 +177,10 @@ def run_review(d: dt.date, settings: Settings, store: Store, llm: LLM, cache: Ba
     market = None if client is None else market_agent.collect(store, cache, client, d)
     sections: list[str] = []
     market_lines = market_agent.summary_lines(market)
+    reg = regime.latest(store)
+    reg_line = regime.summary_line(reg)
+    if reg_line:
+        market_lines = [reg_line, *market_lines]
     if market_lines:
         sections += ["## 大盘", *market_lines]
     codes: set[str] = set()

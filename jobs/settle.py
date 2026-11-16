@@ -8,7 +8,7 @@ import pandas as pd
 
 from agents.premarket import HISTORY_DAYS
 from data.akshare_client import DataError
-from engine import promotion
+from engine import promotion, regime
 from engine.backtest import bars_for_day
 from engine.broker import SimBroker
 from engine.dataview import DataView
@@ -81,6 +81,14 @@ def refresh_data(codes: list[str], end: date, client, cache) -> None:
         cache.set_names(client.names())
     except Exception:  # noqa: BLE001 - 名称取不到不影响结算，沿用旧名称
         common.log.exception("refresh names failed")
+
+
+def refresh_regime(store, cache, client, end: date) -> None:
+    """根据最新指数日线识别行情状态（牛/熊/震荡），写入 kv 供盘前、复盘、研究使用。"""
+    try:
+        regime.detect(store, cache, client, asof=end)
+    except Exception:  # noqa: BLE001 - 行情状态识别失败不影响结算
+        common.log.exception("regime detect failed for %s", end)
 
 
 def refresh_dividends(store, client, cache, d: date | None = None) -> list[str]:
@@ -355,6 +363,7 @@ def _settle_pending(now, settings, store, client, cache, calendar, notifier) -> 
                           lambda: refresh_data(codes, days[-1], client, cache),
                           store, notifier, force=True):
         return []
+    refresh_regime(store, cache, client, days[-1])
     done, div_failed = [], set()
     for d in days:
         failed = frozenset(refresh_dividends(store, client, cache, d))  # 截至前一日的持仓与 d 日推荐
