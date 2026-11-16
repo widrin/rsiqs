@@ -74,7 +74,7 @@ uv run pytest
 | RSIQS_midday | 工作日 11:35 | `jobs.midday` | 午盘简报：h:active 持仓盘中状态 + 早盘候选回到买入区间的观察项；不改早盘推荐、不成交 |
 | RSIQS_settle | 工作日 15:35 起，每 20 分钟重试至 18:30 | `jobs.settle` | 拉日线结算模拟单、更新净值（当日日线 15:10 后才算可用；失败可补跑） |
 | RSIQS_review | 工作日 16:05 起，每 20 分钟重试至 18:40 | `jobs.review` | LLM 复盘当日推荐与实际走势、更新 playbook、推送日报，并回补漏掉的日子 |
-| RSIQS_research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘（错过即跳过） |
+| RSIQS_research | 周六 10:00 | `jobs.research` | 提出策略变体、回测评估，合格者进影子盘；随后做每周复盘：按当前行情比较各策略表现并推送策略切换建议（错过即跳过） |
 | RSIQS_doctor | 每天 07:30 | `jobs.doctor` | 体检 + 已知故障自动修复 + 未修复异常诊断 |
 | RSIQS_boot_catchup | 开机时 | `jobs.settle` → `jobs.review` | 开机补跑，依次执行 |
 

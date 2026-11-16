@@ -6,6 +6,7 @@ import pytest
 import agents.premarket as premarket
 import agents.research as research_agent
 import agents.review as review_agent
+import agents.weekly as weekly_agent
 from jobs import common, premarket_final, premarket_scan, research, review
 from engine.types import Pick
 from notify.wecom import NullNotifier
@@ -51,11 +52,16 @@ def env(tmp_path, monkeypatch):
         calls.append(("research", llm))
         return {"status": "ok"}
 
+    def fake_weekly(d, store, notifier):
+        calls.append(("weekly", d))
+        return {"state": None, "action": "none", "to": None}
+
     monkeypatch.setattr(premarket, "scan", fake_scan)
     monkeypatch.setattr(premarket, "run_analyze", fake_analyze)
     monkeypatch.setattr(premarket, "run_final", fake_final)
     monkeypatch.setattr(review_agent, "run_review", fake_review)
     monkeypatch.setattr(research_agent, "run_research", fake_research)
+    monkeypatch.setattr(weekly_agent, "run_weekly", fake_weekly)
     monkeypatch.setattr(common, "make_llm", lambda settings, store: "LLM")
     return dict(dates=dates, store=store, notifier=notifier, calls=calls, analysis=analysis,
                 slept=[], analysis_kw=analysis_kw, scan_picks=scan_picks, review_kw=review_kw,
@@ -338,7 +344,17 @@ def test_research_runs_once_per_day_with_factory_llm(env):
     sat = next_saturday(env["dates"][5])
     assert research.main(now=at(sat, 10)) == {"status": "ok"}
     assert research.main(now=at(sat, 11)) is None  # 当天已跑过
-    assert env["calls"] == [("research", "LLM")]
+    assert env["calls"] == [("research", "LLM"), ("weekly", sat)]  # 研究之后跑每周复盘
+
+
+def test_weekly_review_runs_even_when_research_fails(env, monkeypatch):
+    def boom(settings, store, notifier, llm=None):
+        raise RuntimeError("研究崩了")
+
+    monkeypatch.setattr(research_agent, "run_research", boom)
+    sat = next_saturday(env["dates"][5])
+    research.main(now=at(sat, 10))
+    assert ("weekly", sat) in env["calls"]
 
 
 def test_review_retries_earlier_day_even_if_latest_done(env):
