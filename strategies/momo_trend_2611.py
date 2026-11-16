@@ -41,10 +41,18 @@ class Momotrend2611:
             amt20 = float(amt.iloc[-20:].mean())
             if not (math.isfinite(amt5) and math.isfinite(amt20) and amt20 > 0 and amt5 <= amt20):
                 continue
-            r20, r5 = float(c.iloc[-1] / c.iloc[-21] - 1), float(c.iloc[-1] / c.iloc[-6] - 1)
+            r20 = float(c.iloc[-1] / c.iloc[-21] - 1)
+            r5 = float(c.iloc[-1] / c.iloc[-6] - 1)
             if not (math.isfinite(r20) and math.isfinite(r5)):
                 continue
-            rows.append({"code": code, "name": name, "close": close, "r20": r20, "r5": r5})
+            entry_max = round(close * 1.03, 2)
+            stop = round(close * 0.93, 2)
+            target = round(close * 1.10, 2)
+            if not (stop < entry_max < target):
+                continue
+            rows.append({"code": code, "name": name, "close": close,
+                         "r20": r20, "r5": r5,
+                         "entry_max": entry_max, "stop": stop, "target": target})
         if not rows:
             return []
         df = pd.DataFrame(rows)
@@ -52,8 +60,8 @@ class Momotrend2611:
         df = df.sort_values(["score", "code"], ascending=[False, True]).head(self.top_n)
         return [
             Pick(code=r.code, name=r.name, score=float(r.score),
-                 entry_max=round(r.close * 1.03, 2), stop=round(r.close * 0.93, 2),
-                 target=round(r.close * 1.10, 2), hold_days=5,
+                 entry_max=float(r.entry_max), stop=float(r.stop),
+                 target=float(r.target), hold_days=5,
                  reason=f"20日涨幅{r.r20:.1%}、5日涨幅{r.r5:.1%}，站上60日线且回调缩量，收盘{r.close:.2f}")
             for r in df.itertuples(index=False)
         ]
