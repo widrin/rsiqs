@@ -137,8 +137,10 @@ class Store:
                  None if holdout_pass is None else int(bool(holdout_pass))))
             return int(cur.lastrowid)
 
-    def set_trial_holdout(self, trial_id: int, holdout_pass: bool) -> None:
-        self._exec("UPDATE trials SET holdout_pass=? WHERE id=?", (int(bool(holdout_pass)), int(trial_id)))
+    def set_trial_holdout(self, trial_id: int, holdout_pass: bool | None) -> None:
+        """更新留出期结果。None 表示留出门槛不适用（如 val 与 holdout 行情状态不同），存为 NULL。"""
+        self._exec("UPDATE trials SET holdout_pass=? WHERE id=?",
+                   (None if holdout_pass is None else int(bool(holdout_pass)), int(trial_id)))
 
     def void_trial(self, trial_id: int) -> None:
         """作废一次试验（评估规则在评估期间被改动，或研究会话中 engine/ 哈希校验不符）：仍计入 n_trials，

@@ -178,6 +178,19 @@ def test_evaluate_without_full_pass_keeps_candidate(written, gate, holdout):
     assert store.get_status("probe_one") == "candidate"
 
 
+def test_evaluate_regime_diff_holdout_none_enters_shadow(written):
+    """val 与 holdout 行情不同时 holdout_pass=None：holdout 不否决，仍进入影子盘。"""
+    settings, store = written
+    rep = report(True, None)
+    rep["holdout_reason"] = "regime_diff:bull->bear"
+    out = evaluate_strategy(settings, store, "probe_one",
+                            runner=fake_runner(json.dumps(rep), trial=(store, True, None)))
+    assert out["ok"] is True and out["report"]["gate_pass"] is True
+    assert out["report"]["holdout_pass"] is None
+    assert out["report"]["holdout_reason"] == "regime_diff:bull->bear"
+    assert store.get_status("probe_one") == "shadow"
+
+
 def test_evaluate_forged_report_without_trial_rejected(written):
     settings, store = written  # 策略打印伪造的报告后提前结束进程：数据库里没有本次的试验记录
     out = evaluate_strategy(settings, store, "probe_one", runner=fake_runner(json.dumps(report())))

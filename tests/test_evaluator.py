@@ -68,6 +68,39 @@ def test_gate_fail_skips_holdout(monkeypatch):
     assert store.recent_trials(1)[0]["holdout_pass"] is None
 
 
+def test_regime_diff_skips_holdout_and_records_none(monkeypatch):
+    """val 与 holdout 行情状态不同时，holdout 不运行、holdout_pass=None、holdout_reason 标注差异。"""
+    idx = pd.bdate_range("2025-01-01", periods=200)
+    days = [ts.date() for ts in idx]
+    spl = {"train": (days[2], days[100]), "val": (days[101], days[130]), "holdout": (days[131], None)}
+    cal = TradingCalendar(days)
+    # 前 131 天从 100 涨到 140（val 末=牛市），后 69 天从 140 跌到 80（holdout 末=熊市）
+    up = [100 + 40 * i / 130 for i in range(131)]
+    down = [140 - 60 * (i + 1) / 69 for i in range(69)]
+    bench = pd.Series(up + down, index=idx)
+    # panel 要覆盖到 holdout 末，否则 _data_end 会把 holdout 截断到面板最后一天
+    closes = [10.0 * 1.02 ** i for i in range(200)]  # 股票涨得比基准快，保证 val 超额为正
+    df = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
+                       "volume": [1e6] * 200, "amount": [1e8] * 200,
+                       "prev_close": [float("nan")] + closes[:-1]}, index=idx)
+    panel = {"600001": df}
+    store = Store(":memory:")
+    calls = []
+    real = ev.run_backtest
+
+    def spy(strategy, p, names, calendar, start, end, benchmark_nav, **kw):
+        calls.append(start)
+        return real(strategy, p, names, calendar, start, end, benchmark_nav, **kw)
+
+    monkeypatch.setattr(ev, "run_backtest", spy)
+    rep = ev.evaluate(Winner(), "winner", panel, NAMES, cal, bench, store, splits=spl)
+    assert rep.gate_pass is True
+    assert rep.holdout_pass is None
+    assert rep.holdout_reason == "regime_diff:bull->bear"
+    assert calls == [days[2], days[101]]  # 留出期未运行
+    assert store.last_trial("winner")["holdout_pass"] is None
+
+
 def test_holdout_end_clamped_to_last_data_day(monkeypatch):
     future = [d.date() for d in pd.bdate_range(IDX[-1] + pd.Timedelta(days=1), periods=10)]
     cal = TradingCalendar(DAYS + future)  # 新浪日历含未来日期
@@ -105,7 +138,8 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
     monkeypatch.setattr(ev, "run_backtest", tagged)
     rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
     d = rep.to_agent_dict()
-    assert set(d) == {"strategy", "train", "val", "dsr", "dsr_bar", "gate_pass", "holdout_pass", "n_trials"}
+    assert set(d) == {"strategy", "train", "val", "dsr", "dsr_bar", "gate_pass",
+                      "holdout_pass", "holdout_reason", "n_trials"}
     assert isinstance(d["holdout_pass"], bool)
     assert str(sentinel) not in json.dumps(d)
     assert str(sentinel) not in repr(rep)

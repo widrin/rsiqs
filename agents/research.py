@@ -282,7 +282,7 @@ def _evaluate(settings: Settings, store: Store, name: str, runner, before: int) 
     if trial is None:
         return {"ok": False, "report": None, "error": "评估没有写入试验记录，报告不予采信"}
     report = {**report, "gate_pass": trial["gate_pass"], "holdout_pass": trial["holdout_pass"]}
-    if trial["gate_pass"] and trial["holdout_pass"]:
+    if trial["gate_pass"] and trial["holdout_pass"] is not False:
         store.set_status(name, "shadow", date.today())
     return {"ok": True, "report": report, "error": ""}
 
@@ -337,9 +337,9 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 # 工作方式
 - 本任务不使用工具：需要的接口说明、源码、门槛和试验记录都在用户消息里。你只需按 JSON Schema 返回 analysis、drafts、done。
 - 系统依次处理你的草稿：检查名字和代码规范，保存为 strategies/<name>.py（状态 candidate），然后运行回测评估。没通过检查的草稿不会评估，也不占评估次数，原因会在下一轮告诉你。
-- gate_pass 且 holdout_pass 的策略自动进入影子盘（shadow），之后由至少 20 个交易日的前向模拟盘表现决定能否成为现任。
+- gate_pass 且 holdout_pass 不为 False 的策略自动进入影子盘（shadow）：holdout 通过、或因 val 与 holdout 行情状态不同而豁免（holdout_pass=null）都算。之后由至少 20 个交易日的前向模拟盘表现决定能否成为现任。
 - 一次会话有轮数、每轮草稿数和评估次数的上限（具体数字见用户消息）。草稿数不要超过剩余评估次数，超出的部分不会处理。
-- 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、dsr_bar（本次的 DSR 分数线）、gate_pass、holdout_pass（门槛未达标时为 null，表示没有运行）和 n_trials。
+- 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、dsr_bar（本次的 DSR 分数线）、gate_pass、holdout_pass（门槛未达标或 val 与 holdout 行情状态不同时为 null，表示没有运行或不适用）、holdout_reason（holdout 为 null 时说明原因，如 regime_diff:bull->bear）和 n_trials。val 与 holdout 行情不同时 holdout 不否决策略（动量策略在熊市 holdout 失败是预期），仍可进入影子盘。
 - 每个草稿都要用新名字，包括修正上一轮出错的草稿。
 
 # 输出
@@ -366,8 +366,11 @@ def _outcome(res: dict) -> str:
     if not res["ok"]:
         return res["error"]
     rep = res["report"]
-    if rep.get("gate_pass") and rep.get("holdout_pass"):
+    if rep.get("gate_pass") and rep.get("holdout_pass") is True:
         return "门槛达标，holdout 通过，已进入影子盘"
+    if rep.get("gate_pass") and rep.get("holdout_pass") is None:
+        reason = rep.get("holdout_reason") or ""
+        return f"门槛达标，holdout 因行情差异豁免（{reason}），已进入影子盘"
     if rep.get("gate_pass"):
         return "门槛达标，holdout 未通过，保持 candidate"
     return "门槛未达标，保持 candidate"

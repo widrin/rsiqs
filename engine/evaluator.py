@@ -9,6 +9,7 @@ import pandas as pd
 from engine.backtest import run_backtest
 from engine.calendar import TradingCalendar
 from engine.metrics import deflated_sharpe, sharpe
+from engine import regime as regime_mod
 from engine.store import Store
 
 SPLITS = {"train": (date(2016, 1, 1), date(2024, 12, 31)),
@@ -40,13 +41,15 @@ class EvalReport:
     dsr_bar: float
     gate_pass: bool
     holdout_pass: bool | None
+    holdout_reason: str | None
     n_trials: int
 
     def to_agent_dict(self) -> dict:
         # 只含训练/验证指标与留出期的通过与否；本类本身也不保存任何留出期数值
         return {"strategy": self.strategy, "train": dict(self.train), "val": dict(self.val),
                 "dsr": self.dsr, "dsr_bar": self.dsr_bar, "gate_pass": self.gate_pass,
-                "holdout_pass": self.holdout_pass, "n_trials": self.n_trials}
+                "holdout_pass": self.holdout_pass, "holdout_reason": self.holdout_reason,
+                "n_trials": self.n_trials}
 
 
 def _dsr_bar(dsr_incumbent: float | None) -> float:
@@ -65,6 +68,15 @@ def _data_end(panel, calendar: TradingCalendar) -> date:
     # 新浪交易日历含未来日期；留出期只回放到面板最后一个有数据的交易日
     last = max((df.index.max() for df in panel.values() if len(df)), default=None)
     return calendar.last() if last is None else min(calendar.last(), last.date())
+
+
+def _period_regime(benchmark_nav: pd.Series, end_date: date) -> str | None:
+    """截至 end_date 的行情状态（牛/熊/震荡）。数据不足时返回 None。"""
+    ts = pd.Timestamp(end_date)
+    series = benchmark_nav[benchmark_nav.index <= ts].dropna()
+    if len(series) < regime_mod.MA_WINDOW + 1:
+        return None
+    return regime_mod.classify(series).state
 
 
 def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
@@ -87,20 +99,29 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
     dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r), float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
     gate_pass = _passes_gate(tr.metrics, va.metrics, dsr, dsr_incumbent)
+    # val 与 holdout 行情状态可能不同：动量策略在熊市 holdout 失败是预期，不算过拟合否决
+    val_regime = _period_regime(benchmark_nav, splits["val"][1])
+    ho_regime = _period_regime(benchmark_nav, _data_end(panel, calendar))
+    regime_diff = (val_regime is not None and ho_regime is not None and val_regime != ho_regime)
     # 先入库再回放留出期：留出期中途失败或进程被杀，这次试验也已计数
     trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
     holdout_pass = None
+    holdout_reason = f"regime_diff:{val_regime}->{ho_regime}" if regime_diff else None
     if gate_pass:
-        interrupted = False
-        try:
-            ho = bt("holdout").metrics
-            holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
-                                and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
-        except BaseException as e:  # noqa: BLE001 - 任何异常只记未通过：异常文本可能带出留出期数值，不外传
-            holdout_pass, interrupted = False, isinstance(e, KeyboardInterrupt)
-        store.set_trial_holdout(trial_id, holdout_pass)
-        if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
-            raise KeyboardInterrupt from None
+        if regime_diff:
+            store.set_trial_holdout(trial_id, None)  # 留出门槛不适用，保持 holdout_pass=None
+        else:
+            interrupted = False
+            try:
+                ho = bt("holdout").metrics
+                holdout_pass = bool(ho["n_days"] > 0 and ho["excess_ann"] >= HOLDOUT_GATE["excess_ann"]
+                                    and ho["sharpe"] >= HOLDOUT_GATE["sharpe"])
+            except BaseException as e:  # noqa: BLE001 - 任何异常只记未通过：异常文本可能带出留出期数值，不外传
+                holdout_pass, interrupted = False, isinstance(e, KeyboardInterrupt)
+            store.set_trial_holdout(trial_id, holdout_pass)
+            if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
+                raise KeyboardInterrupt from None
     return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr,
                       dsr_bar=_dsr_bar(dsr_incumbent), gate_pass=gate_pass,
-                      holdout_pass=holdout_pass, n_trials=store.trial_count())
+                      holdout_pass=holdout_pass, holdout_reason=holdout_reason,
+                      n_trials=store.trial_count())
