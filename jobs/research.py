@@ -1,4 +1,4 @@
-"""周六 10:00 研究循环（Claude 多轮结构化输出，评估在子进程里跑）+ 每周复盘与策略切换建议。
+"""周六 10:00 研究循环（Claude 多轮结构化输出，评估在子进程里跑）+ 每周复盘与自动策略切换。
 python -m jobs.research"""
 from __future__ import annotations
 
@@ -27,9 +27,10 @@ def main(now: datetime | None = None) -> dict | None:
             raise common.JobFailed(f"研究会话状态 {summary['status']}（原因已单独告警）")
 
     common.run_job("research", now.date(), fn, store, notifier)
-    # 每周复盘放在研究之后：研究工作量大、可能失败，切换建议仍要照常给出
+    # 每周复盘放在研究之后：研究工作量大、可能失败，策略切换仍要照常判断与执行
     common.run_job("weekly", now.date(),
-                   lambda: weekly_agent.run_weekly(now.date(), store, notifier), store, notifier)
+                   lambda: weekly_agent.run_weekly(now.date(), store, notifier, calendar),
+                   store, notifier)
     return out.get("summary")
 
 

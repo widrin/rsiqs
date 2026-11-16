@@ -52,9 +52,9 @@ def env(tmp_path, monkeypatch):
         calls.append(("research", llm))
         return {"status": "ok"}
 
-    def fake_weekly(d, store, notifier):
+    def fake_weekly(d, store, notifier, calendar):
         calls.append(("weekly", d))
-        return {"state": None, "action": "none", "to": None}
+        return {"state": None, "action": "none", "to": None, "applied": False}
 
     monkeypatch.setattr(premarket, "scan", fake_scan)
     monkeypatch.setattr(premarket, "run_analyze", fake_analyze)

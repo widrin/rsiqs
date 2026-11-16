@@ -1,8 +1,10 @@
+import datetime as dt
 from datetime import date
 
 import pandas as pd
 
 from agents import weekly
+from engine.calendar import TradingCalendar
 from engine.store import Store
 from notify.wecom import NullNotifier
 
@@ -83,13 +85,46 @@ def test_retired_strategy_without_data_in_window_is_excluded():
     assert [r["strategy"] for r in data["rows"]] == ["new_sh", "old_inc"]
 
 
-def test_run_weekly_pushes_notice_with_recommendation():
+def test_run_weekly_switches_automatically():
     store, dates = _setup(_worse_when_bear(), _better_when_bear())
+    calendar = TradingCalendar(dates + [dates[-1] + dt.timedelta(days=3)])  # 下一个交易日为周一
     notifier = NullNotifier()
-    out = weekly.run_weekly(dates[-1], store, notifier)
-    assert out == {"state": "bear", "action": "switch", "to": "new_sh"}
+    out = weekly.run_weekly(dates[-1], store, notifier, calendar)
+    assert out == {"state": "bear", "action": "switch", "to": "new_sh", "applied": True}
+    assert store.get_status("new_sh") == "incumbent"
+    assert store.get_status("old_inc") == "shadow"
+    assert store.status_since("old_inc") == dates[-1] + dt.timedelta(days=3)
     [msg] = notifier.sent
-    assert "每周复盘" in msg and "熊市" in msg and "new_sh" in msg and "建议" in msg
+    assert "每周复盘" in msg and "熊市" in msg and "已自动切换" in msg and "new_sh" in msg
+
+
+def test_run_weekly_holds_and_changes_nothing():
+    store, dates = _setup(_better_when_bear(), _worse_when_bear())
+    calendar = TradingCalendar(dates)
+    notifier = NullNotifier()
+    out = weekly.run_weekly(dates[-1], store, notifier, calendar)
+    assert out["action"] == "hold" and out["applied"] is False
+    assert store.get_status("old_inc") == "incumbent" and store.get_status("new_sh") == "shadow"
+    [msg] = notifier.sent
+    assert "维持现任 old_inc" in msg and "已自动切换" not in msg
+
+
+def test_apply_switch_refuses_non_shadow_target():
+    store, dates = _setup(_worse_when_bear(), _better_when_bear())
+    calendar = TradingCalendar(dates)
+    data = weekly.collect(store, dates[-1])
+    out = weekly.apply_switch(store, data, {"action": "switch", "to": "unknown_one", "text": ""},
+                              calendar, dates[-1])
+    assert out["applied"] is False and "不在影子盘" in out["detail"]
+    assert store.get_status("old_inc") == "incumbent"
+
+
+def test_apply_switch_does_nothing_without_switch_action():
+    store, dates = _setup(_worse_when_bear(), _better_when_bear())
+    data = weekly.collect(store, dates[-1])
+    out = weekly.apply_switch(store, data, {"action": "hold", "to": "old_inc", "text": ""},
+                              TradingCalendar(dates), dates[-1])
+    assert out == {"applied": False, "detail": ""}
 
 
 def test_window_stats_needs_two_points():

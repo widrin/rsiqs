@@ -1,9 +1,9 @@
-"""每周复盘：按当前行情状态比较各策略的模拟盘表现，给出策略切换建议（只建议，不自动切换）。
+"""每周复盘：按当前行情状态比较各策略的模拟盘表现，满足条件时自动切换策略。
 
-行情标签来自 engine.regime（每日结算写入 kv）。建议规则是确定性的，口径与晋升/降级一致：
-当前行情窗口内，其他策略相对现任的年化超额差距达到 10% 且差异的 t 值 >= 1.5，才建议切换；
-现任在当前窗口显著跑输基准、同时有策略跑赢基准时也建议切换。切换本身由人工执行。
-"""
+行情标签来自 engine.regime（每日结算写入 kv）。切换规则是确定性的，口径与晋升/降级一致：
+当前行情窗口内，影子盘策略相对现任的年化超额差距达到 10% 且差异的 t 值 >= 1.5，或现任在当前窗口
+显著跑输基准、同时有影子盘策略跑赢基准时，自动把影子盘策略升为现任、原任降为影子盘。
+只从影子盘里选（研究已通过门槛并前向模拟过），候选与已退役策略不会被自动启用。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -11,6 +11,7 @@ import datetime as dt
 import pandas as pd
 
 from engine import promotion, regime
+from engine.calendar import TradingCalendar
 from engine.store import Store
 from notify.format import format_alert
 
@@ -85,43 +86,67 @@ def collect(store: Store, today: dt.date) -> dict:
 
 
 def decide(data: dict) -> dict:
-    """给出切换建议。返回 {"action": none|hold|switch, "to": 策略名|None, "text": 中文说明}。"""
+    """给出切换建议。返回 {"action": none|hold|switch, "to": 策略名|None, "text": 中文说明}。
+
+    只把影子盘策略作为切换目标：已退役的策略不再自动启用，候选策略没有前向净值。"""
     rows, incumbent = data["rows"], data["incumbent"]
     if not rows:
         return {"action": "none", "to": None, "text": "暂无可比较的策略净值（账户尚未结算），本周不出切换建议。"}
     eligible = [r for r in rows if r["days"] >= MIN_DAYS]
     inc = next((r for r in eligible if r["strategy"] == incumbent), None)
-    alts = [r for r in eligible if r["strategy"] != incumbent]
+    alts = [r for r in eligible if r["strategy"] != incumbent and r["status"] == "shadow"]
     best = max(alts, key=lambda r: r["excess_ann"]) if alts else None
     if inc is None:
         if best is None:
             return {"action": "none", "to": None,
-                    "text": f"没有策略在当前窗口有 {MIN_DAYS} 个以上收益日，暂不给出建议。"}
+                    "text": f"没有影子盘策略在当前窗口有 {MIN_DAYS} 个以上收益日，暂不给出建议。"}
         return {"action": "switch", "to": best["strategy"],
                 "text": (f"当前没有可比较的现任（{incumbent or '未设置'}），建议以 {best['strategy']} 为现任"
                          f"（窗口年化超额 {best['excess_ann']:+.1%}）。")}
     if best is None:
         return {"action": "hold", "to": incumbent,
-                "text": f"维持现任 {incumbent}：其他策略在当前窗口的净值天数不足 {MIN_DAYS}，无法比较。"}
+                "text": f"维持现任 {incumbent}：影子盘在当前窗口的净值天数不足 {MIN_DAYS}，无法比较。"}
     diff = best["excess_ann"] - inc["excess_ann"]
     t_diff = promotion.compare(inc["nav"], best["nav"])[1]
     if diff >= SWITCH_MARGIN and t_diff >= SWITCH_T and best["excess_ann"] > 0:
         return {"action": "switch", "to": best["strategy"],
-                "text": (f"建议把现任 {incumbent} 切换为 {best['strategy']}：当前窗口年化超额 "
-                         f"{best['excess_ann']:+.1%} 对 {inc['excess_ann']:+.1%}（差 {diff:+.1%}，t={t_diff:.2f}）。"
-                         f"切换需人工执行。")}
+                "text": (f"把现任 {incumbent} 切换为 {best['strategy']}：当前窗口年化超额 "
+                         f"{best['excess_ann']:+.1%} 对 {inc['excess_ann']:+.1%}（差 {diff:+.1%}，t={t_diff:.2f}）。")}
     if inc["excess_ann"] <= BAD_EXCESS and best["excess_ann"] > 0:
         return {"action": "switch", "to": best["strategy"],
-                "text": (f"建议把现任 {incumbent} 切换为 {best['strategy']}：现任当前窗口年化超额 "
+                "text": (f"把现任 {incumbent} 切换为 {best['strategy']}：现任当前窗口年化超额 "
                          f"{inc['excess_ann']:+.1%} 已显著跑输基准，{best['strategy']} 为 "
-                         f"{best['excess_ann']:+.1%}。切换需人工执行。")}
+                         f"{best['excess_ann']:+.1%}。")}
     return {"action": "hold", "to": incumbent,
-            "text": (f"维持现任 {incumbent}：窗口年化超额 {inc['excess_ann']:+.1%}，最好的替代 "
+            "text": (f"维持现任 {incumbent}：窗口年化超额 {inc['excess_ann']:+.1%}，最好的影子盘策略 "
                      f"{best['strategy']} 为 {best['excess_ann']:+.1%}，差距未同时达到切换门槛"
                      f"（{SWITCH_MARGIN:.0%} 且 t>={SWITCH_T}）。")}
 
 
-def render(day: dt.date, data: dict, rec: dict) -> str:
+def apply_switch(store: Store, data: dict, rec: dict, calendar: TradingCalendar, day: dt.date) -> dict:
+    """条件满足时自动切换：目标升为现任，原任降为影子盘（从下一个交易日重新起算影子期）。
+
+    返回 {"applied": bool, "detail": 中文说明}。目标必须是影子盘，否则不切换。"""
+    if rec["action"] != "switch" or not rec["to"]:
+        return {"applied": False, "detail": ""}
+    target, old = rec["to"], data["incumbent"]
+    if target == old:
+        return {"applied": False, "detail": f"{target} 已是现任，无需切换"}
+    if store.get_status(target) != "shadow":
+        return {"applied": False, "detail": f"{target} 不在影子盘，未自动切换"}
+    since = day
+    try:  # 原任降为影子后，影子期从下一个交易日算起（与晋升/降级口径一致）
+        since = calendar.next_day(day)
+    except ValueError:  # 日历末端
+        pass
+    if old:
+        store.set_status(old, "shadow", since)
+    store.set_status(target, "incumbent", day)
+    detail = f"{target} 成为现任" + (f"，{old} 降为影子盘（影子期自 {since.isoformat()} 起算）" if old else "")
+    return {"applied": True, "detail": detail}
+
+
+def render(day: dt.date, data: dict, rec: dict, applied: dict | None = None) -> str:
     state_cn = regime.cn(data["state"]) if data["state"] else "未知"
     if data["fallback"] or data["start"] is None:
         window = f"行情标签不足，改看最近 {FALLBACK_DAYS} 个收益日"
@@ -140,13 +165,18 @@ def render(day: dt.date, data: dict, rec: dict) -> str:
                          f"收益 {r['ret']:+.1%}，年化超额 {r['excess_ann']:+.1%}（t={r['t']:.2f}），"
                          f"最大回撤 {r['max_dd']:.1%}")
     lines.append("**建议**：" + rec["text"])
+    if rec["action"] == "switch" and applied is not None:
+        lines.append("**执行**：" + ("已自动切换，" + applied["detail"] if applied["applied"]
+                                    else "未自动切换（" + applied["detail"] + "）"))
     return "\n".join(lines)
 
 
-def run_weekly(day: dt.date, store: Store, notifier) -> dict:
-    """生成并推送每周复盘与切换建议；返回 {"state", "action", "to"}。"""
+def run_weekly(day: dt.date, store: Store, notifier, calendar: TradingCalendar) -> dict:
+    """生成每周复盘、自动执行切换并推送；返回 {"state", "action", "to", "applied"}。"""
     data = collect(store, day)
     rec = decide(data)
-    notifier.send_text(format_alert(f"每周复盘与策略切换建议 {day.isoformat()}",
-                                    render(day, data, rec), kind="notice"))
-    return {"state": data["state"], "action": rec["action"], "to": rec["to"]}
+    applied = apply_switch(store, data, rec, calendar, day)
+    notifier.send_text(format_alert(f"每周复盘与策略切换 {day.isoformat()}",
+                                    render(day, data, rec, applied), kind="strategy"))
+    return {"state": data["state"], "action": rec["action"], "to": rec["to"],
+            "applied": applied["applied"]}
