@@ -278,6 +278,13 @@ def test_evaluate_garbage_output(written, stdout):
 
 # ---------- build_context ----------
 
+def test_build_context_focus_optional(env):
+    settings, store = env
+    assert "本轮研究方向" not in build_context(settings, store)
+    ctx = build_context(settings, store, focus="用池中位数趋势做大盘控仓")
+    assert "本轮研究方向" in ctx and "用池中位数趋势做大盘控仓" in ctx
+
+
 def test_build_context_contents(env):
     settings, store = env
     store.add_trial("old_idea", {}, 0.4, 0.2, False, None)

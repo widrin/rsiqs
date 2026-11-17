@@ -1,7 +1,8 @@
-"""周六 10:00 研究循环（Claude 多轮结构化输出，评估在子进程里跑）+ 每周复盘与自动策略切换。
-python -m jobs.research"""
+"""周六 10:00 研究循环（LLM 多轮结构化输出，评估在子进程里跑）+ 每周复盘与自动策略切换。
+python -m jobs.research [--focus "本轮研究方向"]"""
 from __future__ import annotations
 
+import argparse
 from datetime import datetime
 
 from agents import research as research_agent
@@ -9,7 +10,7 @@ from agents import weekly as weekly_agent
 from jobs import common
 
 
-def main(now: datetime | None = None) -> dict | None:
+def main(now: datetime | None = None, focus: str | None = None) -> dict | None:
     """返回本次研究摘要；当天已跑过或失败时返回 None。
 
     研究是否成功不影响每周复盘：切换建议是独立的一步，作业本身幂等。"""
@@ -19,7 +20,7 @@ def main(now: datetime | None = None) -> dict | None:
 
     def fn():
         summary = research_agent.run_research(
-            settings, store, notifier, llm=common.make_llm(settings, store))
+            settings, store, notifier, llm=common.make_llm(settings, store), focus=focus)
         out["summary"] = summary
         if summary["status"] != "ok":
             # 会话没跑完（完整性拦截/LLM 失败/本地出错）时 agents.research 已推过告警，但 run_job 会记 ok，
@@ -35,4 +36,7 @@ def main(now: datetime | None = None) -> dict | None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--focus", default=None, help="本轮研究方向，原样写进研究上下文")
+    args = parser.parse_args()
+    main(focus=args.focus)

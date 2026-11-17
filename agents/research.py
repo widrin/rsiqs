@@ -132,9 +132,10 @@ def _status_lines(store: Store) -> list[str]:
     return out
 
 
-def build_context(settings: Settings, store: Store) -> str:
+def build_context(settings: Settings, store: Store, focus: str | None = None) -> str:
     """每轮共用的背景：会话限制、门槛、可用模块、策略状态、最近试验、接口与策略源码。
 
+    focus 是用户本轮指定的研究方向，放在行情状态之后、源码之前。
     短而关键的部分在前，源码在后；超过 CONTEXT_MAX_CHARS 时从尾部截断。"""
     root = Path(settings.root)
     splits = {k: [a.isoformat(), b.isoformat() if b else "最新"] for k, (a, b) in SPLITS.items()}
@@ -157,6 +158,8 @@ def build_context(settings: Settings, store: Store) -> str:
         *([f"## 当前行情状态\n- {regime.summary_line(regime.latest(store))}（"
            f"市场状态由沪深300相对120日均线+20日动量自动识别，每日结算时更新）"]
           if regime.latest(store) else []),
+        "",
+        *([f"## 本轮研究方向（用户指定，优先围绕它提出假设）\n- {focus}"] if focus else []),
         "",
         "## 策略代码可以 import 的模块（含其子模块）",
         "- " + ", ".join(sorted(ALLOWED_IMPORTS)),
@@ -402,10 +405,12 @@ def _feedback(history: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _round_task(rnd_no: int, evals_left: int, n_trials: int) -> str:
+def _round_task(rnd_no: int, evals_left: int, n_trials: int, focus: str | None = None) -> str:
     lines = [f"# 本轮任务（第 {rnd_no}/{MAX_ROUNDS} 轮）",
              f"本会话还可评估 {evals_left} 次，本轮最多处理 {MAX_DRAFTS_PER_ROUND} 个草稿；草稿数不要超过剩余评估次数。",
              f"目前累计试验次数 n_trials：{n_trials}（下一次评估计为第 {n_trials + 1} 次）。"]
+    if focus:
+        lines.append("本轮有用户指定的研究方向（见背景中的「本轮研究方向」），优先围绕它提出假设。")
     if rnd_no == 1:
         lines.append("先在 analysis 里回顾现任策略和最近的试验记录，再提出有依据的新假设。"
                      "没有值得检验的想法时，返回 done=true 和空的 drafts。")
@@ -481,8 +486,10 @@ def _process_round(settings: Settings, store: Store, rnd_no: int, rnd: ResearchR
     return results, evals
 
 
-def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
-    """一次研究会话（最多 MAX_ROUNDS 轮）。返回 status/rounds/written/results/analysis。"""
+def run_research(settings: Settings, store: Store, notifier, llm=None,
+                 focus: str | None = None) -> dict:
+    """一次研究会话（最多 MAX_ROUNDS 轮）。focus 为用户指定的研究方向，可为空。
+    返回 status/rounds/written/results/analysis。"""
     root = Path(settings.root)
     today = date.today()
     out = {"status": "ok", "rounds": 0, "written": [], "results": [], "analysis": ""}
@@ -497,10 +504,10 @@ def run_research(settings: Settings, store: Store, notifier, llm=None) -> dict:
     history: list[dict] = []
     evals = 0
     try:
-        context = build_context(settings, store)
+        context = build_context(settings, store, focus)
         for rnd_no in range(1, MAX_ROUNDS + 1):
             feedback = _feedback(history) + "\n\n" if history else ""
-            task = _round_task(rnd_no, MAX_EVALS_PER_SESSION - evals, store.trial_count())
+            task = _round_task(rnd_no, MAX_EVALS_PER_SESSION - evals, store.trial_count(), focus)
             user = f"{context}\n\n{feedback}{task}"
             try:
                 rnd = llm.parse(purpose="research", system=RESEARCH_SYSTEM, user=user, schema=ResearchRound,

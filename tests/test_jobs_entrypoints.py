@@ -48,8 +48,8 @@ def env(tmp_path, monkeypatch):
         calls.append(("review", d, llm))
         review_kw.append((d, backfill))
 
-    def fake_research(settings, store, notifier, llm=None):
-        calls.append(("research", llm))
+    def fake_research(settings, store, notifier, llm=None, focus=None):
+        calls.append(("research", llm, focus))
         return {"status": "ok"}
 
     def fake_weekly(d, store, notifier, calendar):
@@ -344,7 +344,13 @@ def test_research_runs_once_per_day_with_factory_llm(env):
     sat = next_saturday(env["dates"][5])
     assert research.main(now=at(sat, 10)) == {"status": "ok"}
     assert research.main(now=at(sat, 11)) is None  # 当天已跑过
-    assert env["calls"] == [("research", "LLM"), ("weekly", sat)]  # 研究之后跑每周复盘
+    assert env["calls"] == [("research", "LLM", None), ("weekly", sat)]  # 研究之后跑每周复盘
+
+
+def test_research_passes_focus_to_agent(env):
+    sat = next_saturday(env["dates"][5])
+    research.main(now=at(sat, 10), focus="大盘控仓方向")
+    assert ("research", "LLM", "大盘控仓方向") in env["calls"]
 
 
 def test_weekly_review_runs_even_when_research_fails(env, monkeypatch):

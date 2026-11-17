@@ -335,7 +335,8 @@ def test_context_built_once_and_round_task_has_current_n_trials(env, monkeypatch
     e = env
     built = []
     real = research.build_context
-    monkeypatch.setattr(research, "build_context", lambda s, st: built.append(1) or real(s, st))
+    monkeypatch.setattr(research, "build_context",
+                        lambda s, st, focus=None: built.append(1) or real(s, st, focus))
     llm = make_llm(e, rnd(d("a_one")), rnd(done=True))
     run(e, llm)
     assert built == [1]
