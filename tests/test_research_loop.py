@@ -198,6 +198,14 @@ def test_stops_on_done_after_processing_drafts(env):
     assert e.evals.names == ["a_one"]
 
 
+def test_round_tolerates_missing_fields():
+    # 弱模型偶尔漏字段：缺 drafts/done 时不应让整轮研究作废
+    rnd_model = ResearchRound.model_validate({"analysis": "回顾：熊市回撤过大。"})
+    assert rnd_model.drafts == [] and rnd_model.done is False
+    rnd_model = ResearchRound.model_validate({"analysis": "x", "drafts": [], "done": True})
+    assert rnd_model.done is True
+
+
 def test_stops_on_empty_drafts_without_commit(env):
     e = env
     llm = make_llm(e, rnd(analysis="暂无值得检验的想法"), rnd(d("b_two")))

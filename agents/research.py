@@ -61,8 +61,10 @@ class Draft(BaseModel):
 
 class ResearchRound(BaseModel):
     analysis: str
-    drafts: list[Draft]
-    done: bool
+    # 结构化输出已声明必填，但弱模型偶尔漏字段；缺省按"本轮无草稿、未结束"处理，
+    # 避免一个漏字段让整轮研究作废
+    drafts: list[Draft] = []
+    done: bool = False
 
 
 def _strip_comments(src: str) -> str:
