@@ -16,6 +16,20 @@ from tests.jobfakes import (CODES, NAMES, FakeCache, FakeClient, cal, install_co
 ACCOUNTS = ["q:baseline_momo", "h:active", "h:candidate", "bench:csi300"]
 
 
+class _View:
+    """熊市准入测试用的最小 DataView：只提供 codes/history。"""
+
+    def __init__(self, hist: dict[str, list[float]]):
+        self._hist = hist
+
+    def codes(self) -> list[str]:
+        return list(self._hist)
+
+    def history(self, code: str, n: int | None = None):
+        s = pd.Series(self._hist[code], name="close")
+        return pd.DataFrame({"close": s.iloc[-n:] if n else s})
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     root = prepare_root(tmp_path, monkeypatch)
@@ -91,6 +105,48 @@ def test_rerun_is_idempotent(env):
     assert len(store.load_account("h:active").trades) == n_trades
     assert store.load_account("q:baseline_momo").cash == cash
     assert len(store.nav_series("h:active")) == 3
+
+
+def test_bear_admission_filters_weaker_picks():
+    """熊市准入：20 日与 5 日都要强于中位数；数据不足的候选同样被剔除。"""
+    codes = [f"60{i:04d}" for i in range(60)]
+    hist = {c: [10.0] * 21 for c in codes}  # 两个窗口的中位数都是 0%
+    hist[codes[0]] = [10.0] * 20 + [12.0]   # 20 日 +20%，5 日 +20%：放行
+    hist[codes[1]] = [10.0] * 20 + [9.0]    # 20 日 -10%：中期就弱，剔除
+    hist[codes[2]] = [10.0] * 15 + [20.0] * 5 + [12.0]  # 20 日 +20%，5 日 -40%：下跌中继，剔除
+    view = _View(hist)
+    def pick(code):
+        return Pick(code=code, name="", score=1, entry_max=99, stop=1, target=99, hold_days=5, reason="")
+    warnings: list[str] = []
+    picked = settle._admit_in_bear([pick(codes[0]), pick(codes[1]), pick(codes[2]), pick("000000")],
+                                   view, date(2026, 11, 18), warnings)
+    assert [p.code for p in picked] == [codes[0]]
+    assert warnings == []
+
+
+def test_bear_admission_blocks_when_proxy_missing():
+    """大盘代理样本不足时宁可不开仓，并留下一条结算警告。"""
+    view = _View({f"60{i:04d}": [10.0] * 21 for i in range(10)})
+    pick = Pick(code="600000", name="", score=1, entry_max=99, stop=1, target=99, hold_days=5, reason="")
+    warnings: list[str] = []
+    assert settle._admit_in_bear([pick], view, date(2026, 11, 18), warnings) == []
+    assert warnings and "熊市准入" in warnings[0]
+
+
+def test_bear_gate_applies_to_strategy_accounts_only(env, monkeypatch):
+    """熊市标签生效时策略账户不开新仓；LLM 账户不受影响。"""
+    dates, store = env["dates"], env["store"]
+    store.kv_set(f"regime:{dates[101].isoformat()}",
+                 {"state": "bear", "asof": dates[101].isoformat(), "close": 1.0,
+                  "ma_long": 2.0, "ret_short": -0.05, "above_ma": False})
+    calls: list[date] = []
+    monkeypatch.setattr(settle, "_admit_in_bear",
+                        lambda picks, view, d, w: calls.append(d) or [])
+    settle.main(now=at(dates[101], 16))
+    assert calls == [dates[101]]  # 只有策略账户走准入
+    assert store.load_account("q:baseline_momo").trades == []
+    assert any(f.side == "BUY" and f.code == "600001"
+               for f in store.load_account("h:active").trades)
 
 
 def test_today_not_settled_before_1510(env):

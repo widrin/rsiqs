@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from statistics import median
 
 import pandas as pd
 
@@ -23,6 +24,56 @@ MIN_COVERAGE = 0.9       # 当日有日线的股票占比低于此值视为数�
 KIND_CN = {"promote": "晋升", "demote": "降级", "retire": "淘汰"}
 BIG_EX_GAP = 0.03       # 参考昨收比上一收盘低这么多、又没有分红记录：多半是送转或大额派息的记录还没到
 MAX_EX_WAIT_DAYS = 2    # 最多为等分红记录暂停这么多个交易日，之后按配股告警、不建模
+ADMIT_WINDOW = 20       # 熊市准入：候选与大盘比较中期强弱的窗口（与行情识别的短期动量一致）
+ADMIT_MIN_SAMPLES = 50  # 大盘代理至少要这么多只股票的收益才认为可用
+
+
+def _short_return(view, code: str, n: int = ADMIT_WINDOW) -> float | None:
+    """截至 view.asof 的 n 日涨幅；数据不足或价格异常时返回 None。"""
+    try:
+        hist = view.history(code, n + 1)
+    except Exception:  # noqa: BLE001 — 单只取数异常不影响其他候选
+        return None
+    if len(hist) < n + 1:
+        return None
+    first, last = float(hist["close"].iloc[0]), float(hist["close"].iloc[-1])
+    if not (pd.notna(first) and pd.notna(last)) or first <= 0:
+        return None
+    return last / first - 1.0
+
+
+def _market_median(view, n: int = ADMIT_WINDOW) -> float | None:
+    """用股票池横截面中位数充当大盘代理（指数不在策略可见的股票池里）。样本不足返回 None。"""
+    rets = [r for code in view.codes() if (r := _short_return(view, code, n)) is not None]
+    return median(rets) if len(rets) >= ADMIT_MIN_SAMPLES else None
+
+
+def _bear_on(store, d: date) -> bool:
+    """d 日行情是否为熊市。只认当天的标签：补跑历史日时没有标签就不套用（避免用未来行情做判断）。"""
+    doc = store.kv_get(f"regime:{d.isoformat()}")
+    return isinstance(doc, dict) and doc.get("state") == regime.BEAR
+
+
+def _admit_in_bear(picks, view, d: date, warnings: list[str]):
+    """熊市准入：候选必须在 20 日（中期）和 5 日（短期）两个维度都强于股票池中位数。
+
+    只看 20 日不够：动量策略的候选本来就是池内最强的一批，熊市里常常是"20 日还强、5 日已崩"
+    的下跌中继，2026-11-18 那两笔买入（5 日 -17.6%/-21.2%）就是例子。大盘代理不可用时当日不开新仓。"""
+    med20 = _market_median(view)
+    med5 = _market_median(view, 5)
+    if med20 is None or med5 is None:
+        warnings.append(f"{d.isoformat()} 熊市准入：股票池样本不足，当日不开新仓")
+        return []
+
+    def admit(p) -> bool:
+        r20, r5 = _short_return(view, p.code), _short_return(view, p.code, 5)
+        return r20 is not None and r5 is not None and r20 > med20 and r5 > med5
+
+    admitted = [p for p in picks if admit(p)]
+    if len(admitted) < len(picks):
+        common.log.info("bear admission %s: keep %d/%d (median20 %+.2f%%, median5 %+.2f%%)",
+                        d.isoformat(), len(admitted), len(picks), med20 * 100, med5 * 100)
+    return admitted
 
 
 def pending_days(store, calendar, now: datetime) -> list[date]:
@@ -261,17 +312,22 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
         if notifier is not None and name == common.ACTIVE_ACCOUNT:
             _notify_fills(d, fills, acc, before, notifier)
 
+    bear = _bear_on(store, d)
     for status in ("incumbent", "shadow"):
         for strat in store.strategies_with_status(status):
             name = f"q:{strat}"
             if _settled(store, name, d):
                 continue
             try:
-                picks = load_strategy(strat).select(view)[: settings.max_picks]
+                picks = load_strategy(strat).select(view)
             except Exception as e:  # noqa: BLE001 — 单个策略出错不阻塞其他账户
                 common.log.exception("strategy %s failed on %s", strat, d)
                 warnings.append(f"策略 {strat} 选股失败，当日跳过：{type(e).__name__}: {e}")
                 continue
+            # 熊市准入在截断之前做：丢掉弱于大盘的候选后，再用强于大盘的补足 max_picks 个仓位
+            if bear:
+                picks = _admit_in_bear(picks, view, d, warnings)
+            picks = picks[: settings.max_picks]
             raw = raw_bars(p.code for p in picks)
             run(name, [_to_raw(p, qfq_bars.get(p.code), raw.get(p.code)) for p in picks])
 
