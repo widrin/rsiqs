@@ -43,9 +43,12 @@ def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchm
         return None
     cached = store.kv_get(INCUMBENT_KV)
     splits_key = repr(evaluator.SPLITS)
+    # method 标记缓存口径：v1=绝对收益，v2=超额收益（target_regime 用）。改口径后旧缓存自动失效
+    method = "excess" if target_regime is not None else "absolute"
     stats = (cached if isinstance(cached, dict) and cached.get("name") == name
              and cached.get("splits") == splits_key
-             and cached.get("target_regime") == target_regime else None)
+             and cached.get("target_regime") == target_regime
+             and cached.get("method") == method else None)
     if stats is None:
         try:
             inc = load_strategy(name)
@@ -54,16 +57,17 @@ def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchm
                     for start, end in (evaluator.SPLITS["train"], evaluator.SPLITS["val"])]
             r = pd.concat(rets)
             if target_regime is not None:
-                # 与候选策略同口径：只保留目标行情的交易日
+                # 与候选策略同口径：只保留目标行情的交易日，并用超额收益（r - br）算 DSR
                 tr_start = evaluator.SPLITS["train"][0]
                 va_end = evaluator.SPLITS["val"][1] or calendar.last()
                 regime_map = regime_mod.daily_regime(benchmark_nav, tr_start, va_end)
-                br = benchmark_nav.astype(float).pct_change().dropna()
-                r, _ = evaluator._regime_subset(
+                r, br = evaluator._regime_subset(
                     (1.0 + r).cumprod(), benchmark_nav, target_regime, regime_map)
+                r = r - br
             if len(r) < 4:
                 return None
             stats = {"name": name, "splits": splits_key, "target_regime": target_regime,
+                     "method": method,
                      "sr": evaluator.sharpe(r, periods=1), "n_obs": int(len(r)),
                      "skew": float(r.skew()), "kurt": float(r.kurt()) + 3.0}
             store.kv_set(INCUMBENT_KV, stats)

@@ -156,9 +156,11 @@ def build_context(settings: Settings, store: Store, focus: str | None = None) ->
         f"另设 {DSR_FLOOR} 的噪声底线。超过现任即可，不要为了更高的绝对 DSR 反复微调。",
         f"- holdout 门槛 HOLDOUT_GATE：{json.dumps(HOLDOUT_GATE)}。holdout 只返回 holdout_pass（通过/不通过）。",
         "- **按行情评估（target_regime）**：策略可声明类属性 `target_regime`，取值 'bull'/'bear'/'sideways'。"
-        "声明后，train、val、DSR 只在该行情的交易日上计算，与现任在同一行情段上比较。"
-        "适合只在某一种行情赚钱的策略（如满仓动量只在牛市有效、空仓避险只在熊市有效）。"
-        "不声明则按全周期评估（默认）。报告里 target_regime 字段会显示本次口径。",
+        "声明后，train、val、DSR 只在该行情的交易日上计算，且全部改用**超额收益口径**（策略日收益 − 基准日收益）："
+        "衡量的是「在该行情里跑赢沪深300」，而非靠 beta 或空仓。"
+        "另外设有持仓约束：目标行情里日收益标准差必须 ≥ 0.001（始终空仓会被拒绝，因为空仓在熊市天然跑赢下跌的基准）。"
+        "适合只在某一种行情提供 alpha 的策略（如牛市里选股跑赢指数、熊市里少亏）。"
+        "不声明则按全周期绝对收益评估（默认）。报告里 target_regime 字段会显示本次口径。",
         f"- 会话开始时的历史试验总数 n_trials：{store.trial_count()}（本会话每评估一次加 1，当前数字见本轮任务）",
         "",
         *([f"## 当前行情状态\n- {regime.summary_line(regime.latest(store))}（"

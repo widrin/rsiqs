@@ -321,8 +321,8 @@ def test_target_regime_filters_metrics_to_matching_days():
     spl = {"train": (days[120], days[175]), "val": (days[176], days[220]), "holdout": (days[221], None)}
     from engine import regime as regime_mod
     regime_map = regime_mod.daily_regime(bench, days[120], days[220])
-    # 收益从 train 段的第二天起算（首日是期初资金，无收益）
-    train_bull = sum(1 for d in days[121:176] if regime_map.get(d) == "bull")
+    # 回测从 train 首日即产生收益（以上一交易日净值为基数），故收益日为 days[120:176]
+    train_bull = sum(1 for d in days[120:176] if regime_map.get(d) == "bull")
 
     store = Store(":memory:")
     rep = ev.evaluate(BullWinner(), "bull_winner", panel, NAMES, cal, bench, store, splits=spl)
@@ -357,3 +357,23 @@ def test_target_regime_mismatch_with_holdout_skips_holdout():
         ev_mod.run_backtest = real
     # 即使 gate 通过，holdout 也不该跑（行情不符）
     assert days[221] not in calls
+
+
+class BearIdle(Idle):
+    name = "bear_idle"
+    target_regime = "bear"
+
+
+def test_target_regime_empty_strategy_fails_exposure_check():
+    """行情专精策略若始终空仓（日收益恒为0），daily_vol=0，即使超额收益为正也不能过门。"""
+    days, bench, panel = _bull_bear_panel_and_bench()
+    cal = TradingCalendar(days)
+    # 熊市段：bench 在跌，空仓策略超额收益为正（跑赢下跌的基准）
+    spl = {"train": (days[160], days[200]), "val": (days[201], days[240]), "holdout": (days[241], None)}
+    store = Store(":memory:")
+    rep = ev.evaluate(BearIdle(), "bear_idle", panel, NAMES, cal, bench, store, splits=spl)
+    assert rep.target_regime == "bear"
+    assert rep.train["daily_vol"] == 0.0
+    assert rep.val["daily_vol"] == 0.0
+    # 空仓套利被持仓约束挡住
+    assert rep.gate_pass is False

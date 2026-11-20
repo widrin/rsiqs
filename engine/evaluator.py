@@ -8,7 +8,7 @@ import pandas as pd
 
 from engine.backtest import run_backtest
 from engine.calendar import TradingCalendar
-from engine.metrics import deflated_sharpe, sharpe, summarize
+from engine.metrics import annualized_return, deflated_sharpe, max_drawdown, sharpe, summarize
 from engine import regime as regime_mod
 from engine.store import Store
 
@@ -29,6 +29,9 @@ GATE = {"train_sharpe": 0.5, "train_max_dd": -0.45, "val_sharpe": 0.5,
 # 增加对双方的影响相同，不会像固定的 0.9 那样越研究越不可能达标。DSR_FLOOR 只是防噪声的底线：
 # 现任本身很差时，不能让门槛一路降到随机水平。
 DSR_FLOOR = 0.5
+# 行情专精策略（target_regime）必须在目标行情里有真实持仓：日收益标准差低于此值视为空仓套利
+# （空仓时收益恒为0，std=0；哪怕轻仓也会轻易超过此线）。
+MIN_DAILY_VOL = 0.001
 HOLDOUT_GATE = {"excess_ann": 0.0, "sharpe": 0.5}
 
 
@@ -58,11 +61,19 @@ def _dsr_bar(dsr_incumbent: float | None) -> float:
     return DSR_FLOOR if dsr_incumbent is None else max(DSR_FLOOR, float(dsr_incumbent))
 
 
-def _passes_gate(train: dict, val: dict, dsr: float, dsr_incumbent: float | None = None) -> bool:
-    return (train["sharpe"] >= GATE["train_sharpe"] and train["max_dd"] >= GATE["train_max_dd"]
+def _passes_gate(train: dict, val: dict, dsr: float, dsr_incumbent: float | None = None,
+                 target_regime: str | None = None) -> bool:
+    base = (train["sharpe"] >= GATE["train_sharpe"] and train["max_dd"] >= GATE["train_max_dd"]
             and val["sharpe"] >= GATE["val_sharpe"]
             and val["excess_ann"] >= GATE["val_excess_ann"] and val["max_dd"] >= GATE["val_max_dd"]
             and dsr >= _dsr_bar(dsr_incumbent))
+    if not base:
+        return False
+    # 行情专精策略用超额收益口径：必须在目标行情里真实持仓，否则空仓就能"跑赢"下跌的基准
+    if target_regime is not None:
+        if train.get("daily_vol", 0.0) < MIN_DAILY_VOL or val.get("daily_vol", 0.0) < MIN_DAILY_VOL:
+            return False
+    return True
 
 
 def _data_end(panel, calendar: TradingCalendar) -> date:
@@ -98,6 +109,20 @@ def _metrics_from_rets(r: pd.Series, br: pd.Series) -> dict:
     return summarize((1.0 + r).cumprod(), (1.0 + br).cumprod())
 
 
+def _excess_metrics(ex: pd.Series) -> dict:
+    """从超额日收益算指标（行情专精策略用超额口径：衡量相对基准的 alpha）。"""
+    if len(ex) == 0:
+        return {"total_return": 0.0, "ann_return": 0.0, "sharpe": 0.0,
+                "max_dd": 0.0, "excess_ann": 0.0, "n_days": 0}
+    nav_ex = (1.0 + ex).cumprod()
+    return {"total_return": float(nav_ex.iloc[-1] - 1.0),
+            "ann_return": annualized_return(ex),
+            "sharpe": sharpe(ex),
+            "max_dd": max_drawdown(nav_ex),
+            "excess_ann": float(ex.mean() * 252),
+            "n_days": int(len(ex))}
+
+
 def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
              store: Store, params: dict | None = None, splits: dict | None = None,
              dsr_incumbent: float | None = None) -> EvalReport:
@@ -125,17 +150,25 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
         regime_map = regime_mod.daily_regime(benchmark_nav, tr_start, va_end)
         tr_r, tr_br = _regime_subset(tr.nav, benchmark_nav, target_regime, regime_map)
         va_r, va_br = _regime_subset(va.nav, benchmark_nav, target_regime, regime_map)
-        tr_metrics = _metrics_from_rets(tr_r, tr_br)
-        va_metrics = _metrics_from_rets(va_r, va_br)
-        r = pd.concat([tr_r, va_r])
+        # 行情专精策略用超额收益口径：策略价值是"在该行情里跑赢基准"，而非靠 beta 或空仓
+        tr_ex, va_ex = tr_r - tr_br, va_r - va_br
+        tr_metrics = _excess_metrics(tr_ex)
+        va_metrics = _excess_metrics(va_ex)
+        tr_metrics["daily_vol"] = float(tr_r.std()) if len(tr_r) > 1 else 0.0
+        va_metrics["daily_vol"] = float(va_r.std()) if len(va_r) > 1 else 0.0
+        r = pd.concat([tr_ex, va_ex])
     else:
         tr_metrics, va_metrics = tr.metrics, va.metrics
-        r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
+        tr_r = tr.nav.pct_change().dropna()
+        va_r = va.nav.pct_change().dropna()
+        tr_metrics["daily_vol"] = float(tr_r.std()) if len(tr_r) > 1 else 0.0
+        va_metrics["daily_vol"] = float(va_r.std()) if len(va_r) > 1 else 0.0
+        r = pd.concat([tr_r, va_r])
 
     dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r),
                           float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
-    gate_pass = _passes_gate(tr_metrics, va_metrics, dsr, dsr_incumbent)
+    gate_pass = _passes_gate(tr_metrics, va_metrics, dsr, dsr_incumbent, target_regime)
     # val 与 holdout 行情状态可能不同：动量策略在熊市 holdout 失败是预期，不算过拟合否决
     val_regime = _period_regime(benchmark_nav, splits["val"][1])
     ho_regime = _period_regime(benchmark_nav, _data_end(panel, calendar))
