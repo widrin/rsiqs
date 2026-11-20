@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS bar_raw (
 CREATE TABLE IF NOT EXISTS dividends (
     code TEXT NOT NULL, ex_date TEXT NOT NULL, cash REAL NOT NULL, ratio REAL NOT NULL,
     PRIMARY KEY (code, ex_date));
+CREATE TABLE IF NOT EXISTS stock_industry (
+    code TEXT PRIMARY KEY, industry TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
@@ -114,9 +116,22 @@ class BarCache:
             self.conn.executemany("INSERT OR REPLACE INTO bar_names VALUES (?,?)",
                                   [(str(k), str(v)) for k, v in names.items()])
 
+    def save_industries(self, mapping: dict[str, str]) -> None:
+        """写入 code→申万一级行业名映射（全量替换）。"""
+        now = date.today().isoformat()
+        rows = [(str(k), str(v), now) for k, v in mapping.items()]
+        with self.conn:
+            self.conn.execute("DELETE FROM stock_industry")
+            self.conn.executemany("INSERT OR REPLACE INTO stock_industry VALUES (?,?,?)", rows)
+
+    def industries(self) -> dict[str, str]:
+        """code→申万一级行业名；未写入的代码不在返回中。"""
+        return dict(self.conn.execute("SELECT code, industry FROM stock_industry"))
+
     def load_panel(self, codes: list[str], start: date, end: date
-                   ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-        """panel[code]：DatetimeIndex 升序，列 open high low close volume amount prev_close。"""
+                   ) -> tuple[dict[str, pd.DataFrame], dict[str, str], dict[str, str]]:
+        """panel[code]：DatetimeIndex 升序，列 open high low close volume amount prev_close。
+        返回 (panel, names, industries)，industries 为 code→申万一级行业名（无记录的代码缺省）。"""
         panel: dict[str, pd.DataFrame] = {}
         for code in codes:
             df = pd.read_sql_query(
@@ -132,7 +147,9 @@ class BarCache:
                 panel[code] = df
         known = dict(self.conn.execute("SELECT code, name FROM bar_names"))
         names = {code: known.get(code, "") for code in panel}
-        return panel, names
+        industries = self.industries()
+        industries = {code: industries.get(code) for code in panel if code in industries}
+        return panel, names, industries
 
     def update_raw(self, codes: list[str], end: date, start_default: date) -> list[str]:
         """不复权日线增量更新（只供模拟盘结算）；不复权价格不会因除权而变，不需要重叠比对。返回失败的代码。"""

@@ -125,13 +125,14 @@ def _excess_metrics(ex: pd.Series) -> dict:
 
 def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
              store: Store, params: dict | None = None, splits: dict | None = None,
-             dsr_incumbent: float | None = None) -> EvalReport:
+             dsr_incumbent: float | None = None, industries: dict[str, str] | None = None) -> EvalReport:
     splits = splits or SPLITS
     target_regime = getattr(strategy, "target_regime", None)
 
     def bt(key: str):
         start, end = splits[key]
-        return run_backtest(strategy, panel, names, calendar, start, end or _data_end(panel, calendar), benchmark_nav)
+        return run_backtest(strategy, panel, names, calendar, start, end or _data_end(panel, calendar),
+                            benchmark_nav, industries=industries)
 
     n_trials = store.trial_count() + 1  # 含本次
     try:

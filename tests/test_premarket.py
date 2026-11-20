@@ -48,7 +48,7 @@ CTX = {"news": [{"title": "隔夜美股收涨", "content": "纳指涨 1%", "time
 def make_panel(codes, end=PREV, n=25):
     idx = pd.bdate_range(end=pd.Timestamp(end), periods=n)
     cols = {"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.0, "volume": 1e6, "amount": 2e8, "prev_close": 10.0}
-    return {c: pd.DataFrame(cols, index=idx) for c in codes}, {c: f"股{c}" for c in codes}
+    return {c: pd.DataFrame(cols, index=idx) for c in codes}, {c: f"股{c}" for c in codes}, {}
 
 
 class FakeAk:

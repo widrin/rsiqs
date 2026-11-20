@@ -71,6 +71,36 @@ def _install_requests_default_timeout() -> None:
     requests.adapters.HTTPAdapter.send = send_with_timeout
 
 
+_SW_SSL_BYPASS_INSTALLED = False
+
+
+def _install_sw_ssl_bypass() -> None:
+    """申万行业分类接口（swsresearch.com）的 SSL 证书无法通过本地 CA 校验，给 akshare.utils.http.get
+    装一层仅对该域名跳过 verify 的包装（只装一次）。其他域名仍走正常校验。"""
+    global _SW_SSL_BYPASS_INSTALLED
+    if _SW_SSL_BYPASS_INSTALLED:
+        return
+    try:
+        import akshare.utils.http as ak_http
+        import urllib3
+    except Exception:  # noqa: BLE001 — akshare 导入失败时由调用方报错
+        return
+    orig = ak_http.get
+    if getattr(orig, "_sw_ssl_bypass", False):
+        _SW_SSL_BYPASS_INSTALLED = True
+        return
+
+    def get_with_sw_bypass(url, params=None, **kwargs):
+        if "swsresearch" in str(url):
+            kwargs["verify"] = False
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return orig(url, params=params, **kwargs)
+
+    get_with_sw_bypass._sw_ssl_bypass = True
+    ak_http.get = get_with_sw_bypass
+    _SW_SSL_BYPASS_INSTALLED = True
+
+
 class DataError(Exception):
     pass
 
@@ -145,6 +175,7 @@ class AkClient:
         self._em_skip_until = 0.0
         self._read_ban_state()
         _install_requests_default_timeout()
+        _install_sw_ssl_bypass()
         if socket.getdefaulttimeout() is None:
             socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
@@ -392,6 +423,37 @@ class AkClient:
                 failed += 1
         if failed == len(sources):
             raise DataError("交易所股票简称列表全部获取失败")
+        return out
+
+    def industry_map(self) -> dict[str, str]:
+        """全部 A 股的申万一级行业映射 {code: 一级行业名}。
+
+        数据来自两个非东财接口（东财板块成分股限流严重，且需要逐个板块调用上百次）：
+        1. stock_industry_clf_hist_sw：申万个股行业分类变动历史，取每只股票最新一条的 6 位行业代码。
+        2. stock_industry_category_cninfo(symbol='申银万国行业分类标准')：申万行业分类表，含各级代码→名称。
+
+        行业代码取前 2 位作为一级行业代码，再查 cninfo 的名称表。cninfo 没有的旧代码（少量已退市或
+        长期未重分类的股票）归为"其他"。两只接口任一失败都抛 DataError。"""
+        sw = self._call(ak.stock_industry_clf_hist_sw)
+        if sw is None or sw.empty or "symbol" not in sw.columns or "industry_code" not in sw.columns:
+            raise DataError("申万行业分类返回空表或缺少必要列")
+        sw = sw.copy()
+        sw["industry_code"] = sw["industry_code"].astype(str).str.zfill(6)
+        # 每只股票取计入日期最新的一条作为当前分类
+        sw = sw.sort_values("start_date").groupby("symbol", as_index=False).tail(1)
+
+        cn = self._call(ak.stock_industry_category_cninfo, symbol="申银万国行业分类标准")
+        if cn is None or cn.empty:
+            raise DataError("巨潮申万行业分类表返回空表")
+        l1 = cn[cn["分级"] == 1][["类目编码", "类目名称"]].copy()
+        l1["code"] = l1["类目编码"].astype(str).str.replace("S", "", regex=False).str[:2]
+        l1_map: dict[str, str] = dict(zip(l1["code"], l1["类目名称"]))
+
+        out: dict[str, str] = {}
+        for r in sw.itertuples(index=False):
+            code = str(r.symbol).zfill(6)
+            l1_code = str(r.industry_code)[:2]
+            out[code] = l1_map.get(l1_code, "其他")
         return out
 
     def spot(self, codes: list[str] | None = None, sink: list | None = None,

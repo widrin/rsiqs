@@ -72,7 +72,7 @@ class DayBars:
 
 def run_backtest(strategy, panel, names, calendar: TradingCalendar, start: date, end: date,
                  benchmark_nav: pd.Series, capital: float = 500_000, max_picks: int = 5,
-                 slippage_bps: float = 10.0) -> BacktestResult:
+                 slippage_bps: float = 10.0, industries: dict[str, str] | None = None) -> BacktestResult:
     """nav 的第一个点是 start 前一交易日的期初资金，首日的建仓成本和涨跌因此计入指标。
     策略拿到的面板截断到 end：本段回测看不到之后（例如留出期）的任何数据。"""
     acct = Account(name=f"bt:{getattr(strategy, 'name', 'strategy')}", cash=float(capital))
@@ -85,7 +85,7 @@ def run_backtest(strategy, panel, names, calendar: TradingCalendar, start: date,
     dates = [calendar.prev_day(days[0])] + days if days else []
     navs: list[float] = [float(capital)] if days else []
     for i, t in enumerate(days):
-        view = DataView(panel, names, asof=calendar.prev_day(t))
+        view = DataView(panel, names, asof=calendar.prev_day(t), industries=industries)
         picks = list(strategy.select(view))[:max_picks]
         # 持有期越过日历末尾的 pick 无法确定到期日，丢弃（t 之后还剩 horizon-1-i 个交易日）
         picks = [p for p in picks if p.hold_days <= horizon - 1 - i]

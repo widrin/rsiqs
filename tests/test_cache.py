@@ -77,7 +77,7 @@ def test_full_update_refetches_everything(cache):
     c.update(["600000"], date(2026, 1, 8))
     c.update(["600000"], date(2026, 1, 8), full=True)
     assert client.calls[-1] == ("600000", date(2015, 6, 1), date(2026, 1, 8))
-    panel, _ = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 8))
+    panel, _, _ = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 8))
     assert len(panel["600000"]) == 4
 
 
@@ -92,7 +92,7 @@ def test_load_panel_prev_close_and_names(cache):
     c, _ = cache
     c.update(["600000"], date(2026, 1, 8))
     c.set_names({"600000": "浦发银行"})
-    panel, names = c.load_panel(["600000", "000001"], date(2026, 1, 6), date(2026, 1, 8))
+    panel, names, industries = c.load_panel(["600000", "000001"], date(2026, 1, 6), date(2026, 1, 8))
     assert list(panel) == ["600000"]  # 无数据的代码不出现
     df = panel["600000"]
     assert isinstance(df.index, pd.DatetimeIndex)
@@ -106,7 +106,7 @@ def test_load_panel_prev_close_and_names(cache):
 def test_load_panel_first_bar_prev_close_falls_back_to_open(cache):
     c, _ = cache
     c.update(["600000"], date(2026, 1, 8))
-    panel, names = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 6))
+    panel, names, _ = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 6))
     assert panel["600000"]["prev_close"].tolist() == [10.0, 10.2]
     assert names == {"600000": ""}
 
@@ -120,7 +120,7 @@ def test_rebased_history_triggers_full_refetch(cache):
     c.update(["600000"], date(2026, 1, 8))
     assert c.last_rebased == ["600000"]
     assert client.calls[-1] == ("600000", date(2015, 6, 1), date(2026, 1, 8))
-    panel, _ = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 8))
+    panel, _, _ = c.load_panel(["600000"], date(2026, 1, 1), date(2026, 1, 8))
     assert panel["600000"]["close"].tolist() == pytest.approx([9.9, 10.3, 10.1, 10.5])
     assert panel["600000"]["prev_close"].iloc[-1] == pytest.approx(10.1)  # 除息日的昨收已是复权后的价格
 
@@ -135,7 +135,7 @@ def test_rebase_refetch_keeps_full_history(tmp_path):
     rebased.loc[:10, ["open", "high", "low", "close"]] -= 0.3
     client.data["600000"] = rebased
     c.update(["600000"], days[11].date())
-    panel, _ = c.load_panel(["600000"], days[0].date(), days[11].date())
+    panel, _, _ = c.load_panel(["600000"], days[0].date(), days[11].date())
     assert c.last_rebased == ["600000"] and len(panel["600000"]) == 12  # 不是只剩重叠的最后几行
 
 
@@ -213,3 +213,23 @@ def test_index_roundtrip_and_persistence(tmp_path):
     assert out.index.tolist() == s.index.tolist()
     assert out.tolist() == [4000.0, 4010.5]
     assert c2.load_index("sh000905").empty
+
+
+def test_industries_roundtrip_and_persistence(tmp_path):
+    path = tmp_path / "c.sqlite"
+    c = BarCache(path, FakeClient({}))
+    assert c.industries() == {}
+    c.save_industries({"600000": "银行", "000001": "银行", "300750": "电力设备"})
+    assert c.industries() == {"600000": "银行", "000001": "银行", "300750": "电力设备"}
+    c.save_industries({"600000": "银行"})  # 覆盖：只保留这一条
+    assert c.industries() == {"600000": "银行"}
+    c2 = BarCache(path, FakeClient({}))
+    assert c2.industries() == {"600000": "银行"}
+
+
+def test_load_panel_returns_industries_for_listed_codes(cache):
+    c, _ = cache
+    c.update(["600000"], date(2026, 1, 8))
+    c.save_industries({"600000": "银行", "000001": "食品饮料"})
+    panel, names, industries = c.load_panel(["600000", "000001"], date(2026, 1, 6), date(2026, 1, 8))
+    assert industries == {"600000": "银行"}  # 000001 无日线数据，不出现在 industries 里

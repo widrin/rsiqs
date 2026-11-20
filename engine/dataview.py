@@ -16,10 +16,12 @@ class DataView:
     # 面板只保存在方法的闭包里，实例上没有任何能取到它的属性：改编后的私有名字、str.format 的字段
     # （"{0._DataView__panel}"）都拿不到 asof 之后的数据。闭包本身只能经 __closure__ 这类双下划线属性
     # 取到，Task 3.6 的源码检查禁止任何含 "__" 的名字、属性和字符串。没有 __dict__，实例只读。
-    __slots__ = ("asof", "codes", "name", "history", "bar_on")
+    __slots__ = ("asof", "codes", "name", "industry", "history", "bar_on")
 
-    def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str], asof: date):
+    def __init__(self, panel: dict[str, pd.DataFrame], names: dict[str, str], asof: date,
+                 industries: dict[str, str] | None = None):
         ts = pd.Timestamp(asof)
+        industries = industries or {}
         # 只列出 asof 时已经有数据的股票：之后才上市的代码本身就是未来信息
         listed = sorted(c for c, df in panel.items() if len(df) and df.index[0] <= ts)
 
@@ -28,6 +30,9 @@ class DataView:
 
         def name(code: str) -> str:
             return names.get(code, "")
+
+        def industry(code: str) -> str | None:
+            return industries.get(code)
 
         def history(code: str, n: int | None = None) -> pd.DataFrame:
             df = panel[code]
@@ -43,8 +48,8 @@ class DataView:
                        close=float(row["close"]), prev_close=float(row["prev_close"]), volume=float(row["volume"]),
                        amount=float(row["amount"]), name=names.get(code, ""))
 
-        for attr, value in (("asof", asof), ("codes", codes), ("name", name), ("history", history),
-                            ("bar_on", bar_on)):
+        for attr, value in (("asof", asof), ("codes", codes), ("name", name), ("industry", industry),
+                            ("history", history), ("bar_on", bar_on)):
             object.__setattr__(self, attr, value)
 
     def __setattr__(self, key, value):

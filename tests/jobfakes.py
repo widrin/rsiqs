@@ -193,7 +193,7 @@ class FakeCache:
     def load_panel(self, codes, start, end):
         a, b = pd.Timestamp(start), pd.Timestamp(end)
         panel = {c: self.panel[c].loc[a:b].copy() for c in codes if c in self.panel}
-        return panel, {c: self.names.get(c, "") for c in panel}
+        return panel, {c: self.names.get(c, "") for c in panel}, {}
 
     def save_index(self, symbol, series):
         self.saved_index[symbol] = series

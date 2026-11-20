@@ -690,6 +690,39 @@ def test_spot_for_codes_streams_rows_into_sink(monkeypatch):
     assert [r["code"] for r in rows] == ["600000", "000001"] and rows[0]["open"] == 10.2
 
 
+def test_industry_map_maps_sw_codes_to_l1_names(monkeypatch):
+    sw = pd.DataFrame({  # 000001 有两条历史，取 start_date 最新的（480301=银行）
+        "symbol": ["000001", "000001", "600519", "300750"],
+        "start_date": [date(2014, 2, 21), date(2021, 7, 30), date(2021, 7, 30), date(2021, 7, 30)],
+        "industry_code": ["480101", "480301", "340501", "630701"],
+        "update_time": [date(2015, 10, 27), date(2025, 12, 15), date(2022, 5, 9), date(2025, 10, 15)],
+    })
+    cn = pd.DataFrame({  # 只列分级=1 的行（一级行业代码→名称）
+        "类目编码": ["S48", "S34", "S63"], "类目名称": ["银行", "食品饮料", "电力设备"],
+        "分级": [1, 1, 1],
+    })
+    fake_ak(monkeypatch, stock_industry_clf_hist_sw=lambda: sw,
+            stock_industry_category_cninfo=lambda symbol: cn)
+    out = AkClient().industry_map()
+    assert out == {"000001": "银行", "600519": "食品饮料", "300750": "电力设备"}
+
+
+def test_industry_map_falls_unknown_codes_to_other(monkeypatch):
+    sw = pd.DataFrame({"symbol": ["999999"], "start_date": [date(2021, 7, 30)],
+                       "industry_code": ["999999"], "update_time": [date(2021, 7, 31)]})
+    cn = pd.DataFrame({"类目编码": ["S48"], "类目名称": ["银行"], "分级": [1]})
+    fake_ak(monkeypatch, stock_industry_clf_hist_sw=lambda: sw,
+            stock_industry_category_cninfo=lambda symbol: cn)
+    assert AkClient().industry_map() == {"999999": "其他"}
+
+
+def test_industry_map_raises_on_empty_sources(monkeypatch):
+    fake_ak(monkeypatch, stock_industry_clf_hist_sw=lambda: pd.DataFrame(),
+            stock_industry_category_cninfo=lambda symbol: pd.DataFrame())
+    with pytest.raises(DataError):
+        AkClient().industry_map()
+
+
 def test_requests_without_timeout_get_one(monkeypatch):
     import socket
     import threading

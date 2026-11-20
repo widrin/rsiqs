@@ -74,7 +74,7 @@ class FakeCache:
 
     def load_panel(self, codes, start, end):
         self.loaded = (start, end)
-        return {c: self.data[c] for c in codes if c in self.data}, {c: f"股{c}" for c in CODES}
+        return {c: self.data[c] for c in codes if c in self.data}, {c: f"股{c}" for c in CODES}, {}
 
 
 class FakeLLM:

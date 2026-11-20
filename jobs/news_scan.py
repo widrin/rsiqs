@@ -19,8 +19,8 @@ def scan(d: date, settings, store, client, cache, calendar) -> list:
     asof = calendar.prev_day(d)
     codes = client.universe()
     cache.update(codes, asof)
-    panel, names = cache.load_panel(codes, asof - timedelta(days=HISTORY_DAYS), asof)
-    view = DataView(panel, names, asof)
+    panel, names, industries = cache.load_panel(codes, asof - timedelta(days=HISTORY_DAYS), asof)
+    view = DataView(panel, names, asof, industries=industries)
     picks, meta = news.select(common.make_llm(settings, store), client, d, view, codes)
     store.save_recommendation(d, ACCOUNT, picks, meta)
     common.log.info("news_scan %s: news %d, llm codes %s, picks %s", d, meta["news_count"],

@@ -158,8 +158,8 @@ def scan(d: dt.date, settings: Settings, store: Store, cache: BarCache, client: 
     asof = calendar.prev_day(d)
     codes = client.universe()
     cache.update(codes, asof)  # 增量：已是最新的代码不发请求
-    panel, names = cache.load_panel(codes, asof - dt.timedelta(days=HISTORY_DAYS), asof)
-    view = DataView(panel, names, asof)
+    panel, names, industries = cache.load_panel(codes, asof - dt.timedelta(days=HISTORY_DAYS), asof)
+    view = DataView(panel, names, asof, industries=industries)
     picks = strategy.select(view)[:CANDIDATE_COUNT]
     cand = [p.code for p in picks]
     context = {

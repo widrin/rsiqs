@@ -30,6 +30,10 @@ def main(now: datetime | None = None) -> dict:
         common.log.exception("names() failed, falling back to spot()")
         spot = client.spot()
         cache.set_names({str(c): str(n) for c, n in zip(spot["code"], spot["name"])})
+    try:
+        cache.save_industries(client.industry_map())  # 申万一级行业映射，供行业轮动策略使用
+    except Exception:  # noqa: BLE001 - 行业映射取不到不阻塞初始化，策略会拿到空行业
+        common.log.exception("industry_map() failed")
     # 只取到已收盘的锚定日：盘中运行时，当天未收盘的 K 线会留在缓存里，之后的增量更新不再覆盖它
     anchor = common.last_closed_day(now, calendar)
     failed = cache.update(codes, end=anchor, start_default=HISTORY_START) or []

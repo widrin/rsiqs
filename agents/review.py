@@ -67,7 +67,7 @@ def _account_section(store: Store, d: dt.date, name: str) -> tuple[list[str], se
 
 
 def _bar_lines(cache: BarCache, codes: set[str], d: dt.date) -> list[str]:
-    panel, names = cache.load_panel(sorted(codes), d - dt.timedelta(days=BAR_LOOKBACK_DAYS), d)
+    panel, names, _ = cache.load_panel(sorted(codes), d - dt.timedelta(days=BAR_LOOKBACK_DAYS), d)
     ts, out = pd.Timestamp(d), ["## 个股当日行情"]
     for code in sorted(codes):
         df = panel.get(code)

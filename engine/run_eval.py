@@ -30,7 +30,8 @@ INCUMBENT_KV = "eval_incumbent"  # 现任在 train+val 上的组合日收益统�
 
 
 def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
-                   n_trials: int, skip: str, target_regime: str | None = None) -> float | None:
+                   n_trials: int, skip: str, target_regime: str | None = None,
+                   industries: dict[str, str] | None = None) -> float | None:
     """现任策略的 DSR：DSR 门槛是相对现任的，所以先算现任这一把。
 
     统计量缓存在 kv，同一只现任只回测一次（换现任后自动重算）。任何失败都返回 None，门槛退回
@@ -53,7 +54,7 @@ def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchm
         try:
             inc = load_strategy(name)
             rets = [evaluator.run_backtest(inc, panel, names, calendar, start, end or calendar.last(),
-                                           benchmark_nav).nav.pct_change().dropna()
+                                           benchmark_nav, industries=industries).nav.pct_change().dropna()
                     for start, end in (evaluator.SPLITS["train"], evaluator.SPLITS["val"])]
             r = pd.concat(rets)
             if target_regime is not None:
@@ -117,13 +118,13 @@ def _setup():
     if bench.empty:
         raise RuntimeError(f"缓存中没有基准指数 {BENCHMARK}，请先运行 python -m jobs.bootstrap")
     calendar = TradingCalendar(ts.date() for ts in bench.index)
-    panel, names = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
-    return store, calendar, panel, names, bench / bench.iloc[0]
+    panel, names, industries = cache.load_panel(cache.codes(), HISTORY_START, calendar.last())
+    return store, calendar, panel, names, industries, bench / bench.iloc[0]
 
 
 def run(name: str) -> dict:
     try:
-        store, calendar, panel, names, benchmark_nav = _setup()
+        store, calendar, panel, names, industries, benchmark_nav = _setup()
     except Exception as e:  # noqa: BLE001 — 统一标成环境错误
         raise SetupError(f"{type(e).__name__}: {e}") from e
     before = _rules_state()  # 先取快照再加载策略：策略模块的顶层代码也可能改动评估规则
@@ -131,9 +132,9 @@ def run(name: str) -> dict:
     target_regime = getattr(strategy, "target_regime", None)
     dsr_incumbent = _incumbent_dsr(store, panel, names, calendar, benchmark_nav,
                                    store.trial_count() + 1, skip=name,
-                                   target_regime=target_regime)  # 与 evaluate 用同一个 n_trials
+                                   target_regime=target_regime, industries=industries)
     report = evaluate(strategy, name, panel, names, calendar, benchmark_nav, store,
-                      dsr_incumbent=dsr_incumbent)
+                      dsr_incumbent=dsr_incumbent, industries=industries)
     if _rules_state() != before:
         trial = store.last_trial(name)
         if trial is not None:

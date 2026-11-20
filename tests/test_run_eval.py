@@ -44,9 +44,9 @@ def captured(tmp_path, monkeypatch):
     seen = {}
 
     def fake_evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
-                      dsr_incumbent=None):
+                      dsr_incumbent=None, industries=None):
         seen.update(strategy=strategy, name=name, panel=panel, names=names, calendar=calendar,
-                    bench=benchmark_nav, store=store, dsr_incumbent=dsr_incumbent)
+                    bench=benchmark_nav, store=store, dsr_incumbent=dsr_incumbent, industries=industries)
         return FakeReport()
 
     monkeypatch.setattr(run_eval, "evaluate", fake_evaluate)
@@ -120,7 +120,7 @@ def test_mutated_rules_void_the_trial(captured, monkeypatch, what):
     tamper_now = _tamperings(monkeypatch)[what]
 
     def tamper(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
-               dsr_incumbent=None):
+               dsr_incumbent=None, industries=None):
         store.add_trial(name, {}, 1.0, 1.0, True, True)
         tamper_now()  # 模拟策略代码在评估中改了评估规则
         return FakeReport()
@@ -150,7 +150,7 @@ def test_rules_mutated_while_loading_strategy_void_the_trial(captured, monkeypat
         return captured["sentinel"]
 
     def evaluate(strategy, name, panel, names, calendar, benchmark_nav, store, params=None,
-                 dsr_incumbent=None):
+                 dsr_incumbent=None, industries=None):
         store.add_trial(name, {}, 1.0, 1.0, True, True)
         return FakeReport()
 

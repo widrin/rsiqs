@@ -40,6 +40,16 @@ def test_codes_and_name(view):
     assert view.name("000001") == ""
 
 
+def test_industry_returns_none_when_unknown():
+    panel = {"600000": _frame(), "000001": _frame()}
+    v = DataView(panel, {"600000": "浦发银行"}, asof=date(2026, 1, 9),
+                 industries={"600000": "银行"})
+    assert v.industry("600000") == "银行"
+    assert v.industry("000001") is None  # 有数据但无行业映射
+    v2 = DataView(panel, {}, asof=date(2026, 1, 9))  # 不传 industries
+    assert v2.industry("600000") is None
+
+
 def test_bar_on(view):
     b = view.bar_on("600000", date(2026, 1, 9))
     assert b.close == 14.0 and b.prev_close == 13.0 and b.name == "浦发银行"

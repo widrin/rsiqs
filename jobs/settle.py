@@ -132,6 +132,10 @@ def refresh_data(codes: list[str], end: date, client, cache) -> None:
         cache.set_names(client.names())
     except Exception:  # noqa: BLE001 - 名称取不到不影响结算，沿用旧名称
         common.log.exception("refresh names failed")
+    try:  # 每天刷新申万一级行业映射：新纳入成分股、少数股票行业调整
+        cache.save_industries(client.industry_map())
+    except Exception:  # noqa: BLE001 - 行业映射取不到不影响结算，沿用旧映射
+        common.log.exception("refresh industries failed")
 
 
 def refresh_regime(store, cache, client, end: date) -> None:
@@ -241,7 +245,7 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
     recs = recommended_codes(store, [d])
     asof = calendar.prev_day(d)
     # 与盘前扫描一样从 asof 往前取 LOOKBACK_CAL_DAYS 个自然日：同一策略两处看到的历史行数相同
-    panel, names = cache.load_panel(sorted(set(codes) | recs), asof - timedelta(days=LOOKBACK_CAL_DAYS), d)
+    panel, names, industries = cache.load_panel(sorted(set(codes) | recs), asof - timedelta(days=LOOKBACK_CAL_DAYS), d)
     qfq_bars = bars_for_day(panel, names, d)
     if len(qfq_bars) < max(1, int(len(codes) * MIN_COVERAGE)):
         raise DataError(f"{d.isoformat()} 日线覆盖不足 {len(qfq_bars)}/{len(codes)}，数据可能未更新")
@@ -251,7 +255,8 @@ def settle_day(d: date, settings, store, cache, calendar, div_failed=frozenset()
 
     # 策略只拿到截至 asof 的面板：d 日的行情只用于撮合。选股范围是股票池加持仓，不含当天 LLM 推荐的代码
     tracked = set(codes)
-    view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names, asof=asof)
+    view = DataView({c: df.loc[:pd.Timestamp(asof)] for c, df in panel.items() if c in tracked}, names,
+                    asof=asof, industries=industries)
     broker, per_pick = SimBroker(), settings.capital / settings.max_picks
     def raw_bars(codes) -> dict:
         need = sorted(set(codes))

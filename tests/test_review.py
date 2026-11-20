@@ -43,7 +43,7 @@ class FakeCache:
 
     def load_panel(self, codes, start, end):
         self.requested = (sorted(codes), start, end)
-        return {c: self.raw.copy() for c in codes}, {c: f"股{c}" for c in codes}
+        return {c: self.raw.copy() for c in codes}, {c: f"股{c}" for c in codes}, {}
 
     def raw_bars(self, codes, d, names=None):
         ts = pd.Timestamp(d)
