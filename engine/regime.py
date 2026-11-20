@@ -73,6 +73,32 @@ def classify(series: pd.Series) -> Regime:
                   ret_short=ret_short, above_ma=above_ma)
 
 
+def daily_regime(benchmark_nav: pd.Series, start: dt.date | None = None,
+                 end: dt.date | None = None) -> dict:
+    """按交易日向量化计算行情状态：返回 {date: state}。
+
+    与 classify() 同口径（120 日均线 + 20 日动量），但一次性滚动计算整段，供评估器按
+    目标行情过滤收益序列。均线在完整序列上计算（否则前 120 天无法形成），再按 [start, end]
+    过滤输出。数据不足的日期不进入结果。
+    """
+    s = benchmark_nav.dropna().sort_index()
+    if len(s) < MA_WINDOW + 1:
+        return {}
+    ma_long = s.rolling(MA_WINDOW).mean()
+    ret_short = s / s.shift(RET_WINDOW) - 1.0
+    above_ma = s > ma_long
+    bull = above_ma & (ret_short > BULL_RET)
+    bear = (~above_ma) & (ret_short < BEAR_RET)
+    state = pd.Series(SIDEWAYS, index=s.index, dtype=object)
+    state[bull] = BULL
+    state[bear] = BEAR
+    valid = ma_long.notna()
+    start_ts = pd.Timestamp(start) if start is not None else s.index[0]
+    end_ts = pd.Timestamp(end) if end is not None else s.index[-1]
+    in_range = (s.index >= start_ts) & (s.index <= end_ts)
+    return {idx.date(): state.loc[idx] for idx in s.index[valid & in_range]}
+
+
 def detect(store, cache, client=None, asof: dt.date | None = None) -> Regime | None:
     """加载指数日线、计算状态并写入 kv。client 为 None 时只用缓存（测试/回补）。"""
     try:

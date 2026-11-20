@@ -139,7 +139,7 @@ def test_to_agent_dict_never_contains_holdout_numbers(monkeypatch):
     rep = ev.evaluate(Winner(), "winner", _panel(), NAMES, CAL, BENCH, store, splits=SPL)
     d = rep.to_agent_dict()
     assert set(d) == {"strategy", "train", "val", "dsr", "dsr_bar", "gate_pass",
-                      "holdout_pass", "holdout_reason", "n_trials"}
+                      "holdout_pass", "holdout_reason", "n_trials", "target_regime"}
     assert isinstance(d["holdout_pass"], bool)
     assert str(sentinel) not in json.dumps(d)
     assert str(sentinel) not in repr(rep)
@@ -293,3 +293,67 @@ def test_dsr_inputs_and_trial_sharpes(monkeypatch):
     assert seen["kurt"] == pytest.approx(float(r.kurt()) + 3.0)  # 非超额峰度
     t = store.last_trial("winner")
     assert (t["train_sharpe"], t["val_sharpe"]) == (pytest.approx(rep.train["sharpe"]), pytest.approx(rep.val["sharpe"]))
+
+
+def _bull_bear_panel_and_bench():
+    """前 150 天单边上涨（牛市），后 100 天单边下跌（熊市）；股票每天涨 1%。"""
+    idx = pd.bdate_range("2024-01-01", periods=250)
+    days = [ts.date() for ts in idx]
+    up = [100.0 + 0.33 * i for i in range(150)]
+    down = [150.0 - 0.7 * (i + 1) for i in range(100)]
+    bench = pd.Series(up + down, index=idx)
+    closes = [10.0 * 1.01 ** i for i in range(250)]
+    df = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
+                       "volume": [1e6] * 250, "amount": [1e8] * 250,
+                       "prev_close": [float("nan")] + closes[:-1]}, index=idx)
+    return days, bench, {"600001": df}
+
+
+class BullWinner(Winner):
+    name = "bull_winner"
+    target_regime = "bull"
+
+
+def test_target_regime_filters_metrics_to_matching_days():
+    """声明 target_regime 的策略，train/val 指标只在该行情的交易日上计算。"""
+    days, bench, panel = _bull_bear_panel_and_bench()
+    cal = TradingCalendar(days)
+    spl = {"train": (days[120], days[175]), "val": (days[176], days[220]), "holdout": (days[221], None)}
+    from engine import regime as regime_mod
+    regime_map = regime_mod.daily_regime(bench, days[120], days[220])
+    # 收益从 train 段的第二天起算（首日是期初资金，无收益）
+    train_bull = sum(1 for d in days[121:176] if regime_map.get(d) == "bull")
+
+    store = Store(":memory:")
+    rep = ev.evaluate(BullWinner(), "bull_winner", panel, NAMES, cal, bench, store, splits=spl)
+    assert rep.target_regime == "bull"
+    assert rep.train["n_days"] == train_bull > 0
+    # 全周期版本的 train 天数 = 整段 train（56 个收益日），一定多于牛市子集
+    full = ev.evaluate(Winner(), "winner", panel, NAMES, cal, bench, Store(":memory:"), splits=spl)
+    assert full.train["n_days"] > rep.train["n_days"]
+    # 报告对外暴露 target_regime
+    assert rep.to_agent_dict()["target_regime"] == "bull"
+
+
+def test_target_regime_mismatch_with_holdout_skips_holdout():
+    """目标行情与 holdout 行情不符时，holdout 不运行、holdout_pass=None。"""
+    days, bench, panel = _bull_bear_panel_and_bench()
+    cal = TradingCalendar(days)
+    # train/val 含牛市，holdout 是熊市（221 之后都在跌）
+    spl = {"train": (days[120], days[160]), "val": (days[161], days[175]), "holdout": (days[221], None)}
+    store = Store(":memory:")
+    calls = []
+    real = ev.run_backtest
+
+    def spy(strategy, p, names, calendar, start, end, benchmark_nav, **kw):
+        calls.append(start)
+        return real(strategy, p, names, calendar, start, end, benchmark_nav, **kw)
+
+    import engine.evaluator as ev_mod
+    ev_mod.run_backtest = spy
+    try:
+        rep = ev.evaluate(BullWinner(), "bull_winner", panel, NAMES, cal, bench, store, splits=spl)
+    finally:
+        ev_mod.run_backtest = real
+    # 即使 gate 通过，holdout 也不该跑（行情不符）
+    assert days[221] not in calls

@@ -20,6 +20,7 @@ from data.cache import BarCache
 from engine import backtest, broker, evaluator, metrics, rules
 from engine.calendar import TradingCalendar
 from engine.evaluator import evaluate
+from engine import regime as regime_mod
 from engine.store import Store
 from strategies.base import load_strategy
 
@@ -29,11 +30,12 @@ INCUMBENT_KV = "eval_incumbent"  # 现任在 train+val 上的组合日收益统�
 
 
 def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
-                   n_trials: int, skip: str) -> float | None:
+                   n_trials: int, skip: str, target_regime: str | None = None) -> float | None:
     """现任策略的 DSR：DSR 门槛是相对现任的，所以先算现任这一把。
 
     统计量缓存在 kv，同一只现任只回测一次（换现任后自动重算）。任何失败都返回 None，门槛退回
     DSR_FLOOR — 算不出基准不该让候选的评估失败。评估现任自身时没有基准可比，同样返回 None。
+    target_regime 不为空时，只在该行情的交易日上统计（与候选策略同口径）。
     """
     incs = store.strategies_with_status("incumbent")
     name = incs[0] if incs else None
@@ -42,7 +44,8 @@ def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchm
     cached = store.kv_get(INCUMBENT_KV)
     splits_key = repr(evaluator.SPLITS)
     stats = (cached if isinstance(cached, dict) and cached.get("name") == name
-             and cached.get("splits") == splits_key else None)
+             and cached.get("splits") == splits_key
+             and cached.get("target_regime") == target_regime else None)
     if stats is None:
         try:
             inc = load_strategy(name)
@@ -50,10 +53,19 @@ def _incumbent_dsr(store: Store, panel, names, calendar: TradingCalendar, benchm
                                            benchmark_nav).nav.pct_change().dropna()
                     for start, end in (evaluator.SPLITS["train"], evaluator.SPLITS["val"])]
             r = pd.concat(rets)
+            if target_regime is not None:
+                # 与候选策略同口径：只保留目标行情的交易日
+                tr_start = evaluator.SPLITS["train"][0]
+                va_end = evaluator.SPLITS["val"][1] or calendar.last()
+                regime_map = regime_mod.daily_regime(benchmark_nav, tr_start, va_end)
+                br = benchmark_nav.astype(float).pct_change().dropna()
+                r, _ = evaluator._regime_subset(
+                    (1.0 + r).cumprod(), benchmark_nav, target_regime, regime_map)
             if len(r) < 4:
                 return None
-            stats = {"name": name, "splits": splits_key, "sr": evaluator.sharpe(r, periods=1),
-                     "n_obs": int(len(r)), "skew": float(r.skew()), "kurt": float(r.kurt()) + 3.0}
+            stats = {"name": name, "splits": splits_key, "target_regime": target_regime,
+                     "sr": evaluator.sharpe(r, periods=1), "n_obs": int(len(r)),
+                     "skew": float(r.skew()), "kurt": float(r.kurt()) + 3.0}
             store.kv_set(INCUMBENT_KV, stats)
         except Exception:  # noqa: BLE001 - 现任算不出来就当没有基准
             logging.exception("计算现任 %s 的 DSR 基准失败，门槛退回 DSR_FLOOR", name)
@@ -112,8 +124,10 @@ def run(name: str) -> dict:
         raise SetupError(f"{type(e).__name__}: {e}") from e
     before = _rules_state()  # 先取快照再加载策略：策略模块的顶层代码也可能改动评估规则
     strategy = load_strategy(name)
+    target_regime = getattr(strategy, "target_regime", None)
     dsr_incumbent = _incumbent_dsr(store, panel, names, calendar, benchmark_nav,
-                                   store.trial_count() + 1, skip=name)  # 与 evaluate 用同一个 n_trials
+                                   store.trial_count() + 1, skip=name,
+                                   target_regime=target_regime)  # 与 evaluate 用同一个 n_trials
     report = evaluate(strategy, name, panel, names, calendar, benchmark_nav, store,
                       dsr_incumbent=dsr_incumbent)
     if _rules_state() != before:

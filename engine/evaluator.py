@@ -8,7 +8,7 @@ import pandas as pd
 
 from engine.backtest import run_backtest
 from engine.calendar import TradingCalendar
-from engine.metrics import deflated_sharpe, sharpe
+from engine.metrics import deflated_sharpe, sharpe, summarize
 from engine import regime as regime_mod
 from engine.store import Store
 
@@ -43,13 +43,14 @@ class EvalReport:
     holdout_pass: bool | None
     holdout_reason: str | None
     n_trials: int
+    target_regime: str | None = None
 
     def to_agent_dict(self) -> dict:
         # 只含训练/验证指标与留出期的通过与否；本类本身也不保存任何留出期数值
         return {"strategy": self.strategy, "train": dict(self.train), "val": dict(self.val),
                 "dsr": self.dsr, "dsr_bar": self.dsr_bar, "gate_pass": self.gate_pass,
                 "holdout_pass": self.holdout_pass, "holdout_reason": self.holdout_reason,
-                "n_trials": self.n_trials}
+                "n_trials": self.n_trials, "target_regime": self.target_regime}
 
 
 def _dsr_bar(dsr_incumbent: float | None) -> float:
@@ -79,10 +80,29 @@ def _period_regime(benchmark_nav: pd.Series, end_date: date) -> str | None:
     return regime_mod.classify(series).state
 
 
+def _regime_subset(nav: pd.Series, bench_nav: pd.Series, target_regime: str,
+                   regime_map: dict) -> tuple[pd.Series, pd.Series]:
+    """只保留行情状态 == target_regime 的交易日，返回 (过滤后日收益, 过滤后基准日收益)。"""
+    r = nav.astype(float).pct_change().dropna()
+    br = bench_nav.astype(float).pct_change().dropna()
+    r, br = r.align(br, join="inner")
+    mask = r.index.map(lambda ts: regime_map.get(ts.date()) == target_regime)
+    return r[mask], br[mask]
+
+
+def _metrics_from_rets(r: pd.Series, br: pd.Series) -> dict:
+    """从日收益重建净值并算指标（与 metrics.summarize 同口径）。"""
+    if len(r) == 0:
+        return {"total_return": 0.0, "ann_return": 0.0, "sharpe": 0.0,
+                "max_dd": 0.0, "excess_ann": 0.0, "n_days": 0}
+    return summarize((1.0 + r).cumprod(), (1.0 + br).cumprod())
+
+
 def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, benchmark_nav: pd.Series,
              store: Store, params: dict | None = None, splits: dict | None = None,
              dsr_incumbent: float | None = None) -> EvalReport:
     splits = splits or SPLITS
+    target_regime = getattr(strategy, "target_regime", None)
 
     def bt(key: str):
         start, end = splits[key]
@@ -95,16 +115,36 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
         # 跑不完的试验同样计入 n_trials（DSR 的多重检验校正）；训练、验证段的报错照常抛出
         store.add_trial(name, params or {}, None, None, False, None)
         raise
-    r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
-    dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r), float(r.skew()) if len(r) > 2 else 0.0,
+
+    # 按目标行情过滤：策略声明 target_regime 时，只在该行情的交易日上算指标与 DSR。
+    # 解决"牛市策略被九年熊市拖垮、熊市策略被牛市拉高"的口径错位——不同行情用不同策略，
+    # 各自在自己擅长的行情内比较。
+    if target_regime is not None:
+        tr_start = splits["train"][0]
+        va_end = splits["val"][1] or _data_end(panel, calendar)
+        regime_map = regime_mod.daily_regime(benchmark_nav, tr_start, va_end)
+        tr_r, tr_br = _regime_subset(tr.nav, benchmark_nav, target_regime, regime_map)
+        va_r, va_br = _regime_subset(va.nav, benchmark_nav, target_regime, regime_map)
+        tr_metrics = _metrics_from_rets(tr_r, tr_br)
+        va_metrics = _metrics_from_rets(va_r, va_br)
+        r = pd.concat([tr_r, va_r])
+    else:
+        tr_metrics, va_metrics = tr.metrics, va.metrics
+        r = pd.concat([tr.nav.pct_change().dropna(), va.nav.pct_change().dropna()])
+
+    dsr = deflated_sharpe(sharpe(r, periods=1), n_trials, len(r),
+                          float(r.skew()) if len(r) > 2 else 0.0,
                           float(r.kurt()) + 3.0 if len(r) > 3 else 3.0)
-    gate_pass = _passes_gate(tr.metrics, va.metrics, dsr, dsr_incumbent)
+    gate_pass = _passes_gate(tr_metrics, va_metrics, dsr, dsr_incumbent)
     # val 与 holdout 行情状态可能不同：动量策略在熊市 holdout 失败是预期，不算过拟合否决
     val_regime = _period_regime(benchmark_nav, splits["val"][1])
     ho_regime = _period_regime(benchmark_nav, _data_end(panel, calendar))
     regime_diff = (val_regime is not None and ho_regime is not None and val_regime != ho_regime)
+    # 目标行情与 holdout 行情不符时，holdout 不适用（该策略不该在这段行情被考核）
+    if target_regime is not None and ho_regime is not None and ho_regime != target_regime:
+        regime_diff = True
     # 先入库再回放留出期：留出期中途失败或进程被杀，这次试验也已计数
-    trial_id = store.add_trial(name, params or {}, tr.metrics["sharpe"], va.metrics["sharpe"], gate_pass, None)
+    trial_id = store.add_trial(name, params or {}, tr_metrics["sharpe"], va_metrics["sharpe"], gate_pass, None)
     holdout_pass = None
     holdout_reason = f"regime_diff:{val_regime}->{ho_regime}" if regime_diff else None
     if gate_pass:
@@ -121,7 +161,7 @@ def evaluate(strategy, name: str, panel, names, calendar: TradingCalendar, bench
             store.set_trial_holdout(trial_id, holdout_pass)
             if interrupted:  # Ctrl+C 照样中断，但抛出不带消息、不带原异常的新异常（策略也可能抛 KeyboardInterrupt）
                 raise KeyboardInterrupt from None
-    return EvalReport(strategy=name, train=tr.metrics, val=va.metrics, dsr=dsr,
+    return EvalReport(strategy=name, train=tr_metrics, val=va_metrics, dsr=dsr,
                       dsr_bar=_dsr_bar(dsr_incumbent), gate_pass=gate_pass,
                       holdout_pass=holdout_pass, holdout_reason=holdout_reason,
-                      n_trials=store.trial_count())
+                      n_trials=store.trial_count(), target_regime=target_regime)
