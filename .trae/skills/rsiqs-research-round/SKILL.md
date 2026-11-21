@@ -48,6 +48,16 @@ Get-Process python -ErrorAction SilentlyContinue | Select-Object Id,CPU,@{N='Mem
 
 `train_sharpe >= 0.5`、`train_max_dd >= -0.45`、`val_sharpe >= 0.5`、`val_excess_ann >= 0.05`、`val_max_dd >= -0.25`、`DSR >= max(0.5, 现任 DSR)`。
 
+## 检查生成草稿（必做）
+
+LLM 写出的策略常出现"参数写了但没生效"的错误，评估前先用 Grep 核对：
+- 名额：循环里的 break 条件是否用 `daily_picks`，而不是遗留的 `top_n=15`；
+- 权重：是否真的 `weight=` 传进 `Pick`；
+- 刹车：`dd_stop`/`dd_slow` 是否与 focus 一致；
+- 打分：是否与基线一致（LLM 常擅自把"全池排名"改成"行业内排名"）。
+
+发现偏差时，不要重跑会话（浪费 20 分钟和额度），直接以基线文件为源改那两三行，再用 `uv run python -m engine.run_eval <name>` 单独评估。
+
 ## 收尾
 
 1. 研究代理成功后会自动 commit（消息形如 `research: <date> 新增候选策略 ...`）。
