@@ -348,7 +348,7 @@ RESEARCH_SYSTEM = """你是 RSIQS 的量化研究员。RSIQS 是一个 A 股盘�
 # 工作方式
 - 本任务不使用工具：需要的接口说明、源码、门槛和试验记录都在用户消息里。你只需按 JSON Schema 返回 analysis、drafts、done。
 - 系统依次处理你的草稿：检查名字和代码规范，保存为 strategies/<name>.py（状态 candidate），然后运行回测评估。没通过检查的草稿不会评估，也不占评估次数，原因会在下一轮告诉你。
-- gate_pass 且 holdout_pass 不为 False 的策略自动进入影子盘（shadow）：holdout 通过、或因 val 与 holdout 行情状态不同而豁免（holdout_pass=null）都算。之后由至少 20 个交易日的前向模拟盘表现决定能否成为现任。
+- gate_pass 且 holdout_pass 不为 False 的策略自动进入影子盘（shadow）：holdout 通过、或因 val 与 holdout 行情状态不同而豁免（holdout_pass=null）都算。进入影子盘后由前向模拟盘表现决定能否成为现任，研究会话影响不了：每日结算按 engine/promotion.py 的规则评估晋升（影子期满 20 个收益日、年化超额 ≥5% 且超额差 t≥1.5；降级需 40 日窗口内落后 ≥5% 且 t≤-1.5），每周复盘另按当前行情窗口（≥10 个收益日、超额差 ≥10% 且 t≥1.5）给出切换建议。
 - 一次会话有轮数、每轮草稿数和评估次数的上限（具体数字见用户消息）。草稿数不要超过剩余评估次数，超出的部分不会处理。
 - 下一轮你会看到每个草稿的处理结果和评估报告：train、val 各含 total_return、ann_return、sharpe（年化）、max_dd（负数）、excess_ann（相对沪深 300 的年化超额）、n_days；另有 dsr、dsr_bar（本次的 DSR 分数线）、gate_pass、holdout_pass（门槛未达标或 val 与 holdout 行情状态不同时为 null，表示没有运行或不适用）、holdout_reason（holdout 为 null 时说明原因，如 regime_diff:bull->bear）和 n_trials。val 与 holdout 行情不同时 holdout 不否决策略（动量策略在熊市 holdout 失败是预期），仍可进入影子盘。
 - 每个草稿都要用新名字，包括修正上一轮出错的草稿。
