@@ -80,3 +80,4 @@ uv run python -c "import sqlite3; c=sqlite3.connect('data/rsiqs.sqlite'); print(
 - 紧止损 1.0σ 无效；持有期拉到 20 日会降低 train 夏普。
 - 对全池 `pd.concat` 会超时，只能用横截面标量（回撤中位数、广度、r20 中位数）。
 - 二元牛熊硬闸能压回撤但会踏空，val 超额转负。
+- `target_regime = "bull"` 用在行业相对强度结构上会灾难性失效：牛市日超额全负，train/val 夏普 -1.8 ~ -5.0；且该模式下评估更慢，容易撞 30 分钟 EVAL_TIMEOUT 返回 None。
